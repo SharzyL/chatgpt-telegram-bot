@@ -578,17 +578,27 @@ async def async_main():
                     await get_whitelist_handler(event.message)
                 else:
                     await reply_handler(event.message)
-            assert await bot(functions.bots.SetBotCommandsRequest(
-                scope=types.BotCommandScopeDefault(),
-                lang_code='en',
+
+            admin_input_peer = await bot.get_input_entity(config['admin_id'])
+            await bot(functions.bots.SetBotCommandsRequest(
+                scope=types.BotCommandScopePeer(admin_input_peer),
+                lang_code='',
                 commands=[types.BotCommand(command, description) for command, description in [
-                    ('ping', 'Test bot connectivity'),
-                    ('list_models', 'List supported models'),
                     ('add_whitelist', 'Add this group to whitelist (only admin)'),
                     ('del_whitelist', 'Delete this group from whitelist (only admin)'),
                     ('get_whitelist', 'List groups in whitelist (only admin)'),
                 ]]
             ))
+
+            await bot(functions.bots.SetBotCommandsRequest(
+                scope=types.BotCommandScopeDefault(),
+                lang_code='',
+                commands=[types.BotCommand(command, description) for command, description in [
+                    ('ping', 'Test bot connectivity'),
+                    ('list_models', 'List supported models'),
+                ]]
+            ))
+
             await bot.run_until_disconnected()
 
 def main():

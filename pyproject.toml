@@ -20,6 +20,9 @@ license = {text = "MIT"}
 [project.scripts]
 chatgpt-telegram-bot = "chatgpt_telegram_bot.main:main"
 
+[tool.pdm.scripts]
+start = { call = "chatgpt_telegram_bot.main:main" }
+
 [tool.pdm]
 distribution = true
 

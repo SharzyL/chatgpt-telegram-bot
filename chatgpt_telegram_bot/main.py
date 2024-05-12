@@ -240,7 +240,7 @@ async def completion(chat_history, model, chat_id, msg_id):  # chat_history = [u
         stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True)
     finished = False
     async for response in stream:
-        logging.info('Response (chat_id=%r, msg_id=%r): %s', chat_id, msg_id, response)
+        logging.debug('Response (chat_id=%r, msg_id=%r): %s', chat_id, msg_id, response)
         assert not finished
         obj = response.choices[0]
         if obj.delta.role is not None:

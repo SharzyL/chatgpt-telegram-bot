@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import asyncio
 import os
 import logging
@@ -13,48 +15,58 @@ from richtext import RichText
 import openai
 from telethon import TelegramClient, events, errors, functions, types
 import signal
+from urllib.parse import urlparse
+import tomllib
 
 def debug_signal_handler(signal, frame):
     breakpoint()
 
 signal.signal(signal.SIGUSR1, debug_signal_handler)
 
-ADMIN_ID = 71863318
+def parse_config():
+    config_path = os.environ.get("BOT_CONFIG", "bot.toml")
+    with open(config_path, "rb") as f:
+        config = tomllib.load(f)
+    assert config['admin_id']
+    assert config['models']
+    assert config['api_endpoint']
+    assert config['vision_model']
+    assert config['default_model']
+    return config
 
-MODELS = [
-    {'prefix': '$$', 'model': 'gpt-3.5-turbo-0125', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI. Answer as concisely as possible. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'},
-    {'prefix': '$', 'model': 'gpt-4-turbo-2024-04-09', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI, based on the GPT-4 architecture. Answer as concisely as possible. Knowledge cutoff: Dec 2023. Current Beijing Time: {current_time}'},
+config = parse_config()
 
-    {'prefix': 'gpt-4-turbo-2024-04-09$', 'model': 'gpt-4-turbo-2024-04-09', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI, based on the GPT-4 architecture. Answer as concisely as possible. Knowledge cutoff: Dec 2023. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-4-0125-preview$', 'model': 'gpt-4-0125-preview', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI, based on the GPT-4 architecture. Answer as concisely as possible. Knowledge cutoff: Dec 2023. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-4-1106-preview$', 'model': 'gpt-4-1106-preview', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI, based on the GPT-4 architecture. Answer as concisely as possible. Knowledge cutoff: Apr 2023. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-4-vision-preview$', 'model': 'gpt-4-vision-preview', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI, based on the GPT-4 architecture. Answer as concisely as possible. Knowledge cutoff: Apr 2023. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-4-0613$', 'model': 'gpt-4-0613', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI, based on the GPT-4 architecture. Answer as concisely as possible. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-4-32k-0613$', 'model': 'gpt-4-32k-0613', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI, based on the GPT-4 architecture. Answer as concisely as possible. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'},
+# parse env
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
+TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
+API_KEY = os.getenv("OPENAI_API_KEY")
 
-    {'prefix': 'gpt-3.5-turbo-0125$', 'model': 'gpt-3.5-turbo-0125', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI. Answer as concisely as possible. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-3.5-turbo-1106$', 'model': 'gpt-3.5-turbo-1106', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI. Answer as concisely as possible. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-3.5-turbo-0613$', 'model': 'gpt-3.5-turbo-0613', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI. Answer as concisely as possible. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-3.5-turbo-16k-0613$', 'model': 'gpt-3.5-turbo-16k-0613', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI. Answer as concisely as possible. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'},
-    {'prefix': 'gpt-3.5-turbo-0301$', 'model': 'gpt-3.5-turbo-0301', 'prompt_template': 'You are ChatGPT Telegram bot. ChatGPT is a large language model trained by OpenAI. Answer as concisely as possible. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'},
-]
-DEFAULT_MODEL = 'gpt-4-0613' # For compatibility with the old database format
-VISION_MODEL = 'gpt-4-turbo-2024-04-09'
+assert TELEGRAM_API_ID and TELEGRAM_BOT_TOKEN and TELEGRAM_API_HASH and API_KEY
+TELEGRAM_API_ID = int(TELEGRAM_API_ID)
+
+def parse_proxy():
+    proxy_env = os.getenv("ALL_PROXY")
+    if proxy_env:
+        proxy_url = urlparse(proxy_env)
+        return {
+            'proxy_type': proxy_url.scheme,
+            'addr': proxy_url.hostname,
+            'port': proxy_url.port,
+        }
+    else:
+        return None
 
 def get_prompt(model):
-    for m in MODELS:
-        if m['model'] == model:
-            return m['prompt_template'].replace('{current_time}', (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S'))
-    raise ValueError('Model not found')
+    current_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+    return f'You are ChatGPT Telegram bot running {model} model. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}'
 
 aclient = openai.AsyncOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
+    api_key=API_KEY,
+    base_url = config['api_endpoint'],
     max_retries=0,
     timeout=15,
 )
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 
 TELEGRAM_LENGTH_LIMIT = 4096
 TELEGRAM_MIN_INTERVAL = 3
@@ -142,7 +154,7 @@ def get_whitelist():
 
 def only_admin(func):
     async def new_func(message):
-        if message.sender_id != ADMIN_ID:
+        if message.sender_id != config['admin_id']:
             await send_message(message.chat_id, 'Only admin can use this command', message.id)
             return
         await func(message)
@@ -183,7 +195,8 @@ def load_photo(h):
 
 async def completion(chat_history, model, chat_id, msg_id): # chat_history = [user, ai, user, ai, ..., user]
     assert len(chat_history) % 2 == 1
-    messages=[{"role": "system", "content": get_prompt(model)}]
+    system_prompt = get_prompt(model)
+    messages=[{"role": "system", "content": system_prompt}] if system_prompt else []
     roles = ["user", "assistant"]
     role_id = 0
     for msg in chat_history:
@@ -199,10 +212,7 @@ async def completion(chat_history, model, chat_id, msg_id): # chat_history = [us
                             obj['image_url']['url'] = obj['image_url']['url'][:50] + '...'
         return new_messages
     logging.info('Request (chat_id=%r, msg_id=%r): %s', chat_id, msg_id, remove_image(messages))
-    if model == VISION_MODEL:
-        stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True, max_tokens=4096)
-    else:
-        stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True)
+    stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True)
     finished = False
     async for response in stream:
         logging.info('Response (chat_id=%r, msg_id=%r): %s', chat_id, msg_id, response)
@@ -219,7 +229,7 @@ async def completion(chat_history, model, chat_id, msg_id): # chat_history = [us
                 obj.delta.function_call,
                 obj.delta.role,
                 obj.delta.tool_calls,
-            ])
+            ]) or obj.delta.content == ''
             finish_reason = obj.finish_reason
             if 'finish_details' in obj.model_extra and obj.finish_details is not None:
                 assert finish_reason is None
@@ -238,7 +248,7 @@ async def completion(chat_history, model, chat_id, msg_id): # chat_history = [us
 def construct_chat_history(chat_id, msg_id):
     messages = []
     should_be_bot = False
-    model = DEFAULT_MODEL
+    model = config['default_model']
     has_image = False
     while True:
         key = repr((chat_id, msg_id))
@@ -274,7 +284,7 @@ def construct_chat_history(chat_id, msg_id):
         logging.error('First message not from user (chat_id=%r, msg_id=%r)', chat_id, msg_id)
         return None, None
     if has_image:
-        model = VISION_MODEL
+        model = config['vision_model']
     return messages[::-1], model
 
 @only_admin
@@ -301,7 +311,7 @@ async def get_whitelist_handler(message):
 @only_whitelist
 async def list_models_handler(message):
     text = ''
-    for m in MODELS:
+    for m in config['models']:
         text += f'Prefix: "{m["prefix"]}", model: {m["model"]}\n'
     await send_message(message.chat_id, text, message.id)
 
@@ -415,7 +425,7 @@ async def reply_handler(message):
     text = message.message
     logging.info('New message: chat_id=%r, sender_id=%r, msg_id=%r, text=%r, photo=%s, document=%s', chat_id, sender_id, msg_id, text, message.photo, message.document)
     reply_to_id = None
-    model = DEFAULT_MODEL
+    model = config['default_model']
     extra_photo_message = None
     extra_document_message = None
     if not text and message.photo is None and message.document is None: # unknown media types
@@ -434,7 +444,7 @@ async def reply_handler(message):
         else:
             return
     if not message.is_reply or extra_photo_message is not None or extra_document_message is not None: # new message
-        for m in MODELS:
+        for m in config['models']:
             if text.startswith(m['prefix']):
                 text = text[len(m['prefix']):]
                 model = m['model']
@@ -544,10 +554,10 @@ async def main():
         # compatible old db format: db[(chat_id, msg_id)] = (is_bot, text, reply_id)
         # db['whitelist'] = set(whitelist_chat_ids)
         if 'whitelist' not in db:
-            db['whitelist'] = {ADMIN_ID}
+            db['whitelist'] = {config['admin_id']}
         bot_id = int(TELEGRAM_BOT_TOKEN.split(':')[0])
         pending_reply_manager = PendingReplyManager()
-        async with await TelegramClient('bot', TELEGRAM_API_ID, TELEGRAM_API_HASH).start(bot_token=TELEGRAM_BOT_TOKEN) as bot:
+        async with await TelegramClient('bot', TELEGRAM_API_ID, TELEGRAM_API_HASH, proxy=parse_proxy()).start(bot_token=TELEGRAM_BOT_TOKEN) as bot:
             bot.parse_mode = None
             me = await bot.get_me()
             @bot.on(events.NewMessage)

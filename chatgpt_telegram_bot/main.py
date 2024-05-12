@@ -541,7 +541,7 @@ async def reply_handler(message):
     error_cnt = 0
     while True:
         reply = ''
-        async with BotReplyMessages(chat_id, msg_id, f'[{model}] ') as replymsgs:
+        async with BotReplyMessages(chat_id, msg_id, '🤖 ' + RichText.Code(model) + '\n\n') as replymsgs:
             try:
                 stream = completion(chat_history, model, chat_id, msg_id)
                 first_update_timestamp = None

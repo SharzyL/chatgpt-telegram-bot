@@ -2,7 +2,7 @@ from telethon import types
 
 
 class RichText:
-    def __init__(self, s=''):
+    def __init__(self, s):
         if isinstance(s, str):
             self.children = [{'type': 'text', 'content': s}]
         elif isinstance(s, RichText):
@@ -105,7 +105,7 @@ class RichText:
         pre_lang = None
         fence_len = None
         fence_prefix_spaces = None
-        result = RichText()
+        result = RichText('')
         code = ''
         for line in lines:
             if in_pre:
@@ -197,7 +197,7 @@ def process_line(line):
     in_bold = False
     in_escape = False
     buffer = ''
-    result = RichText()
+    result = RichText('')
     for c in line:
         if in_escape:
             in_escape = False

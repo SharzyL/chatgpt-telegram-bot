@@ -11,12 +11,13 @@ import hashlib
 import base64
 import copy
 from collections import defaultdict
-from richtext import RichText
 import openai
 from telethon import TelegramClient, events, errors, functions, types
 import signal
 from urllib.parse import urlparse
 import tomllib
+
+from chatgpt_telegram_bot.richtext import RichText
 
 def debug_signal_handler(signal, frame):
     breakpoint()
@@ -533,7 +534,7 @@ async def reply_handler(message):
 async def ping(message):
     await send_message(message.chat_id, f'chat_id={message.chat_id} user_id={message.sender_id} is_whitelisted={is_whitelist(message.chat_id)}', message.id)
 
-async def main():
+async def async_main():
     global bot_id, pending_reply_manager, db, bot
 
     logFormatter = logging.Formatter("%(asctime)s %(process)d %(levelname)s %(message)s")
@@ -594,4 +595,5 @@ async def main():
             ))
             await bot.run_until_disconnected()
 
-asyncio.run(main())
+def main():
+    asyncio.run(async_main())

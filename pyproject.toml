@@ -1,0 +1,32 @@
+[project]
+name = "chatgpt-telegram-bot"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "SharzyL", email = "me@sharzy.in"},
+    {name = "zzh1996", email = "zhengzihan1996@gmail.com"},
+]
+dependencies = [
+    "Telethon<2.0.0,>=1.32.0",
+    "python-socks<3.0.0,>=2.4.4",
+    "cryptg<1.0.0,>=0.4.0",
+    "openai<2.0.0,>=1.23.1",
+    "async-timeout<5.0.0,>=4.0.3",
+]
+requires-python = "<4.0,>=3.11"
+readme = "README.md"
+license = {text = "MIT"}
+
+[project.scripts]
+chatgpt-telegram-bot = "chatgpt_telegram_bot.main:main"
+
+[tool.pdm]
+distribution = true
+
+[tool.pdm.build]
+includes = []
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+

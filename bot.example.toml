@@ -2,9 +2,13 @@ admin_id = 114514
 api_endpoint = "https://api.openai.com/v1"
 models = [
   { prefix = "3$", model = "gpt-3.5-turbo" },
-  { prefix = "o$", model = "claude-3-opus" },
+  { prefix = "4$", model = "gpt-4" },
+  { prefix = "4v$", model = "gpt-4-vision-preview" },
   { prefix = "d$", model = "deepseek-chat" },
-  { prefix = "$", model = "gpt-4" },
+  { prefix = "g$", model = "gemini-pro" },
+
+  # the default
+  { prefix = "$", model = "claude-3-opus" },
 ]
-default_model = "gpu-4"
+default_model = "claude-3-opus"
 vision_model = 'gpt-4-vision-preview'

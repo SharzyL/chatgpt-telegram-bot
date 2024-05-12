@@ -1,12 +1,14 @@
 from telethon import types
 
+
 class RichText:
     def __init__(self, s=''):
         if isinstance(s, str):
             self.children = [{'type': 'text', 'content': s}]
         elif isinstance(s, RichText):
             self.children = s.children
-        elif isinstance(s, list) and s and all(isinstance(c, dict) for c in s) and all('type' in c and 'content' in c for c in s):
+        elif isinstance(s, list) and s and all(isinstance(c, dict) for c in s) and all(
+                'type' in c and 'content' in c for c in s):
             self.children = s
         else:
             raise ValueError()
@@ -87,14 +89,15 @@ class RichText:
             i_stop = min(c_stop, stop)
             if i_start < i_stop:
                 new_c = c.copy()
-                new_c['content'] = c['content'][i_start - offset : i_stop - offset]
+                new_c['content'] = c['content'][i_start - offset: i_stop - offset]
                 new_children.append(new_c)
             offset += l
         return RichText(new_children)
 
-    # This function returns rich text that includes the raw Markdown content, with formatting tokens.
-    # The function processes only a subset of Markdown and does NOT adhere to its respective specification.
-    # The challenge in implementing a version that complies with the Markdown standard lies in the fact that common Python Markdown parser libraries do not provide character offset information for AST nodes in the source code.
+    # This function returns rich text that includes the raw Markdown content, with formatting tokens. The function
+    # processes only a subset of Markdown and does NOT adhere to its respective specification. The challenge in
+    # implementing a version that complies with the Markdown standard lies in the fact that common Python Markdown
+    # parser libraries do not provide character offset information for AST nodes in the source code.
     @classmethod
     def from_markdown(cls, markdown):
         lines = markdown.splitlines(keepends=True)
@@ -183,6 +186,7 @@ class RichText:
                     entities.append(types.MessageEntityTextUrl(offset + start, length, c['url']))
                 offset += utf16len(t)
         return text, entities
+
 
 def process_line(line):
     is_title = False

@@ -412,7 +412,7 @@ class ChatGPTTelegramBot:
     @retry()
     @ensure_interval
     async def send_message(self, chat_id, text, reply_to_message_id):
-        logger.info(f'Sending message: {chat_id=}, {reply_to_message_id=}, {text=}')
+        logger.debug(f'Sending message: {chat_id=}, {reply_to_message_id=}, {text=}')
         text = RichText(text)
         text, entities = text.to_telegram()
         msg = await self.bot.send_message(

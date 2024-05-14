@@ -241,13 +241,18 @@ async def completion(chat_history, model, chat_id, msg_id):  # chat_history = [u
     finished = False
     async for response in stream:
         logging.debug('Response (chat_id=%r, msg_id=%r): %s', chat_id, msg_id, response)
-        assert not finished
+        assert not finished or len(response.choices) == 0  # OpenAI sometimes returns a empty response even when finished
+        if len(response.choices) == 0:
+            continue
+
         obj = response.choices[0]
         if obj.delta.role is not None:
             if obj.delta.role != 'assistant':
                 raise ValueError("Role error")
         if obj.delta.content is not None:
             yield obj.delta.content
+
+        # handle the finish
         if obj.finish_reason is not None or ('finish_details' in obj.model_extra and obj.finish_details is not None):
             assert all(item is None for item in [
                 obj.delta.content,

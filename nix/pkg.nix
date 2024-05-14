@@ -5,6 +5,7 @@
 , python-socks
 , openai
 , cryptg
+, loguru
 , pdm-backend
 }:
 
@@ -35,6 +36,7 @@ buildPythonPackage {
     python-socks
     cryptg
     openai
+    loguru
   ];
   doCheck = false; # since we have no test
 }

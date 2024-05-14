@@ -630,6 +630,8 @@ async def async_main():
                 scope=types.BotCommandScopePeer(admin_input_peer),
                 lang_code='',
                 commands=[types.BotCommand(command, description) for command, description in [
+                    ('ping', 'Test bot connectivity'),
+                    ('list_models', 'List supported models'),
                     ('add_whitelist', 'Add this group to whitelist (only admin)'),
                     ('del_whitelist', 'Delete this group from whitelist (only admin)'),
                     ('get_whitelist', 'List groups in whitelist (only admin)'),

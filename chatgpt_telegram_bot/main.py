@@ -181,7 +181,7 @@ class ChatGPTTelegramBot:
     def get_prompt(model):
         current_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
         return f'''
-    You are ChatGPT Telegram bot running {model} model. Knowledge cutoff: Sep 2021. Current Beijing Time: {current_time}
+    You are ChatGPT Telegram bot running {model} model. Current Beijing Time: {current_time}
     '''
 
     def within_interval(self, chat_id):

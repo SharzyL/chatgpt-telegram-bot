@@ -414,8 +414,11 @@ class ChatGPTTelegramBot:
     async def list_models_handler(self, message):
         text = ''
         for m in self.models:
-            text += f'Prefix: "{m["prefix"]}", model: {m["model"]}\n'
-        await self.send_message(message.chat_id, text, message.id)
+            if 'endpoint' in m:
+                text += f'"<code>{m["prefix"]}</code>": <code>{m["model"]}</code> (from {m["endpoint"]})\n'
+            else:
+                text += f'"<code>{m["prefix"]}</code>": <code>{m["model"]}</code>\n'
+        await self.send_message_html(message.chat_id, text, message.id)
 
     @retry()
     @ensure_interval
@@ -429,6 +432,20 @@ class ChatGPTTelegramBot:
             reply_to=reply_to_message_id,
             link_preview=False,
             formatting_entities=entities,
+        )
+        logger.info(f'Message sent: {chat_id=}, {reply_to_message_id=}, {msg.id=}')
+        return msg.id
+
+    @retry()
+    @ensure_interval
+    async def send_message_html(self, chat_id, text, reply_to_message_id):
+        logger.debug(f'Sending message html: {chat_id=}, {reply_to_message_id=}, {text=}')
+        msg = await self.bot.send_message(
+            chat_id,
+            text,
+            reply_to=reply_to_message_id,
+            link_preview=False,
+            parse_mode='html',
         )
         logger.info(f'Message sent: {chat_id=}, {reply_to_message_id=}, {msg.id=}')
         return msg.id

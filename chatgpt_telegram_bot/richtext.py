@@ -78,7 +78,7 @@ class RichText:
         if step != 1:
             raise NotImplementedError()
         if start >= stop:
-            return RichText()
+            return RichText("")
         offset = 0
         new_children = []
         for c in self.children:

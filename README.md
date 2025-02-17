@@ -31,11 +31,14 @@
 1. Obtain an OpenAI API key from https://platform.openai.com/account/api-keys
 1. Create a Telegram bot by using BotFather via https://t.me/BotFather
 1. Get `api_id` and `api_hash` from https://my.telegram.org/apps
-1. Set **OpenAI API key** and **Telegram Bot Token** and **Telegram API ID and Hash** in the `docker-compose.yml` file.
-1. In the `main.py` file, specify the **Telegram admin user ID** (you can send `/ping` to your bot to obtain your user ID) and the **prompt text**.
+1. Copy `bot.example.toml` to `bot.toml` and modify its entries to fit your need.
+1. Setup the following environments:
+    - `TELEGRAM_API_ID`
+    - `TELEGRAM_API_HASH`
+    - `TELEGRAM_BOT_TOKEN`
+    - `OPENAI_API_KEY_{name}`, where `{name}` is replaced with the endpoint name specified in your `bot.toml`.
 1. If you want to use the bot in a group, you must **disable privacy mode** in the bot settings.
-1. Run `docker-compose up --build -d`
-1. You can interact with your bot by initiating a new conversation with a message that starts with `$`. For example, you can type `$Hello`. By default, the bot uses the GPT-4 model. To switch to the GPT-3.5-Turbo model, simply start the message with `$$`.
+1. You can interact with your bot by initiating a new conversation with a message that starts with the given prefix.
 1. To continue a conversation thread, reply to a previous message sent by the bot.
 1. You can reply multiple times to the same message to "fork" the thread.
 1. In a group, only the bot admin can use the `/add_whitelist` command to whitelist the group. To remove the group from the whitelist, the admin can use the `/del_whitelist` command.
@@ -43,4 +46,3 @@
 
 By following these steps, you can effectively use the ChatGPT Telegram bot for your needs.
 
-Note: the above instructions are written by ChatGPT.

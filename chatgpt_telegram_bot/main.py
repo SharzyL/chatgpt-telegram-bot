@@ -79,7 +79,6 @@ class ChatGPTTelegramBot:
         self.TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
         self.TELEGRAM_API_ID = int(os.environ["TELEGRAM_API_ID"])
         self.TELEGRAM_API_HASH = os.environ["TELEGRAM_API_HASH"]
-        self.API_KEY = os.environ["OPENAI_API_KEY"]
 
         self.TELEGRAM_API_ID = int(self.TELEGRAM_API_ID)
 
@@ -87,18 +86,26 @@ class ChatGPTTelegramBot:
             _config = tomllib.load(f)
         self.admin_id = _config['admin_id']
         self.models = _config['models']
-        self.api_endpoint = _config['api_endpoint']
         self.vision_model = _config['vision_model']
         self.default_model = _config['default_model']
+        self.default_api_endpoint = _config['default_api_endpoint']
 
         self.telegram_last_timestamp = defaultdict(lambda: None)
 
-        self.aclient = openai.AsyncOpenAI(
-            api_key=self.API_KEY,
-            base_url=self.api_endpoint,
-            max_retries=0,
-            timeout=15,
-        )
+        # map endpoint to aclient
+        self.endpoint_to_aclient = {
+            endpoint['name']: openai.AsyncOpenAI(
+                api_key=os.environ[f"OPENAI_API_KEY_{endpoint['name']}"],
+                base_url=endpoint['url'],
+                max_retries=0,
+                timeout=15,
+        ) for endpoint in _config['api_endpoints']}
+
+        # check if specified endpoints are legal
+        assert self.default_api_endpoint in self.endpoint_to_aclient
+        for model in self.models:
+            if 'endpoint' in model:
+                assert model['endpoint'] in self.endpoint_to_aclient
 
         self.TELEGRAM_LENGTH_LIMIT = 4096
         self.TELEGRAM_MIN_INTERVAL = 3
@@ -274,7 +281,7 @@ class ChatGPTTelegramBot:
         with open(path, 'rb') as f:
             return f.read()
 
-    async def completion(self, chat_history, model, chat_id, msg_id):  # chat_history = [user, ai, user, ai, ..., user]
+    async def completion(self, chat_history, model, endpoint, chat_id, msg_id):  # chat_history = [user, ai, user, ai, ..., user]
         assert len(chat_history) % 2 == 1
         system_prompt = self.get_prompt(model)
         messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
@@ -295,11 +302,12 @@ class ChatGPTTelegramBot:
             return new_messages
 
         logger.info(f'Request ({chat_id=}, {msg_id=}): {remove_image(messages)}')
+        aclient = self.endpoint_to_aclient[endpoint]
         if model == self.vision_model:
-            stream = await self.aclient.chat.completions.create(model=model, messages=messages, stream=True,
+            stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True,
                                                                 max_tokens=4096)
         else:
-            stream = await self.aclient.chat.completions.create(model=model, messages=messages, stream=True)
+            stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True)
         finished = False
         async for response in stream:
             logger.debug(f'Response ({chat_id=}, {msg_id=}): {response}')
@@ -464,12 +472,15 @@ class ChatGPTTelegramBot:
                     f'{chat_id=}, {sender_id=}, {msg_id=}, {text=}, {message.photo=}, {message.document=}')
         reply_to_id = None
         model = self.default_model
+        endpoint = self.default_api_endpoint
         extra_photo_message = None
         extra_document_message = None
-        if not text and message.photo is None and message.document is None:  # unknown media types
+        if not text and message.photo is None and message.document is None:
+            logger.info(f'Unknown media types {chat_id=}, {msg_id=}')
             return
         if message.is_reply:
             if message.reply_to.quote_text is not None:
+                logger.info(f'Reply contains quote text {chat_id=}, {msg_id=}')
                 return
             reply_to_message = await message.get_reply_message()
             if reply_to_message.sender_id == self.bot_id:  # user reply to bot message
@@ -486,10 +497,12 @@ class ChatGPTTelegramBot:
                 if text.startswith(m['prefix']):
                     text = text[len(m['prefix']):]
                     model = m['model']
+                    if 'endpoint' in m:
+                        endpoint = m['endpoint']
                     break
             else:  # not reply or new message to bot
                 if chat_id == sender_id:  # if in private chat, send hint
-                    await self.send_message(chat_id, 'Please start a new conversation with $ or reply to a bot message',
+                    await self.send_message(chat_id, 'Please start a new conversation with specified prefixes or reply to a bot message',
                                             msg_id)
                 return
 
@@ -548,7 +561,7 @@ class ChatGPTTelegramBot:
             prefix = '🤖 ' + RichText.Code(model) + '\n\n'
             async with BotReplyMessages(self, chat_id, msg_id, prefix) as replymsgs:
                 try:
-                    stream = self.completion(chat_history, model, chat_id, msg_id)
+                    stream = self.completion(chat_history, model, endpoint, chat_id, msg_id)
                     first_update_timestamp = None
                     async for delta in stream:
                         reply += delta

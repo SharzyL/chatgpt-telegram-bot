@@ -1,5 +1,9 @@
 admin_id = 114514
-api_endpoint = "https://api.openai.com/v1"
+api_endpoints = [
+  { name = "openai", url = "https://api.openai.com/v1" }
+]
+default_api_endpoint = "openai"
+
 models = [
   { prefix = "3$", model = "gpt-3.5-turbo" },
   { prefix = "4$", model = "gpt-4" },

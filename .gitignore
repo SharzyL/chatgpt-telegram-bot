@@ -1,17 +1,12 @@
 .venv
-*.log
-db
 __pycache__
 *.pyc
 .DS_Store
+
+db
 *.session
-.ipynb_checkpoints/
-temp/
-chatlogs/
-docker-compose-prod.yml
+*.session-journal
 photos/
-db.db
-bot.session-journal
 
 bot.toml
 dist

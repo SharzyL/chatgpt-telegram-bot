@@ -14,6 +14,7 @@ from collections import defaultdict
 from urllib.parse import urlparse
 import tomllib
 from argparse import ArgumentParser
+from typing import Sequence, Optional, Dict, NamedTuple, DefaultDict, Any, Tuple
 
 import openai
 from telethon import TelegramClient, events, errors, functions, types
@@ -21,6 +22,34 @@ from loguru import logger
 
 from chatgpt_telegram_bot.richtext import RichText
 
+class Model(NamedTuple):
+    prefix: str
+    name: str
+    endpoint: Optional[str] = None
+
+class EndPoint(NamedTuple):
+    name: str
+    url: str
+
+class MsgObj(NamedTuple):
+    """
+    either "text" or "image"
+    """
+    type_: str
+    hash: Optional[str]  # must present when str == "img"
+    text: Optional[str]  # must present when str == "text"
+
+def make_image_obj(_hash: str) -> MsgObj:
+    return MsgObj(type_="image", hash=_hash, text=None)
+
+def make_text_obj(text: str) -> MsgObj:
+    return MsgObj(type_="text", hash=None, text=text)
+
+class MsgInfo(NamedTuple):
+    sent_by_bot: bool
+    message: list[MsgObj]
+    reply_id: Optional[int]
+    prefix: Optional[str]
 
 def parse_proxy():
     proxy_env = os.getenv("ALL_PROXY")
@@ -76,54 +105,53 @@ class PendingReplyManager:
 class ChatGPTTelegramBot:
     def __init__(self, config_path):
         # parse env
-        self.TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-        self.TELEGRAM_API_ID = int(os.environ["TELEGRAM_API_ID"])
-        self.TELEGRAM_API_HASH = os.environ["TELEGRAM_API_HASH"]
+        self.TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
+        self.TELEGRAM_API_ID: int = int(os.environ["TELEGRAM_API_ID"])
+        self.TELEGRAM_API_HASH: str = os.environ["TELEGRAM_API_HASH"]
 
         self.TELEGRAM_API_ID = int(self.TELEGRAM_API_ID)
 
         with open(config_path, "rb") as f:
             _config = tomllib.load(f)
-        self.admin_id = _config['admin_id']
-        self.models = _config['models']
-        self.vision_model = _config['vision_model']
-        self.default_model = _config['default_model']
-        self.default_api_endpoint = _config['default_api_endpoint']
+        self.admin_id: int = _config['admin_id']
+        self.models: Sequence[Model] = [Model(**m) for m in _config['models']]
+        self.endpoints: Sequence[EndPoint] = [EndPoint(**e) for e in _config['endpoints']]
+        self.default_endpoint: str = _config['default_endpoint']
 
-        self.telegram_last_timestamp = defaultdict(lambda: None)
+        self.telegram_last_timestamp: DefaultDict[int, Optional[int]] = defaultdict(lambda: None)
+        self.telegram_rate_limit_lock: DefaultDict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # map endpoint to aclient
-        self.endpoint_to_aclient = {
-            endpoint['name']: openai.AsyncOpenAI(
-                api_key=os.environ[f"OPENAI_API_KEY_{endpoint['name']}"],
-                base_url=endpoint['url'],
+        self.endpoint_to_aclient: Dict[str, openai.AsyncOpenAI] = {
+            endpoint.name: openai.AsyncOpenAI(
+                api_key=os.environ[f"OPENAI_API_KEY_{endpoint.name}"],
+                base_url=endpoint.url,
                 max_retries=0,
                 timeout=15,
-        ) for endpoint in _config['api_endpoints']}
+        ) for endpoint in self.endpoints}
 
         # check if specified endpoints are legal
-        assert self.default_api_endpoint in self.endpoint_to_aclient
         for model in self.models:
             if 'endpoint' in model:
-                assert model['endpoint'] in self.endpoint_to_aclient
+                assert model.endpoint in self.endpoint_to_aclient
 
-        self.TELEGRAM_LENGTH_LIMIT = 4096
-        self.TELEGRAM_MIN_INTERVAL = 3
-        self.OPENAI_MAX_RETRY = 3
-        self.OPENAI_RETRY_INTERVAL = 10
-        self.FIRST_BATCH_DELAY = 1
-        self.TEXT_FILE_SIZE_LIMIT = 100_000
-
-        self.telegram_last_timestamp = dict()
-        self.telegram_rate_limit_lock = defaultdict(asyncio.Lock)
+        self.TELEGRAM_LENGTH_LIMIT: int = 4096
+        self.TELEGRAM_MIN_INTERVAL: int = 3
+        self.OPENAI_MAX_RETRY: int = 3
+        self.OPENAI_RETRY_INTERVAL: int = 10
+        self.FIRST_BATCH_DELAY: int = 1
+        self.TEXT_FILE_SIZE_LIMIT: int = 100_000
 
         self.pending_reply_manager = PendingReplyManager()
 
+        """
+        db scheme:
+        whitelist: Set[int]
+        msg_info_{chat_id}_{msg_id}: MsgInfo
+        """
         self.db = shelve.open('db')
+
         atexit.register(self.db.close)
-        # db[(chat_id, msg_id)] = (is_bot, text, reply_id, model)
-        # compatible old db format: db[(chat_id, msg_id)] = (is_bot, text, reply_id)
-        # db['whitelist'] = set(whitelist_chat_ids)
         if 'whitelist' not in self.db:
             self.db['whitelist'] = {self.admin_id}
 
@@ -131,7 +159,19 @@ class ChatGPTTelegramBot:
         self.pending_reply_manager = PendingReplyManager()
         self.bot = TelegramClient('bot', self.TELEGRAM_API_ID, self.TELEGRAM_API_HASH, proxy=parse_proxy())
 
+    def get_msg_info(self, chat_id: int, msg_id: int) -> Optional[MsgInfo]:
+        key = f'msg_info_{chat_id}_{msg_id}'
+        if key in self.db:
+            return self.db[key]
+        else:
+            return None
+
+    def set_msg_info(self, chat_id: int, msg_id: int, msg_info: MsgInfo):
+        key = f'msg_info_{chat_id}_{msg_id}'
+        self.db[key] = msg_info
+
     async def start(self):
+        logger.info('Pre bot start')
         await self.bot.start(bot_token=self.TELEGRAM_BOT_TOKEN)
         logger.info('Bot started')
         self.bot.parse_mode = None
@@ -264,7 +304,7 @@ class ChatGPTTelegramBot:
         return new_func
 
     @staticmethod
-    def save_photo(photo_blob):  # TODO: change to async
+    def save_photo(photo_blob) -> str:  # TODO: change to async
         h = hashlib.sha256(photo_blob).hexdigest()
         save_dir = f'photos/{h[:2]}/{h[2:4]}'
         path = f'{save_dir}/{h}'
@@ -275,7 +315,7 @@ class ChatGPTTelegramBot:
         return h
 
     @staticmethod
-    def load_photo(h):
+    def load_photo(h) -> bytes:
         save_dir = f'photos/{h[:2]}/{h[2:4]}'
         path = f'{save_dir}/{h}'
         with open(path, 'rb') as f:
@@ -303,11 +343,7 @@ class ChatGPTTelegramBot:
 
         logger.info(f'Request ({chat_id=}, {msg_id=}): {remove_image(messages)}')
         aclient = self.endpoint_to_aclient[endpoint]
-        if model == self.vision_model:
-            stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True,
-                                                                max_tokens=4096)
-        else:
-            stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True)
+        stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True)
         finished = False
         async for response in stream:
             logger.debug(f'Response ({chat_id=}, {msg_id=}): {response}')
@@ -347,47 +383,51 @@ class ChatGPTTelegramBot:
                         yield f'\n\n[!] Error: finish_details="{obj.finish_details}"'
                 finished = True
 
-    def construct_chat_history(self, chat_id, msg_id):
-        messages = []
+    def construct_chat_history(self, chat_id: int, msg_id: int) -> Tuple[list[Any], Model]:
+        history = []
         should_be_bot = False
-        model = self.default_model
-        has_image = False
+        model_of_history: Optional[Model] = None
+
+        # trace through the replay chain and construct the message history
+        cur_msg_id = msg_id
         while True:
-            key = repr((chat_id, msg_id))
-            if key not in self.db:
-                logger.error(f'History message not found ({chat_id=}, {msg_id=})')
-                return None, None
-            is_bot, message, reply_id, *params = self.db[key]
-            if params:
-                model = params[0]
-            if is_bot != should_be_bot:
-                logger.error(f'Role does not match ({chat_id=}, {msg_id=})')
-                return None, None
-            if isinstance(message, list):
-                new_message = []
-                for obj in message:
-                    if obj['type'] == 'text':
-                        new_message.append(obj)
-                    elif obj['type'] == 'image':
-                        blob = self.load_photo(obj['hash'])
-                        blob_base64 = base64.b64encode(blob).decode()
-                        image_url = 'data:image/jpeg;base64,' + blob_base64
-                        new_message.append({'type': 'image_url', 'image_url': {'url': image_url, 'detail': 'high'}})
-                        has_image = True
-                    else:
-                        raise ValueError('Unknown message type in chat history')
-                message = new_message
-            messages.append(message)
+            msg_info = self.get_msg_info(chat_id, cur_msg_id)
+            if msg_info is None:
+                raise RuntimeError(f'MsgInfo not found ({chat_id=}, {cur_msg_id=}, {msg_id=})')
+
+            # infer the model and endpoint from the first replied msg
+            if msg_info.prefix:
+                for model in self.models:
+                    if model.prefix == msg_info.prefix:
+                        model_of_history = model
+
+            if msg_info.sent_by_bot != should_be_bot:
+                raise RuntimeError(f'Role does not match ({chat_id=}, {cur_msg_id=}, {msg_id=}, {should_be_bot=})')
+
+            new_message = []  # a list of OpenAI API messages
+            for obj in msg_info.message:
+                if obj.type_ == 'text':
+                    new_message.append({'type': 'text', 'text': obj.text})
+                elif obj.type_ == 'image':
+                    blob = self.load_photo(obj.hash)
+                    blob_base64 = base64.b64encode(blob).decode()
+                    image_url = 'data:image/jpeg;base64,' + blob_base64
+                    new_message.append({'type': 'image_url', 'image_url': {'url': image_url, 'detail': 'high'}})
+                else:
+                    raise RuntimeError('Unknown message type in chat history')
+            message = new_message
+
+            history.append(message)
             should_be_bot = not should_be_bot
-            if reply_id is None:
+            if msg_info.reply_id is None:
                 break
-            msg_id = reply_id
-        if len(messages) % 2 != 1:
-            logger.error(f'First message not from user ({chat_id=}, {msg_id=})')
-            return None, None
-        if has_image:
-            model = self.vision_model
-        return messages[::-1], model
+            cur_msg_id = msg_info.reply_id
+
+        if len(history) % 2 != 1:
+            raise RuntimeError(f'First message not from user ({chat_id=}, {msg_id=})')
+
+        assert model_of_history
+        return history[::-1], model_of_history
 
     @only_admin
     async def add_whitelist_handler(self, message):
@@ -415,9 +455,9 @@ class ChatGPTTelegramBot:
         text = ''
         for m in self.models:
             if 'endpoint' in m:
-                text += f'"<code>{m["prefix"]}</code>": <code>{m["model"]}</code> (from {m["endpoint"]})\n'
+                text += f'"<code>{m.prefix}</code>": <code>{m.name}</code> (from {m.endpoint})\n'
             else:
-                text += f'"<code>{m["prefix"]}</code>": <code>{m["model"]}</code>\n'
+                text += f'"<code>{m.prefix}</code>": <code>{m.name}</code>\n'
         await self.send_message_html(message.chat_id, text, message.id)
 
     @retry()
@@ -488,8 +528,8 @@ class ChatGPTTelegramBot:
         logger.info(f'New message to reply: '
                     f'{chat_id=}, {sender_id=}, {msg_id=}, {text=}, {message.photo=}, {message.document=}')
         reply_to_id = None
-        model = self.default_model
-        endpoint = self.default_api_endpoint
+        prefix = None
+
         extra_photo_message = None
         extra_document_message = None
         if not text and message.photo is None and message.document is None:
@@ -511,11 +551,9 @@ class ChatGPTTelegramBot:
                 return
         if not message.is_reply or extra_photo_message is not None or extra_document_message is not None:  # new message
             for m in self.models:
-                if text.startswith(m['prefix']):
-                    text = text[len(m['prefix']):]
-                    model = m['model']
-                    if 'endpoint' in m:
-                        endpoint = m['endpoint']
+                if text.startswith(m.prefix):
+                    text = text[len(m.prefix):]
+                    prefix = m.prefix
                     break
             else:  # not reply or new message to bot
                 if chat_id == sender_id:  # if in private chat, send hint
@@ -552,33 +590,37 @@ class ChatGPTTelegramBot:
                 return
 
         if photo_hash:
-            new_message = [{'type': 'text', 'text': text}, {'type': 'image', 'hash': photo_hash}]
+            new_message: list[MsgObj] = [
+                make_text_obj(text),
+                make_image_obj(photo_hash),
+            ]
         elif document_text:
             if text:
-                new_message = document_text + '\n\n' + text
+                new_message = [make_text_obj(document_text + '\n\n' + text)]
             else:
-                new_message = document_text
+                new_message = [make_text_obj(document_text)]
         else:
-            new_message = text
+            new_message = [make_text_obj(text)]
 
-        self.db[repr((chat_id, msg_id))] = (False, new_message, reply_to_id, model)
+        self.set_msg_info(chat_id, msg_id,
+                          MsgInfo(sent_by_bot=False, message=new_message, reply_id=reply_to_id, prefix=prefix))
 
-        chat_history, model = self.construct_chat_history(chat_id, msg_id)
-        if chat_history is None:
+        try:
+            chat_history, model = self.construct_chat_history(chat_id, msg_id)
+        except RuntimeError as e:
             await self.send_message(chat_id,
-                                    f"[!] Error: Unable to proceed with this conversation. Potential "
-                                    f"causes: the message replied to may be incomplete, contain an error, "
-                                    f"be a system message, or not exist in the database.",
+                                    f"[!] Error on resolving conversation: {e}",
                                     msg_id)
             return
 
         error_cnt = 0
         while True:
             reply = ''
-            prefix = '🤖 ' + RichText.Code(model) + '\n\n'
+            prefix = '🤖 ' + RichText.Code(model.name) + '\n\n'
             async with BotReplyMessages(self, chat_id, msg_id, prefix) as replymsgs:
                 try:
-                    stream = self.completion(chat_history, model, endpoint, chat_id, msg_id)
+                    endpoint = model.endpoint or self.default_endpoint
+                    stream = self.completion(chat_history, model.name, endpoint, chat_id, msg_id)
                     first_update_timestamp = None
                     async for delta in stream:
                         reply += delta
@@ -588,8 +630,9 @@ class ChatGPTTelegramBot:
                             await replymsgs.update(RichText.from_markdown(reply) + ' [!Generating...]')
                     await replymsgs.update(RichText.from_markdown(reply))
                     await replymsgs.finalize()
-                    for message_id, _ in replymsgs.replied_msgs:
-                        self.db[repr((chat_id, message_id))] = (True, reply, msg_id, model)
+                    for bot_msg_id, _ in replymsgs.replied_msgs:
+                        self.set_msg_info(chat_id, bot_msg_id,
+                                          MsgInfo(sent_by_bot=True, message=[make_text_obj(reply)], reply_id=msg_id, prefix=prefix))
                     return
 
                 # handling completion errors

@@ -5,14 +5,12 @@ api_endpoints = [
 default_api_endpoint = "openai"
 
 models = [
-  { prefix = "3$", model = "gpt-3.5-turbo" },
-  { prefix = "4$", model = "gpt-4" },
-  { prefix = "4v$", model = "gpt-4-vision-preview" },
-  { prefix = "d$", model = "deepseek-chat" },
-  { prefix = "g$", model = "gemini-pro" },
+  { prefix = "3$", name = "gpt-3.5-turbo" },
+  { prefix = "4$", name = "gpt-4" },
+  { prefix = "4v$", name = "gpt-4-vision-preview" },
+  { prefix = "d$", name = "deepseek-chat" },
+  { prefix = "g$", name = "gemini-pro" },
 
   # the default
-  { prefix = "$", model = "claude-3-opus" },
+  { prefix = "$", name = "claude-3-opus" },
 ]
-default_model = "claude-3-opus"
-vision_model = 'gpt-4-vision-preview'

@@ -22,14 +22,17 @@ from loguru import logger
 
 from chatgpt_telegram_bot.richtext import RichText
 
+
 class Model(NamedTuple):
     prefix: str
     name: str
     endpoint: Optional[str] = None
 
+
 class EndPoint(NamedTuple):
     name: str
     url: str
+
 
 class MsgObj(NamedTuple):
     """
@@ -39,17 +42,22 @@ class MsgObj(NamedTuple):
     hash: Optional[str]  # must present when str == "img"
     text: Optional[str]  # must present when str == "text"
 
+
 def make_image_obj(_hash: str) -> MsgObj:
     return MsgObj(type_="image", hash=_hash, text=None)
 
+
 def make_text_obj(text: str) -> MsgObj:
     return MsgObj(type_="text", hash=None, text=text)
+
 
 class MsgInfo(NamedTuple):
     sent_by_bot: bool
     message: list[MsgObj]
     reply_id: Optional[int]
     prefix: Optional[str]
+    system_prompt: Optional[str]
+
 
 def parse_proxy():
     proxy_env = os.getenv("ALL_PROXY")
@@ -128,7 +136,7 @@ class ChatGPTTelegramBot:
                 base_url=endpoint.url,
                 max_retries=0,
                 timeout=15,
-        ) for endpoint in self.endpoints}
+            ) for endpoint in self.endpoints}
 
         # check if specified endpoints are legal
         for model in self.models:
@@ -148,6 +156,7 @@ class ChatGPTTelegramBot:
         db scheme:
         whitelist: Set[int]
         msg_info_{chat_id}_{msg_id}: MsgInfo
+        system_prompt_{chat_id}: str
         """
         self.db = shelve.open('db')
 
@@ -170,6 +179,13 @@ class ChatGPTTelegramBot:
         key = f'msg_info_{chat_id}_{msg_id}'
         self.db[key] = msg_info
 
+    def get_system_prompt_by_chat(self, chat_id: int):
+        key = f'system_prompt_{chat_id}'
+        if key in self.db:
+            return self.db[key]
+        else:
+            return None
+
     async def start(self):
         logger.info('Pre bot start')
         await self.bot.start(bot_token=self.TELEGRAM_BOT_TOKEN)
@@ -179,6 +195,7 @@ class ChatGPTTelegramBot:
 
         @self.bot.on(events.NewMessage)
         async def process(event):
+            prompt_db_key = f'system_prompt_{event.message.chat_id}'
             if event.message.chat_id is None:
                 return
             if event.message.sender_id is None:
@@ -196,6 +213,24 @@ class ChatGPTTelegramBot:
                 await self.del_whitelist_handler(event.message)
             elif text == '/get_whitelist' or text == f'/get_whitelist@{me.username}':
                 await self.get_whitelist_handler(event.message)
+
+            elif text == '/get_prompt' or text == f'/get_prompt@{me.username}':
+                if prompt_db_key in self.db:
+                    prompt = self.db[prompt_db_key]
+                    await self.send_message(event.message.chat_id, f'system prompt:\n\n{prompt}', event.message.id)
+                else:
+                    await self.send_message(event.message.chat_id, f'no prompt set yet', event.message.id)
+            elif text.startswith('/set_prompt'):
+                space_pos = text.find(' ')
+                if space_pos == -1:
+                    space_pos = len(text) - 1
+                prompt = text[space_pos + 1:]
+                self.db[prompt_db_key] = prompt
+                await self.send_message(event.message.chat_id, f'system prompt set to:\n\n{prompt}', event.message.id)
+            elif text == '/clear_prompt' or text == f'/clear_prompt@{me.username}':
+                if prompt_db_key in self.db:
+                    del self.db[prompt_db_key]
+                await self.send_message(event.message.chat_id, f'system prompt cleared', event.message.id)
             else:
                 await self.reply_handler(event.message)
 
@@ -209,6 +244,9 @@ class ChatGPTTelegramBot:
                 ('add_whitelist', 'Add this group to whitelist (only admin)'),
                 ('del_whitelist', 'Delete this group from whitelist (only admin)'),
                 ('get_whitelist', 'List groups in whitelist (only admin)'),
+                ('get_prompt', 'Get system prompt'),
+                ('set_prompt', 'Set system prompt'),
+                ('clear_prompt', 'Clear system prompt'),
             ]]
         ))
 
@@ -225,13 +263,13 @@ class ChatGPTTelegramBot:
         await self.bot.run_until_disconnected()
 
     @staticmethod
-    def get_prompt(model):
+    def get_prompt(model: str):
         current_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
         return f'''
     You are ChatGPT Telegram bot running {model} model. Current Beijing Time: {current_time}
     '''
 
-    def within_interval(self, chat_id):
+    def within_interval(self, chat_id: int):
         last_timestamp = self.telegram_last_timestamp.get(chat_id, None)
         if last_timestamp is None:
             return False
@@ -321,9 +359,9 @@ class ChatGPTTelegramBot:
         with open(path, 'rb') as f:
             return f.read()
 
-    async def completion(self, chat_history, model, endpoint, chat_id, msg_id):  # chat_history = [user, ai, user, ai, ..., user]
+    async def completion(self, chat_history: list[Any], model: Model, system_prompt: str,
+                         endpoint: str, chat_id: int, msg_id: int):  # chat_history = [user, ai, user, ai, ..., user]
         assert len(chat_history) % 2 == 1
-        system_prompt = self.get_prompt(model)
         messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
         roles = ["user", "assistant"]
         role_id = 0
@@ -343,7 +381,7 @@ class ChatGPTTelegramBot:
 
         logger.info(f'Request ({chat_id=}, {msg_id=}): {remove_image(messages)}')
         aclient = self.endpoint_to_aclient[endpoint]
-        stream = await aclient.chat.completions.create(model=model, messages=messages, stream=True)
+        stream = await aclient.chat.completions.create(model=model.name, messages=messages, stream=True)
         finished = False
         async for response in stream:
             logger.debug(f'Response ({chat_id=}, {msg_id=}): {response}')
@@ -383,10 +421,11 @@ class ChatGPTTelegramBot:
                         yield f'\n\n[!] Error: finish_details="{obj.finish_details}"'
                 finished = True
 
-    def construct_chat_history(self, chat_id: int, msg_id: int) -> Tuple[list[Any], Model]:
+    def construct_chat_history(self, chat_id: int, msg_id: int) -> Tuple[list[Any], Model, str]:
         history = []
         should_be_bot = False
         model_of_history: Optional[Model] = None
+        system_prompt = None
 
         # trace through the replay chain and construct the message history
         cur_msg_id = msg_id
@@ -400,6 +439,9 @@ class ChatGPTTelegramBot:
                 for model in self.models:
                     if model.prefix == msg_info.prefix:
                         model_of_history = model
+
+            if msg_info.system_prompt:
+                system_prompt = msg_info.system_prompt
 
             if msg_info.sent_by_bot != should_be_bot:
                 raise RuntimeError(f'Role does not match ({chat_id=}, {cur_msg_id=}, {msg_id=}, {should_be_bot=})')
@@ -415,9 +457,8 @@ class ChatGPTTelegramBot:
                     new_message.append({'type': 'image_url', 'image_url': {'url': image_url, 'detail': 'high'}})
                 else:
                     raise RuntimeError('Unknown message type in chat history')
-            message = new_message
 
-            history.append(message)
+            history.append(new_message)
             should_be_bot = not should_be_bot
             if msg_info.reply_id is None:
                 break
@@ -426,8 +467,11 @@ class ChatGPTTelegramBot:
         if len(history) % 2 != 1:
             raise RuntimeError(f'First message not from user ({chat_id=}, {msg_id=})')
 
+        if system_prompt is None:
+            system_prompt = self.get_prompt(model_of_history.name)
+
         assert model_of_history
-        return history[::-1], model_of_history
+        return history[::-1], model_of_history, system_prompt
 
     @only_admin
     async def add_whitelist_handler(self, message):
@@ -527,8 +571,8 @@ class ChatGPTTelegramBot:
         text = message.message
         logger.info(f'New message to reply: '
                     f'{chat_id=}, {sender_id=}, {msg_id=}, {text=}, {message.photo=}, {message.document=}')
-        reply_to_id = None
-        prefix = None
+        reply_to_id: Optional[int] = None
+        model_by_prefix: Optional[Model] = None
 
         extra_photo_message = None
         extra_document_message = None
@@ -553,11 +597,12 @@ class ChatGPTTelegramBot:
             for m in self.models:
                 if text.startswith(m.prefix):
                     text = text[len(m.prefix):]
-                    prefix = m.prefix
+                    model_by_prefix = m
                     break
             else:  # not reply or new message to bot
                 if chat_id == sender_id:  # if in private chat, send hint
-                    await self.send_message(chat_id, 'Please start a new conversation with specified prefixes or reply to a bot message',
+                    await self.send_message(chat_id,
+                                            'Please start a new conversation with specified prefixes or reply to a bot message',
                                             msg_id)
                 return
 
@@ -602,11 +647,15 @@ class ChatGPTTelegramBot:
         else:
             new_message = [make_text_obj(text)]
 
+        system_prompt: Optional[str] = self.get_system_prompt_by_chat(chat_id) or model_by_prefix and self.get_prompt(model_by_prefix.name)
+
+        # note that prefix and system_prompt are None when reply_id is not None
         self.set_msg_info(chat_id, msg_id,
-                          MsgInfo(sent_by_bot=False, message=new_message, reply_id=reply_to_id, prefix=prefix))
+                          MsgInfo(sent_by_bot=False, message=new_message, reply_id=reply_to_id,
+                                  prefix=model_by_prefix and model_by_prefix.prefix, system_prompt=system_prompt))
 
         try:
-            chat_history, model = self.construct_chat_history(chat_id, msg_id)
+            chat_history, model, system_prompt = self.construct_chat_history(chat_id, msg_id)
         except RuntimeError as e:
             await self.send_message(chat_id,
                                     f"[!] Error on resolving conversation: {e}",
@@ -620,7 +669,7 @@ class ChatGPTTelegramBot:
             async with BotReplyMessages(self, chat_id, msg_id, prefix) as replymsgs:
                 try:
                     endpoint = model.endpoint or self.default_endpoint
-                    stream = self.completion(chat_history, model.name, endpoint, chat_id, msg_id)
+                    stream = self.completion(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
                     first_update_timestamp = None
                     async for delta in stream:
                         reply += delta
@@ -632,7 +681,8 @@ class ChatGPTTelegramBot:
                     await replymsgs.finalize()
                     for bot_msg_id, _ in replymsgs.replied_msgs:
                         self.set_msg_info(chat_id, bot_msg_id,
-                                          MsgInfo(sent_by_bot=True, message=[make_text_obj(reply)], reply_id=msg_id, prefix=prefix))
+                                          MsgInfo(sent_by_bot=True, message=[make_text_obj(reply)], reply_id=msg_id,
+                                                  prefix=prefix, system_prompt=None))
                     return
 
                 # handling completion errors

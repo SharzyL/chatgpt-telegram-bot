@@ -442,9 +442,9 @@ class ChatGPTTelegramBot:
         async for response in stream:
             logger.debug(f'Response ({chat_id=}, {msg_id=}): {response}')
             assert (
-                not finished or len(response.choices) == 0
+                not finished or response.choices is None or len(response.choices) == 0
             )  # OpenAI sometimes returns a empty response even when finished
-            if len(response.choices) == 0:
+            if response.choices is None or len(response.choices) == 0:
                 continue
 
             obj = response.choices[0]

@@ -18,8 +18,8 @@ in
   config = mkIf cfg.enable {
     systemd.services.chatgpt-telegram-bot = {
       description = "ChatGPT Telegram bot service";
-      after = [ "network-online.target"  ];
-      wants = [ "network-online.target"  ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/chatgpt-telegram-bot -c ${cfg.configFile}";

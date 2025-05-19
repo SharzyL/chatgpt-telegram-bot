@@ -31,6 +31,7 @@ class Model(NamedTuple):
     name: str
     endpoint: Optional[str] = None
     no_system_prompt: bool = False
+    system_prompt: Optional[str] = None
 
 
 class EndPoint(NamedTuple):
@@ -148,7 +149,7 @@ class ChatGPTTelegramBot:
                 api_key=os.environ[f'OPENAI_API_KEY_{endpoint.name}'],
                 base_url=endpoint.url,
                 max_retries=0,
-                timeout=15,
+                timeout=60,
             )
             for endpoint in self.endpoints
         }
@@ -161,7 +162,7 @@ class ChatGPTTelegramBot:
         self.TELEGRAM_LENGTH_LIMIT: int = 4096
         self.TELEGRAM_MIN_INTERVAL: int = 3
         self.OPENAI_MAX_RETRY: int = 3
-        self.OPENAI_RETRY_INTERVAL: int = 10
+        self.OPENAI_RETRY_INTERVAL: int = 3
         self.FIRST_BATCH_DELAY: int = 1
         self.TEXT_FILE_SIZE_LIMIT: int = 100_000
 
@@ -638,7 +639,7 @@ class ChatGPTTelegramBot:
                 logger.debug(f'Reply contains quote text {chat_id=}, {msg_id=}')
                 return
             reply_to_message = await message.get_reply_message()
-            if reply_to_message.sender_id == self.bot_id:  # user reply to bot message
+            if reply_to_message.sender_id == self.bot_id:  # user reply to a bot message
                 reply_to_id = message.reply_to.reply_to_msg_id
                 await self.pending_reply_manager.wait_for((chat_id, reply_to_id))
             elif reply_to_message.photo is not None:  # user reply to a photo

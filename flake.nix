@@ -12,7 +12,7 @@
 
   outputs = { flake-parts, ... }@inputs:
     let
-      name = "python_pdm_playground";
+      name = "chatgpt-telegram-bot";
       makePkg = import ./nix/pkg.nix;
       overlay = final: _: {
         ${name} = final.python3Packages.callPackage makePkg { };
@@ -25,9 +25,13 @@
         inputs.treefmt-nix.flakeModule
       ];
 
-      flake.overlays.default = overlay;
+      flake = {
+        overlays.default = overlay;
+        nixosModules.default = import ./nix/service.nix;
+      };
 
       systems = inputs.nixpkgs.lib.systems.flakeExposed;
+
 
       perSystem = { system, config, pkgs, ... }: {
         packages.default = config.legacyPackages.${name};

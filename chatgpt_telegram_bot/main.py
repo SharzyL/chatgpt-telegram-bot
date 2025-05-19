@@ -22,7 +22,6 @@ from loguru import logger
 
 from chatgpt_telegram_bot.richtext import RichText
 
-
 BASE64_IMAGE_PREFIX = 'data:image/jpeg;base64,'
 
 
@@ -244,7 +243,7 @@ class ChatGPTTelegramBot:
                 space_pos = text.find(' ')
                 if space_pos == -1:
                     space_pos = len(text) - 1
-                prompt = text[space_pos + 1 :]
+                prompt = text[space_pos + 1:]
                 self.db[prompt_db_key] = prompt
                 await self.send_message(
                     event.message.chat_id,
@@ -408,16 +407,17 @@ class ChatGPTTelegramBot:
             return f.read()
 
     async def completion(
-        self,
-        chat_history: list[Any],
-        model: Model,
-        system_prompt: str,
-        endpoint: str,
-        chat_id: int,
-        msg_id: int,
+            self,
+            chat_history: list[Any],
+            model: Model,
+            system_prompt: str,
+            endpoint: str,
+            chat_id: int,
+            msg_id: int,
     ):  # chat_history = [user, ai, user, ai, ..., user]
         assert len(chat_history) % 2 == 1
-        messages: list[Any] = [{'role': 'system', 'content': system_prompt}] if system_prompt and not model.no_system_prompt else []
+        messages: list[Any] = [
+            {'role': 'system', 'content': system_prompt}] if system_prompt and not model.no_system_prompt else []
         roles = ['user', 'assistant']
 
         for i, msg in enumerate(chat_history):
@@ -443,7 +443,7 @@ class ChatGPTTelegramBot:
         async for response in stream:
             logger.debug(f'Response ({chat_id=}, {msg_id=}): {response}')
             assert (
-                not finished or response.choices is None or len(response.choices) == 0
+                    not finished or response.choices is None or len(response.choices) == 0
             )  # OpenAI sometimes returns a empty response even when finished
             if response.choices is None or len(response.choices) == 0:
                 continue
@@ -652,7 +652,7 @@ class ChatGPTTelegramBot:
         if not message.is_reply or extra_photo_message is not None or extra_document_message is not None:  # new message
             for m in self.models:
                 if text.startswith(m.prefix):
-                    text = text[len(m.prefix) :]
+                    text = text[len(m.prefix):]
                     model_by_prefix = m
                     break
             else:  # not reply or new message to bot
@@ -712,7 +712,9 @@ class ChatGPTTelegramBot:
             new_message = [make_text_part(text)]
 
         system_prompt: Optional[str] = (
-            self.get_system_prompt_by_chat(chat_id) or model_by_prefix and self.get_prompt(model_by_prefix.name)
+                self.get_system_prompt_by_chat(chat_id) or
+                (model_by_prefix and model_by_prefix.system_prompt) or
+                (model_by_prefix and self.get_prompt(model_by_prefix.name))
         )
 
         # note that prefix and system_prompt are None when reply_id is not None
@@ -771,9 +773,9 @@ class ChatGPTTelegramBot:
                     error_cnt += 1
                     logger.exception(f'Error on generating exception({chat_id=}, {msg_id=}, {error_cnt=})')
                     will_retry = (
-                        not isinstance(e, openai.BadRequestError)
-                        and not isinstance(e, openai.AuthenticationError)
-                        and error_cnt <= self.OPENAI_MAX_RETRY
+                            not isinstance(e, openai.BadRequestError)
+                            and not isinstance(e, openai.AuthenticationError)
+                            and error_cnt <= self.OPENAI_MAX_RETRY
                     )
                     error_msg = f'[!] Error: {traceback.format_exception_only(e)[-1].strip()}'
                     if will_retry:
@@ -821,7 +823,7 @@ class BotReplyMessages:
         slices = []
         while len(text) > self.msg_len:
             slices.append(text[: self.msg_len])
-            text = text[self.msg_len :]
+            text = text[self.msg_len:]
         if text:
             slices.append(text)
         if not slices:

@@ -5,12 +5,9 @@ api_endpoints = [
 default_api_endpoint = "openai"
 
 models = [
-  { prefix = "3$", name = "gpt-3.5-turbo" },
-  { prefix = "4$", name = "gpt-4" },
-  { prefix = "4v$", name = "gpt-4-vision-preview" },
-  { prefix = "d$", name = "deepseek-chat" },
-  { prefix = "g$", name = "gemini-pro" },
+  { prefix = "o1 ", name = "o1-mini", no_system_prompt = true },
 
-  # the default
-  { prefix = "$", name = "claude-3-opus" },
+  { prefix = "$ ", name = "claude-3-opus" },
+
+  { prefix = "t ", name = "claude-3-7-sonnet-latest", system_prompt = "The user will send you some text and optionally a language name. You need to translate it into Chinese. If the user sends a single word, you should also include some expanations and usages. Note that your answer should also in Chinese." },
 ]

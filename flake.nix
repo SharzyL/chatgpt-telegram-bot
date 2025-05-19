@@ -14,11 +14,6 @@
     let
       name = "python_pdm_playground";
       makePkg = import ./nix/pkg.nix;
-      shellOverride = pkgs: oldAttrs: {
-        nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ (with pkgs; [
-          mypy
-        ]);
-      };
       overlay = final: _: {
         ${name} = final.python3Packages.callPackage makePkg { };
       };
@@ -44,7 +39,13 @@
           overlays = [ overlay ];
         };
 
-        devShells.default = config.packages.default.overrideAttrs (shellOverride pkgs);
+        devShells.default = pkgs.mkShell {
+          buildInputs = with pkgs; [
+            python3
+            pdm
+            ruff
+          ];
+        };
 
         treefmt = {
           programs.mypy = {

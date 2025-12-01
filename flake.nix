@@ -18,6 +18,14 @@
         ${name} = final.python3Packages.callPackage makePkg { };
       };
 
+      shellOverride = pkgs: oldAttrs: {
+        nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ (with pkgs; [
+          mypy
+          ruff
+          pdm
+        ]);
+      };
+
     in
     # flake-parts boilerplate
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -43,13 +51,8 @@
           overlays = [ overlay ];
         };
 
-        devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            python3
-            pdm
-            ruff
-          ];
-        };
+        devShells.default = config.packages.default.overrideAttrs (shellOverride pkgs);
+
 
         treefmt = {
           programs.mypy = {

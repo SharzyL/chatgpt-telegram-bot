@@ -10,7 +10,7 @@ dependencies = [
     "Telethon<2.0.0,>=1.32.0",
     "python-socks<3.0.0,>=2.4.4",
     "cryptg<1.0.0,>=0.4.0",
-    "openai<2.0.0,>=1.23.1",
+    "openai",
     "loguru>=0.7.2",
 ]
 requires-python = "<4.0,>=3.11"

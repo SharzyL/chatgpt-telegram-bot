@@ -149,7 +149,7 @@ class ChatGPTTelegramBot:
                 api_key=os.environ[f'OPENAI_API_KEY_{endpoint.name}'],
                 base_url=endpoint.url,
                 max_retries=0,
-                timeout=60,
+                timeout=300,
             )
             for endpoint in self.endpoints
         }
@@ -211,6 +211,8 @@ class ChatGPTTelegramBot:
 
         @self.bot.on(events.NewMessage)
         async def process(event):
+            if event.message.grouped_id is not None:
+                return
             prompt_db_key = f'system_prompt_{event.message.chat_id}'
             if event.message.chat_id is None:
                 return
@@ -257,6 +259,12 @@ class ChatGPTTelegramBot:
                 await self.send_message(event.message.chat_id, f'system prompt cleared', event.message.id)
             else:
                 await self.reply_handler(event.message)
+
+        @self.bot.on(events.Album)
+        async def process_album(event):
+            if event.chat_id is None or event.sender_id is None:
+                return
+            await self.album_handler(event)
 
         admin_input_peer = await self.bot.get_input_entity(self.admin_id)
         await self.bot(
@@ -660,26 +668,12 @@ class ChatGPTTelegramBot:
         photo_message = message if message.photo is not None else extra_photo_message
         photo_hash = None
         if photo_message is not None:
-            if photo_message.grouped_id is not None:
-                await self.send_message(
-                    chat_id,
-                    'Grouped photos are not yet supported, but will be supported soon',
-                    msg_id,
-                )
-                return
             photo_blob = await photo_message.download_media(bytes)
             photo_hash = self.save_photo(photo_blob)
 
         document_message = message if message.document is not None else extra_document_message
         document_text = None
         if document_message is not None:
-            if document_message.grouped_id is not None:
-                await self.send_message(
-                    chat_id,
-                    'Grouped files are not yet supported, but will be supported soon',
-                    msg_id,
-                )
-                return
             if document_message.document.size > self.TEXT_FILE_SIZE_LIMIT:
                 await self.send_message(chat_id, 'File too large', msg_id)
                 return
@@ -723,6 +717,9 @@ class ChatGPTTelegramBot:
             ),
         )
 
+        await self._run_completion(chat_id, msg_id)
+
+    async def _run_completion(self, chat_id: int, msg_id: int):
         try:
             chat_history, model, system_prompt = self.construct_chat_history(chat_id, msg_id)
         except RuntimeError as e:
@@ -780,6 +777,86 @@ class ChatGPTTelegramBot:
                         await asyncio.sleep(self.OPENAI_RETRY_INTERVAL)
                     if not will_retry:
                         break
+
+    async def album_handler(self, event):
+        chat_id = event.chat_id
+        sender_id = event.sender_id
+
+        # Inline whitelist check (Album.Event lacks .id, so @only_whitelist cannot be used)
+        if not self.is_whitelist(chat_id):
+            if chat_id == sender_id:
+                await self.send_message(chat_id, 'This chat is not in whitelist', event.messages[0].id)
+            return
+
+        msg_id = event.messages[0].id
+        all_msg_ids = [m.id for m in event.messages]
+        text = next((m.message for m in event.messages if m.message), '')
+
+        logger.info(
+            f'New album to reply: {chat_id=}, {sender_id=}, {msg_id=}, {text=}, '
+            f'num_messages={len(event.messages)}'
+        )
+
+        reply_to_id: Optional[int] = None
+        model_by_prefix: Optional[Model] = None
+
+        if event.is_reply:
+            first_msg = event.messages[0]
+            if first_msg.reply_to and first_msg.reply_to.quote_text is not None:
+                logger.debug(f'Album reply contains quote text {chat_id=}, {msg_id=}')
+                return
+            reply_to_message = await event.get_reply_message()
+            if reply_to_message.sender_id == self.bot_id:
+                reply_to_id = first_msg.reply_to.reply_to_msg_id
+                await self.pending_reply_manager.wait_for((chat_id, reply_to_id))
+            else:
+                return
+
+        if not event.is_reply:
+            for m in self.models:
+                if text.startswith(m.prefix):
+                    text = text[len(m.prefix):]
+                    model_by_prefix = m
+                    break
+            else:
+                if chat_id == sender_id:
+                    await self.send_message(
+                        chat_id,
+                        'Please start a new conversation with specified prefixes or reply to a bot message',
+                        msg_id,
+                    )
+                return
+
+        photo_messages = [m for m in event.messages if m.photo is not None]
+        photo_blobs = await asyncio.gather(*[m.download_media(bytes) for m in photo_messages])
+        photo_hashes = [self.save_photo(blob) for blob in photo_blobs]
+
+        if not photo_hashes:
+            logger.debug(f'Album has no photos {chat_id=}, {msg_id=}')
+            return
+
+        new_message: list[MsgPartInHistory] = [make_text_part(text)]
+        for h in photo_hashes:
+            new_message.append(make_image_part(h))
+
+        system_prompt: Optional[str] = (
+            self.get_system_prompt_by_chat(chat_id)
+            or (model_by_prefix and model_by_prefix.system_prompt)
+            or (model_by_prefix and self.get_prompt(model_by_prefix.name))
+        )
+
+        msg_info = MsgInfo(
+            sent_by_bot=False,
+            message=new_message,
+            reply_id=reply_to_id,
+            prefix=model_by_prefix and model_by_prefix.prefix,
+            system_prompt=system_prompt,
+        )
+
+        for mid in all_msg_ids:
+            self.set_msg_info(chat_id, mid, msg_info)
+
+        await self._run_completion(chat_id, msg_id)
 
     async def ping(self, message):
         await self.send_message(

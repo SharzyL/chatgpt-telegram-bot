@@ -4,6 +4,7 @@ __pycache__
 .DS_Store
 
 db
+db-*
 *.session
 *.session-journal
 photos/

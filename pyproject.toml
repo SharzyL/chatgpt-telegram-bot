@@ -20,18 +20,12 @@ license = {text = "MIT"}
 [project.scripts]
 chatgpt-telegram-bot = "chatgpt_telegram_bot.main:main"
 
-[tool.pdm.scripts]
-start = { call = "chatgpt_telegram_bot.main:main" }
-
-[tool.pdm]
-distribution = true
-
-[tool.pdm.build]
-includes = []
-
 [build-system]
-requires = ["pdm-backend"]
-build-backend = "pdm.backend"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+python-preference = "only-system"
 
 [tool.ruff]
 line-length = 120

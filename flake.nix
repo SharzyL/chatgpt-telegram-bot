@@ -22,7 +22,7 @@
         nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ (with pkgs; [
           mypy
           ruff
-          pdm
+          uv
         ]);
       };
 

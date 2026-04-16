@@ -6,7 +6,7 @@
 , openai
 , cryptg
 , loguru
-, pdm-backend
+, hatchling
 }:
 
 let
@@ -24,7 +24,7 @@ in
 buildPythonPackage {
   name = "chatgpt-telegram-bot";
   pyproject = true;
-  nativeBuildInputs = [ pdm-backend ];
+  nativeBuildInputs = [ hatchling ];
 
   src = with lib.fileset; toSource {
     root = ./..;

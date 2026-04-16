@@ -1,48 +1,58 @@
+from __future__ import annotations
+
+from typing import Any, override
+
 from telethon import types
 
 
 class RichText:
-    def __init__(self, s):
+    def __init__(self, s: str | RichText | list[dict[str, Any]]) -> None:
         if isinstance(s, str):
-            self.children = [{'type': 'text', 'content': s}]
+            self.children: list[dict[str, Any]] = [{'type': 'text', 'content': s}]
         elif isinstance(s, RichText):
             self.children = s.children
-        elif isinstance(s, list) and s and all(isinstance(c, dict) for c in s) and all(
-                'type' in c and 'content' in c for c in s):
+        elif (
+            isinstance(s, list)  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime validation
+            and s
+            and all(isinstance(c, dict) for c in s)  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime validation
+            and all('type' in c and 'content' in c for c in s)
+        ):
             self.children = s
         else:
             raise ValueError()
 
     @classmethod
-    def Raw(cls, s):
+    def Raw(cls, s: str) -> RichText:
         return RichText([{'type': 'text', 'content': s}])
 
     @classmethod
-    def Bold(cls, s):
+    def Bold(cls, s: str | RichText) -> RichText:
         return RichText([{'type': 'bold', 'content': RichText(s)}])
 
     @classmethod
-    def Code(cls, s):
+    def Code(cls, s: str) -> RichText:
         return RichText([{'type': 'code', 'content': s}])
 
     @classmethod
-    def Pre(cls, s, language=''):
+    def Pre(cls, s: str, language: str = '') -> RichText:
         return RichText([{'type': 'pre', 'content': s, 'language': language}])
 
     @classmethod
-    def Href(cls, s, url):
+    def Href(cls, s: str | RichText, url: str) -> RichText:
         return RichText([{'type': 'href', 'content': RichText(s), 'url': url}])
 
-    def __len__(self):
+    def __len__(self) -> int:
         return sum(len(c['content']) for c in self.children)
 
-    def __str__(self):
+    @override
+    def __str__(self) -> str:
         return f'RichText({self.children})'
 
-    def __repr__(self):
+    @override
+    def __repr__(self) -> str:
         return f'RichText({self.children})'
 
-    def __add__(self, value):
+    def __add__(self, value: RichText | str) -> RichText:
         if isinstance(value, RichText):
             if len(self) == 0:
                 return value
@@ -61,24 +71,25 @@ class RichText:
         else:
             return self + RichText(value)
 
-    def __radd__(self, value):
+    def __radd__(self, value: str) -> RichText:
         return RichText(value) + self
 
-    def __eq__(self, value):
+    @override
+    def __eq__(self, value: object) -> bool:
         if not isinstance(value, RichText):
             if isinstance(value, str):
                 return self == RichText(value)
             return False
         return self.children == value.children
 
-    def __getitem__(self, key):
-        if not isinstance(key, slice):
-            raise NotImplementedError()
+    def __getitem__(self, key: slice) -> RichText:
+        if not isinstance(key, slice):  # pyright: ignore[reportUnnecessaryIsInstance]  # runtime guard
+            raise NotImplementedError()  # pyright: ignore[reportUnreachable]
         start, stop, step = key.indices(len(self))
         if step != 1:
             raise NotImplementedError()
         if start >= stop:
-            return RichText("")
+            return RichText('')
         offset = 0
         new_children = []
         for c in self.children:
@@ -89,7 +100,7 @@ class RichText:
             i_stop = min(c_stop, stop)
             if i_start < i_stop:
                 new_c = c.copy()
-                new_c['content'] = c['content'][i_start - offset: i_stop - offset]
+                new_c['content'] = c['content'][i_start - offset : i_stop - offset]
                 new_children.append(new_c)
             offset += l
         return RichText(new_children)
@@ -99,12 +110,12 @@ class RichText:
     # implementing a version that complies with the Markdown standard lies in the fact that common Python Markdown
     # parser libraries do not provide character offset information for AST nodes in the source code.
     @classmethod
-    def from_markdown(cls, markdown):
+    def from_markdown(cls, markdown: str) -> RichText:
         lines = markdown.splitlines(keepends=True)
         in_pre = False
-        pre_lang = None
-        fence_len = None
-        fence_prefix_spaces = None
+        pre_lang: str | None = None
+        fence_len: int = 0
+        fence_prefix_spaces: int = 0
         result = RichText('')
         code = ''
         for line in lines:
@@ -143,12 +154,12 @@ class RichText:
             result += code
         return result
 
-    def to_telegram(self, offset=0):
-        def utf16len(s):
+    def to_telegram(self, offset: int = 0) -> tuple[str, list[Any]]:
+        def utf16len(s: str) -> int:
             return len(s.encode('utf-16-le')) // 2
 
-        def strip_entity(s):
-            lstripped = s[:len(s) - len(s.lstrip())]
+        def strip_entity(s: str) -> tuple[int, int]:
+            lstripped = s[: len(s) - len(s.lstrip())]
             return utf16len(lstripped), utf16len(s.strip())
 
         entities = []
@@ -188,7 +199,7 @@ class RichText:
         return text, entities
 
 
-def process_line(line):
+def process_line(line: str) -> RichText:
     is_title = False
     prefix = line.strip().split(' ', 1)[0]
     if len(prefix) in range(1, 7) and all(c == '#' for c in prefix):

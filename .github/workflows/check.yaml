@@ -21,4 +21,5 @@ jobs:
         run: |
           nix build
           nix flake check
+          nix develop -c basedpyright
 

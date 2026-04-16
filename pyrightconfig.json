@@ -1,0 +1,11 @@
+{
+  "include": ["chatgpt_telegram_bot"],
+  "typeCheckingMode": "all",
+  "reportMissingTypeStubs": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownArgumentType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownParameterType": false,
+  "reportAny": false,
+  "reportExplicitAny": false
+}

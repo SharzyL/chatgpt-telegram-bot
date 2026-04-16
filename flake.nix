@@ -20,7 +20,7 @@
 
       shellOverride = pkgs: oldAttrs: {
         nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ (with pkgs; [
-          mypy
+          basedpyright
           ruff
           uv
         ]);
@@ -55,11 +55,8 @@
 
 
         treefmt = {
-          programs.mypy = {
-            enable = true;
-            directories.".".extraPythonPackages = config.packages.default.propagatedBuildInputs;
-          };
           programs.nixpkgs-fmt.enable = true;
+          programs.ruff-format.enable = true;
         };
       };
     };

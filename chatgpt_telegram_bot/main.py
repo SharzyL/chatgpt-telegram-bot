@@ -739,6 +739,7 @@ class ChatGPTTelegramBot:
             async with BotReplyMessages(self, chat_id, msg_id, prefix) as replymsgs:
                 try:
                     endpoint = model.endpoint or self.default_endpoint
+                    await replymsgs.update('[Generating...]')
                     stream = self.completion(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
                     first_update_timestamp = None
                     async for delta in stream:

@@ -1,13 +1,17 @@
 admin_id = 114514
 api_endpoints = [
-  { name = "openai", url = "https://api.openai.com/v1" }
+  { name = "openai", url = "https://api.openai.com/v1" },
+  { name = "anthropic", url = "https://api.anthropic.com" },
+  { name = "gemini", url = "https://generativelanguage.googleapis.com/v1beta/" },
 ]
 default_api_endpoint = "openai"
 
 models = [
-  { prefix = "o1 ", name = "o1-mini", no_system_prompt = true },
+  { prefix = "o1", name = "o1-mini", no_system_prompt = true },
 
-  { prefix = "$ ", name = "claude-3-opus" },
+  { prefix = "$", name = "claude-3-opus", endpoint = "anthropic", api_type = "anthropic" },
 
-  { prefix = "t ", name = "claude-3-7-sonnet-latest", system_prompt = "The user will send you some text and optionally a language name. You need to translate it into Chinese. If the user sends a single word, you should also include some expanations and usages. Note that your answer should also in Chinese." },
+  { prefix = "g", name = "gemini-2.5-flash", endpoint = "gemini", api_type = "gemini" },
+
+  { prefix = "t", name = "claude-3-7-sonnet-latest", endpoint = "anthropic", api_type = "anthropic", system_prompt = "The user will send you some text and optionally a language name. You need to translate it into Chinese. If the user sends a single word, you should also include some expanations and usages. Note that your answer should also in Chinese." },
 ]

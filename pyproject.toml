@@ -11,6 +11,8 @@ dependencies = [
     "python-socks<3.0.0,>=2.4.4",
     "cryptg<1.0.0,>=0.4.0",
     "openai",
+    "anthropic",
+    "google-genai",
     "loguru>=0.7.2",
 ]
 requires-python = "<4.0,>=3.11"

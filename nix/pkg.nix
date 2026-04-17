@@ -4,6 +4,8 @@
 , telethon
 , python-socks
 , openai
+, anthropic
+, google-genai
 , cryptg
 , loguru
 , hatchling
@@ -36,6 +38,8 @@ buildPythonPackage {
     python-socks
     cryptg
     openai
+    anthropic
+    google-genai
     loguru
   ];
   doCheck = false; # since we have no test

@@ -41,6 +41,10 @@ class RichText:
     def Href(cls, s: str | RichText, url: str) -> RichText:
         return RichText([{'type': 'href', 'content': RichText(s), 'url': url}])
 
+    @classmethod
+    def Blockquote(cls, s: str | RichText) -> RichText:
+        return RichText([{'type': 'blockquote', 'content': RichText(s)}])
+
     def __len__(self) -> int:
         return sum(len(c['content']) for c in self.children)
 
@@ -196,6 +200,14 @@ class RichText:
                 if length:
                     entities.append(types.MessageEntityTextUrl(offset + start, length, c['url']))
                 offset += utf16len(t)
+            elif c['type'] == 'blockquote':
+                t, e = c['content'].to_telegram(offset)
+                text += t
+                entities.extend(e)
+                t_len = utf16len(t)
+                if t_len:
+                    entities.append(types.MessageEntityBlockquote(offset, t_len))
+                offset += t_len
         return text, entities
 
 

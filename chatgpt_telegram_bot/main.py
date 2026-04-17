@@ -35,6 +35,7 @@ class Model(NamedTuple):
     api_type: str = 'openai'  # 'openai', 'anthropic', or 'gemini'
     suffix: str | None = None  # appended to endpoint URL, None = use endpoint's default_suffix
     thinking: int | str | None = None  # None = disabled, int = budget, str = effort level or 'adaptive'
+    search: bool = False
 
 
 class EndPoint(NamedTuple):
@@ -71,6 +72,27 @@ class MsgInfo(NamedTuple):
 
     """only present for head of conversation"""
     system_prompt: str | None
+
+    """only present for head of conversation, stores inline parameter overrides"""
+    overrides: dict[str, str | None] | None = None
+
+
+OVERRIDE_ALIASES: dict[str, str] = {'t': 'thinking', 's': 'search'}
+
+
+def _parse_overrides(s: str) -> dict[str, str | None]:
+    """Parse 'key=val,key2=val2,key3' into dict. Bare key (no '=') maps to None (use default)."""
+    overrides: dict[str, str | None] = {}
+    for part in s.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '=' in part:
+            k, v = part.split('=', 1)
+            overrides[k.strip()] = v.strip()
+        else:
+            overrides[part] = None
+    return overrides
 
 
 def parse_proxy():
@@ -144,8 +166,8 @@ class ChatGPTTelegramBot:
         self.default_endpoint: str = _config['default_endpoint']
 
         for model in self.models:
-            if ' ' in model.prefix or '$' in model.prefix:
-                raise ValueError(f'prefix must not contain space or "$": "{model.prefix}"')
+            if ' ' in model.prefix or '$' in model.prefix or '|' in model.prefix:
+                raise ValueError(f'prefix must not contain space, "$", or "|": "{model.prefix}"')
             if model.thinking == 'adaptive' and model.api_type != 'anthropic':
                 raise ValueError(
                     f'thinking="adaptive" is only supported for api_type="anthropic",'
@@ -223,14 +245,57 @@ class ChatGPTTelegramBot:
         )
 
     @staticmethod
-    def match_prefix(text: str, prefix: str) -> str | None:
-        """Check if text matches prefix with delimiter. Returns remaining text or None."""
+    def match_prefix(text: str, prefix: str) -> tuple[str, dict[str, str | None]] | None:
+        """Check if text matches prefix with optional overrides. Returns (remaining_text, overrides) or None."""
+        # Case 1: prefix with overrides (prefix|key=val,... delim text)
+        if text.startswith(prefix + '|'):
+            after_pipe = text[len(prefix) + 1 :]
+            # Find where overrides end (space or $ delimiter, or end of string)
+            for delim in (' ', '$'):
+                idx = after_pipe.find(delim)
+                if idx != -1:
+                    return (after_pipe[idx + 1 :], _parse_overrides(after_pipe[:idx]))
+            # No delimiter — entire rest is overrides, no text
+            return ('', _parse_overrides(after_pipe))
+        # Case 2: bare prefix (existing behavior)
         if text == prefix:
-            return ''
+            return ('', {})
         for delim in (' ', '$'):
             if text.startswith(prefix + delim):
-                return text[len(prefix) + len(delim) :]
+                return (text[len(prefix) + len(delim) :], {})
         return None
+
+    THINKING_DEFAULTS: dict[str, str] = {
+        'openai': 'high',
+        'anthropic': 'adaptive',
+    }
+
+    @staticmethod
+    def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
+        """Apply inline parameter overrides to a model, returning a new Model."""
+        if not overrides:
+            return model
+        replacements: dict[str, Any] = {}
+        for key, value in overrides.items():
+            field = OVERRIDE_ALIASES.get(key, key)
+            if field == 'thinking':
+                if value is None:
+                    # bare key (e.g. |t) — use api_type default
+                    replacements['thinking'] = ChatGPTTelegramBot.THINKING_DEFAULTS.get(model.api_type)
+                elif value == '':
+                    # explicit empty (e.g. |t=) — disable thinking
+                    replacements['thinking'] = None
+                else:
+                    try:
+                        replacements['thinking'] = int(value)
+                    except ValueError:
+                        replacements['thinking'] = value
+            elif field == 'search':
+                # bare key (|s) enables, explicit empty (|s=) disables
+                replacements['search'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
+            else:
+                raise ValueError(f'Unknown override key: {key}')
+        return model._replace(**replacements)
 
     def get_client(self, endpoint: str, model: Model) -> Any:
         suffix = model.suffix if model.suffix is not None else self.endpoint_by_name[endpoint].default_suffix
@@ -528,14 +593,24 @@ class ChatGPTTelegramBot:
         if model.thinking is not None:
             effort = model.thinking if isinstance(model.thinking, str) else 'high'
             kwargs['reasoning'] = {'effort': effort, 'summary': 'detailed'}
+        if model.search:
+            kwargs['tools'] = [{'type': 'web_search', 'search_context_size': 'medium'}]
 
         aclient: openai.AsyncOpenAI = self.get_client(endpoint, model)
         stream = await aclient.responses.create(**kwargs)
         has_reasoning = False
         reasoning_ended = False
+        search_queries: list[str] = []
         async for event in stream:
             logger.debug(f'Received event ({chat_id=}, {msg_id=}): {event.type}')
-            if event.type == 'response.reasoning_summary_text.delta':
+            if event.type == 'response.web_search_call.searching':
+                yield '\x01Searching...\x01'
+            elif event.type == 'response.output_item.done' and event.item.type == 'web_search_call':
+                query = getattr(event.item.action, 'query', None) if hasattr(event.item, 'action') else None
+                if query:
+                    search_queries.append(query)
+                yield '\x01Generating...\x01'
+            elif event.type in ('response.reasoning_summary_text.delta', 'response.reasoning_text.delta'):
                 if not has_reasoning:
                     has_reasoning = True
                 yield event.delta
@@ -552,6 +627,8 @@ class ChatGPTTelegramBot:
                         yield '\n\n[!] Error: Output truncated due to limit'
                     else:
                         yield f'\n\n[!] Error: incomplete reason="{reason}"'
+        if search_queries:
+            yield '\x02' + '\n'.join(search_queries)
 
     def _convert_history_anthropic(self, chat_history: list[list[MsgPartInHistory]]) -> list[list[dict[str, Any]]]:
         result: list[list[dict[str, Any]]] = []
@@ -603,6 +680,9 @@ class ChatGPTTelegramBot:
             kwargs['thinking'] = {'type': 'adaptive'}
         elif isinstance(model.thinking, int) and model.thinking > 0:
             kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': model.thinking}
+
+        if model.search:
+            kwargs.setdefault('tools', []).append({'type': 'web_search_20250305', 'name': 'web_search'})
 
         aclient: anthropic.AsyncAnthropic = self.get_client(endpoint, model)
         async with aclient.messages.stream(**kwargs) as stream:
@@ -657,6 +737,8 @@ class ChatGPTTelegramBot:
             config_kwargs['system_instruction'] = system_prompt
         if isinstance(model.thinking, int) and model.thinking > 0:
             config_kwargs['thinking_config'] = genai_types.ThinkingConfig(thinking_budget=model.thinking)
+        if model.search:
+            config_kwargs['tools'] = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
 
         gclient: genai.Client = self.get_client(endpoint, model)
         finish_reason = None
@@ -708,7 +790,8 @@ class ChatGPTTelegramBot:
             if msg_info.prefix:
                 for model in self.models:
                     if model.prefix == msg_info.prefix:
-                        model_of_history = model
+                        overrides = getattr(msg_info, 'overrides', None) or {}
+                        model_of_history = self.apply_overrides(model, overrides)
 
             if msg_info.system_prompt:
                 system_prompt = msg_info.system_prompt
@@ -861,12 +944,17 @@ class ChatGPTTelegramBot:
             else:
                 return
 
+        overrides: dict[str, str | None] = {}
         if not message.is_reply or extra_photo_message is not None or extra_document_message is not None:  # new message
             for m in self.models:
-                rest = self.match_prefix(text, m.prefix)
-                if rest is not None:
-                    text = rest
-                    model_by_prefix = m
+                match = self.match_prefix(text, m.prefix)
+                if match is not None:
+                    text, overrides = match
+                    try:
+                        model_by_prefix = self.apply_overrides(m, overrides)
+                    except ValueError as e:
+                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+                        return
                     break
             else:  # not reply or new message to bot
                 if chat_id == sender_id:  # if in private chat, send hint
@@ -929,6 +1017,7 @@ class ChatGPTTelegramBot:
                 reply_id=reply_to_id,
                 prefix=model_by_prefix and model_by_prefix.prefix,
                 system_prompt=system_prompt,
+                overrides=overrides or None,
             ),
         )
 
@@ -936,9 +1025,14 @@ class ChatGPTTelegramBot:
 
     @staticmethod
     def _format_reply(
-        thinking: str, reply: str, thinking_done: bool, generating: bool, expect_thinking: bool = False
+        thinking: str,
+        reply: str,
+        thinking_done: bool,
+        status: str | None = None,
+        expect_thinking: bool = False,
+        tool_calls: list[str] | None = None,
     ) -> str | RichText:
-        suffix = ' [!Generating...]' if generating else ''
+        suffix = f' [!{status}]' if status else ''
         if not thinking_done:
             # still in thinking phase, or no thinking at all
             if not thinking:
@@ -949,11 +1043,12 @@ class ChatGPTTelegramBot:
         # thinking is done, show blockquote + response
         result: str | RichText = ''
         if thinking:
-            result = RichText.Blockquote(RichText.from_markdown(thinking))
+            result = RichText.Blockquote(RichText.from_markdown(thinking.rstrip('\n')))
         if reply or suffix:
-            if thinking:
-                result = result + '\n\n'
-            result = result + RichText.from_markdown(reply) + suffix
+            result = result + '\n' + RichText.from_markdown(reply) + suffix
+        if tool_calls:
+            footer = RichText.Bold('Tool calls') + '\n' + '\n'.join(f'🔍 {q}' for q in tool_calls)
+            result = result + '\n\n' + footer
         return result
 
     async def _run_completion(self, chat_id: int, msg_id: int):
@@ -969,15 +1064,49 @@ class ChatGPTTelegramBot:
             thinking = ''
             reply = ''
             thinking_done = False
+            tool_calls: list[str] = []
             expect_thinking = model.thinking is not None or model.api_type == 'anthropic'
-            prefix = '🤖 ' + RichText.Code(model.name) + '\n\n'
+            model_flags: list[str] = []
+            if model.thinking is not None:
+                model_flags.append(f'thinking={model.thinking}')
+            if model.search:
+                model_flags.append('search')
+            prefix = '🤖 ' + RichText.Code(model.name)
+            if model_flags:
+                prefix += ' ' + ' '.join(model_flags)
+            prefix += '\n\n'
             async with BotReplyMessages(self, chat_id, msg_id, prefix) as replymsgs:
                 try:
                     endpoint = model.endpoint or self.default_endpoint
-                    await replymsgs.update('[Generating...]')
+                    status: str | None = 'Generating...'
+                    await replymsgs.update(f'[{status}]')
                     stream = self.completion(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
                     first_update_timestamp = None
                     async for delta in stream:
+                        # \x02 sentinel carries tool call info (at end of stream)
+                        if '\x02' in delta:
+                            tool_calls.extend(delta.split('\x02', 1)[1].split('\n'))
+                            continue
+                        # \x01 sentinel signals status change
+                        if '\x01' in delta:
+                            parts = delta.split('\x01')
+                            for i, part in enumerate(parts):
+                                if i % 2 == 1:
+                                    status = part if part else 'Generating...'
+                                elif part:
+                                    if '\x00' in part:
+                                        t, r = part.split('\x00', 1)
+                                        thinking += t
+                                        reply += r
+                                        thinking_done = True
+                                    elif not thinking_done:
+                                        thinking += part
+                                    else:
+                                        reply += part
+                            await replymsgs.update(
+                                self._format_reply(thinking, reply, thinking_done, status, expect_thinking)
+                            )
+                            continue
                         # \x00 sentinel separates thinking from response
                         if '\x00' in delta:
                             parts = delta.split('\x00', 1)
@@ -992,13 +1121,13 @@ class ChatGPTTelegramBot:
                             first_update_timestamp = time.time()
                         if time.time() >= first_update_timestamp + self.FIRST_BATCH_DELAY:
                             await replymsgs.update(
-                                self._format_reply(thinking, reply, thinking_done, True, expect_thinking)
+                                self._format_reply(thinking, reply, thinking_done, status, expect_thinking)
                             )
                     if not thinking_done:
                         # no \x00 sentinel received — all text is response, not thinking
                         reply = thinking
                         thinking = ''
-                    await replymsgs.update(self._format_reply(thinking, reply, True, generating=False))
+                    await replymsgs.update(self._format_reply(thinking, reply, True, tool_calls=tool_calls or None))
                     await replymsgs.finalize()
                     full_reply = reply
                     for bot_msg_id, _ in replymsgs.replied_msgs:
@@ -1072,12 +1201,17 @@ class ChatGPTTelegramBot:
             else:
                 return
 
+        overrides: dict[str, str | None] = {}
         if not event.is_reply:
             for m in self.models:
-                rest = self.match_prefix(text, m.prefix)
-                if rest is not None:
-                    text = rest
-                    model_by_prefix = m
+                match = self.match_prefix(text, m.prefix)
+                if match is not None:
+                    text, overrides = match
+                    try:
+                        model_by_prefix = self.apply_overrides(m, overrides)
+                    except ValueError as e:
+                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+                        return
                     break
             else:
                 if chat_id == sender_id:
@@ -1112,6 +1246,7 @@ class ChatGPTTelegramBot:
             reply_id=reply_to_id,
             prefix=model_by_prefix and model_by_prefix.prefix,
             system_prompt=system_prompt,
+            overrides=overrides or None,
         )
 
         for mid in all_msg_ids:
@@ -1131,11 +1266,19 @@ is_whitelisted={self.is_whitelist(message.chat_id)}
         )
 
 
+def _telegram_len(s: str | RichText) -> int:
+    """Length in UTF-16 code units, matching Telegram's counting."""
+    if isinstance(s, RichText):
+        text, _ = s.to_telegram()
+        return len(text.encode('utf-16-le')) // 2
+    return len(s.encode('utf-16-le')) // 2
+
+
 class BotReplyMessages:
     def __init__(self, cbot: ChatGPTTelegramBot, chat_id: int, orig_msg_id: int, prefix: str | RichText) -> None:
         self.cbot: ChatGPTTelegramBot = cbot
         self.prefix: str | RichText = prefix
-        self.msg_len: int = cbot.TELEGRAM_LENGTH_LIMIT - len(prefix)
+        self.msg_len: int = cbot.TELEGRAM_LENGTH_LIMIT - _telegram_len(prefix)
         assert self.msg_len > 0
         self.chat_id: int = chat_id
         self.orig_msg_id: int = orig_msg_id

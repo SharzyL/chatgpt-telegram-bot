@@ -8,6 +8,7 @@
 , cryptg
 , loguru
 , mistune
+, systemd-python
 , hatchling
 }:
 
@@ -41,6 +42,7 @@ buildPythonPackage {
     anthropic
     loguru
     mistune
+    systemd-python
   ];
   doCheck = false; # since we have no test
 }

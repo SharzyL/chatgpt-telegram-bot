@@ -46,3 +46,7 @@
 
 By following these steps, you can effectively use the ChatGPT Telegram bot for your needs.
 
+## Logging
+
+When running under systemd, the bot automatically uses the journald native protocol (via `systemd-python`) to send structured log entries with proper syslog priority levels. This is detected via the `JOURNAL_STREAM` environment variable that systemd sets. When not running under systemd, or if `systemd-python` is not installed, logs are printed to stdout with colorized formatting. The nix package includes `systemd-python` automatically; for non-nix deployments it is an optional dependency.
+

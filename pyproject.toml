@@ -13,6 +13,7 @@ dependencies = [
     "openai",
     "anthropic",
     "loguru>=0.7.2",
+    "mistune>=3.0.0,<4.0.0",
 ]
 requires-python = "<4.0,>=3.11"
 readme = "README.md"

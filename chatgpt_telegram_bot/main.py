@@ -9,12 +9,11 @@ import time
 import traceback
 import hashlib
 import base64
-from collections import defaultdict
 from urllib.parse import urlparse
-import json
 import tomllib
 from argparse import ArgumentParser
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 import anthropic
@@ -31,7 +30,7 @@ class Model(NamedTuple):
     endpoint: str | None = None
     no_system_prompt: bool = False
     system_prompt: str | None = None
-    api_type: str = 'openai'  # 'openai' or 'anthropic'
+    api_type: str = 'openai'  # 'openai', 'openai_legacy', or 'anthropic'
     suffix: str | None = None  # appended to endpoint URL, None = use endpoint's default_suffix
     thinking: int | str | None = None  # None = disabled, int = budget, str = effort level or 'adaptive'
     search: bool = False
@@ -74,6 +73,32 @@ class MsgInfo(NamedTuple):
 
     """only present for head of conversation, stores inline parameter overrides"""
     overrides: dict[str, str | None] | None = None
+
+
+@dataclass
+class StreamEvent:
+    pass
+
+
+@dataclass
+class ThinkingDelta(StreamEvent):
+    text: str
+
+
+@dataclass
+class ResponseDelta(StreamEvent):
+    text: str
+
+
+@dataclass
+class StatusChange(StreamEvent):
+    status: str
+
+
+@dataclass
+class StreamMeta(StreamEvent):
+    tool_calls: list[str] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 OVERRIDE_ALIASES: dict[str, str] = {'t': 'thinking', 's': 'search'}
@@ -165,16 +190,13 @@ class ChatGPTTelegramBot:
         self.default_endpoint: str = _config['default_endpoint']
 
         for model in self.models:
-            if ' ' in model.prefix or '$' in model.prefix or '|' in model.prefix:
-                raise ValueError(f'prefix must not contain space, "$", or "|": "{model.prefix}"')
+            if ' ' in model.prefix or '$' in model.prefix or ',' in model.prefix:
+                raise ValueError(f'prefix must not contain space, "$", or ",": "{model.prefix}"')
             if model.thinking == 'adaptive' and model.api_type != 'anthropic':
                 raise ValueError(
-                    f'thinking="adaptive" is only supported for api_type="anthropic",'
+                    'thinking="adaptive" is only supported for api_type="anthropic",'
                     + f' got api_type="{model.api_type}" for model "{model.prefix}"'
                 )
-
-        self.telegram_last_timestamp: defaultdict[int, int | None] = defaultdict(lambda: None)
-        self.telegram_rate_limit_lock: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # map (endpoint_name, api_type, suffix) to SDK client
         self.endpoint_by_name: dict[str, EndPoint] = {e.name: e for e in self.endpoints}
@@ -193,7 +215,7 @@ class ChatGPTTelegramBot:
             endpoint = endpoint_by_name[ep_name]
             url = endpoint.url + suffix
             api_key = os.environ[f'OPENAI_API_KEY_{ep_name}']
-            if api_type == 'openai':
+            if api_type in ('openai', 'openai_legacy'):
                 self.clients[(ep_name, api_type, suffix)] = openai.AsyncOpenAI(
                     api_key=api_key,
                     base_url=url,
@@ -211,10 +233,9 @@ class ChatGPTTelegramBot:
                 raise ValueError(f'Unknown api_type: {api_type}')
 
         self.TELEGRAM_LENGTH_LIMIT: int = 4096
-        self.TELEGRAM_MIN_INTERVAL: int = 3
+        self.TELEGRAM_MIN_INTERVAL: float = 0.5
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
-        self.FIRST_BATCH_DELAY: int = 1
         self.TEXT_FILE_SIZE_LIMIT: int = 100_000
 
         self.pending_reply_manager: PendingReplyManager = PendingReplyManager()
@@ -241,8 +262,8 @@ class ChatGPTTelegramBot:
     @staticmethod
     def match_prefix(text: str, prefix: str) -> tuple[str, dict[str, str | None]] | None:
         """Check if text matches prefix with optional overrides. Returns (remaining_text, overrides) or None."""
-        # Case 1: prefix with overrides (prefix|key=val,... delim text)
-        if text.startswith(prefix + '|'):
+        # Case 1: prefix with overrides (prefix,key=val+... delim text)
+        if text.startswith(prefix + ','):
             after_pipe = text[len(prefix) + 1 :]
             # Find where overrides end (space or $ delimiter, or end of string)
             for delim in (' ', '$'):
@@ -261,6 +282,7 @@ class ChatGPTTelegramBot:
 
     THINKING_DEFAULTS: dict[str, str] = {
         'openai': 'high',
+        'openai_legacy': 'high',
         'anthropic': 'adaptive',
     }
 
@@ -352,7 +374,7 @@ class ChatGPTTelegramBot:
                         event.message.id,
                     )
                 else:
-                    _ = await self.send_message(event.message.chat_id, f'no prompt set yet', event.message.id)
+                    _ = await self.send_message(event.message.chat_id, 'no prompt set yet', event.message.id)
             elif text.startswith('/set_prompt'):
                 space_pos = text.find(' ')
                 if space_pos == -1:
@@ -367,7 +389,7 @@ class ChatGPTTelegramBot:
             elif text == '/clear_prompt' or text == f'/clear_prompt@{me.username}':
                 if prompt_db_key in self.db:
                     del self.db[prompt_db_key]
-                _ = await self.send_message(event.message.chat_id, f'system prompt cleared', event.message.id)
+                _ = await self.send_message(event.message.chat_id, 'system prompt cleared', event.message.id)
             else:
                 await self.reply_handler(event.message)
 
@@ -423,30 +445,6 @@ class ChatGPTTelegramBot:
         current_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
         return f"""Current Beijing Time: {current_time}. Reply in the same language as the user sent you.
     """
-
-    def within_interval(self, chat_id: int) -> bool:
-        last_timestamp = self.telegram_last_timestamp.get(chat_id, None)
-        if last_timestamp is None:
-            return False
-        else:
-            remaining_time = last_timestamp + self.TELEGRAM_MIN_INTERVAL - time.time()
-        return remaining_time > 0
-
-    @staticmethod
-    def ensure_interval(func):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
-        async def new_func(self, *args, **kwargs):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
-            chat_id = args[0]
-            async with self.telegram_rate_limit_lock[chat_id]:
-                last_timestamp = self.telegram_last_timestamp.get(chat_id, None)
-                if last_timestamp is not None:
-                    remaining_time = last_timestamp + self.TELEGRAM_MIN_INTERVAL - time.time()
-                    if remaining_time > 0:
-                        await asyncio.sleep(remaining_time)
-                result = await func(self, *args, **kwargs)
-                self.telegram_last_timestamp[chat_id] = time.time()
-                return result
-
-        return new_func
 
     def is_whitelist(self, chat_id: int) -> bool:
         whitelist = self.db['whitelist']
@@ -526,13 +524,15 @@ class ChatGPTTelegramBot:
         endpoint: str,
         chat_id: int,
         msg_id: int,
-    ):  # chat_history = [user, ai, user, ai, ..., user]
+    ) -> AsyncIterator[StreamEvent]:  # chat_history = [user, ai, user, ai, ..., user]
         assert len(chat_history) % 2 == 1
         log_history = [[{'type': p.type_, 'text': p.text} for p in msg] for msg in chat_history]
         logger.info(f'Starting completion ({model.api_type}) for {chat_id=}, {msg_id=}: {log_history}')
 
         if model.api_type == 'openai':
             backend = self._completion_openai(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
+        elif model.api_type == 'openai_legacy':
+            backend = self._completion_openai_legacy(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
         elif model.api_type == 'anthropic':
             backend = self._completion_anthropic(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
         else:
@@ -564,7 +564,7 @@ class ChatGPTTelegramBot:
         endpoint: str,
         chat_id: int,
         msg_id: int,
-    ):
+    ) -> AsyncIterator[StreamEvent]:
         converted = self._convert_history_openai(chat_history)
         input_messages: list[Any] = []
         roles = ['user', 'assistant']
@@ -590,39 +590,31 @@ class ChatGPTTelegramBot:
 
         aclient: openai.AsyncOpenAI = self.get_client(endpoint, model)
         stream = await aclient.responses.create(**kwargs)
-        has_reasoning = False
-        reasoning_ended = False
         search_queries: list[str] = []
         async for event in stream:
             logger.debug(f'Received event ({chat_id=}, {msg_id=}): {event.type}')
             if event.type == 'response.web_search_call.searching':
-                yield '\x01Searching...\x01'
+                yield StatusChange(status='Searching...')
             elif event.type == 'response.output_item.done' and event.item.type == 'web_search_call':
                 query = getattr(event.item.action, 'query', None) if hasattr(event.item, 'action') else None
                 if query:
                     search_queries.append(query)
-                yield '\x01Generating...\x01'
+                yield StatusChange(status='Generating...')
             elif event.type in ('response.reasoning_summary_text.delta', 'response.reasoning_text.delta'):
-                if not has_reasoning:
-                    has_reasoning = True
-                yield event.delta
+                yield ThinkingDelta(text=event.delta)
             elif event.type == 'response.output_text.delta':
-                if has_reasoning and not reasoning_ended:
-                    reasoning_ended = True
-                    yield '\x00'
-                yield event.delta
+                yield ResponseDelta(text=event.delta)
             elif event.type == 'response.completed':
                 resp = event.response
                 if resp.status == 'incomplete' and resp.incomplete_details:
                     reason = resp.incomplete_details.reason
                     if reason == 'max_output_tokens':
-                        yield '\n\n[!] Error: Output truncated due to limit'
+                        yield ResponseDelta(text='\n\n[!] Error: Output truncated due to limit')
                     else:
-                        yield f'\n\n[!] Error: incomplete reason="{reason}"'
-                # build metadata
-                meta: dict[str, Any] = {}
+                        yield ResponseDelta(text=f'\n\n[!] Error: incomplete reason="{reason}"')
+                meta = StreamMeta()
                 if search_queries:
-                    meta['tool_calls'] = search_queries
+                    meta.tool_calls = search_queries
                 if resp.usage:
                     usage: dict[str, Any] = {
                         'in': resp.usage.input_tokens,
@@ -632,9 +624,76 @@ class ChatGPTTelegramBot:
                         usage['cached'] = resp.usage.input_tokens_details.cached_tokens
                     if resp.usage.output_tokens_details and resp.usage.output_tokens_details.reasoning_tokens:
                         usage['reasoning'] = resp.usage.output_tokens_details.reasoning_tokens
-                    meta['usage'] = usage
-                if meta:
-                    yield '\x02' + json.dumps(meta)
+                    meta.usage = usage
+                yield meta
+
+    async def _completion_openai_legacy(
+        self,
+        chat_history: list[list[MsgPartInHistory]],
+        model: Model,
+        system_prompt: str,
+        endpoint: str,
+        chat_id: int,
+        msg_id: int,
+    ) -> AsyncIterator[StreamEvent]:
+        messages: list[dict[str, Any]] = []
+        if system_prompt and not model.no_system_prompt:
+            messages.append({'role': 'system', 'content': system_prompt})
+        roles = ['user', 'assistant']
+        for i, msg_parts in enumerate(chat_history):
+            role = roles[i % len(roles)]
+            parts: list[dict[str, Any]] = []
+            for part in msg_parts:
+                if part.type_ == 'text':
+                    parts.append({'type': 'text', 'text': part.text})
+                elif part.type_ == 'image':
+                    assert part.hash is not None
+                    blob = self.load_photo(part.hash)
+                    blob_base64 = base64.b64encode(blob).decode()
+                    parts.append({'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + blob_base64}})
+            content: Any = parts
+            if len(parts) == 1 and parts[0]['type'] == 'text':
+                content = parts[0]['text']
+            messages.append({'role': role, 'content': content})
+
+        kwargs: dict[str, Any] = {
+            'model': model.name,
+            'messages': messages,
+            'stream': True,
+            'stream_options': {'include_usage': True},
+        }
+        if model.thinking is not None:
+            effort = model.thinking if isinstance(model.thinking, str) else 'high'
+            kwargs['reasoning_effort'] = effort
+            kwargs['extra_body'] = {'thinking': {'type': 'enabled'}}
+
+        aclient: openai.AsyncOpenAI = self.get_client(endpoint, model)
+        stream = await aclient.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            logger.debug(f'Received chunk ({chat_id=}, {msg_id=}): {chunk}')
+            if chunk.usage:
+                meta = StreamMeta()
+                usage: dict[str, Any] = {
+                    'in': chunk.usage.prompt_tokens,
+                    'out': chunk.usage.completion_tokens,
+                }
+                if chunk.usage.prompt_tokens_details and chunk.usage.prompt_tokens_details.cached_tokens:
+                    usage['cached'] = chunk.usage.prompt_tokens_details.cached_tokens
+                if chunk.usage.completion_tokens_details and chunk.usage.completion_tokens_details.reasoning_tokens:
+                    usage['reasoning'] = chunk.usage.completion_tokens_details.reasoning_tokens
+                meta.usage = usage
+                yield meta
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason == 'length':
+                yield ResponseDelta(text='\n\n[!] Error: Output truncated due to limit')
+            if choice.delta:
+                reasoning = getattr(choice.delta, 'reasoning_content', None)
+                if reasoning:
+                    yield ThinkingDelta(text=reasoning)
+                if choice.delta.content:
+                    yield ResponseDelta(text=choice.delta.content)
 
     def _convert_history_anthropic(self, chat_history: list[list[MsgPartInHistory]]) -> list[list[dict[str, Any]]]:
         result: list[list[dict[str, Any]]] = []
@@ -664,7 +723,7 @@ class ChatGPTTelegramBot:
         endpoint: str,
         chat_id: int,
         msg_id: int,
-    ):
+    ) -> AsyncIterator[StreamEvent]:
         converted = self._convert_history_anthropic(chat_history)
         messages: list[Any] = []
         roles = ['user', 'assistant']
@@ -692,31 +751,26 @@ class ChatGPTTelegramBot:
 
         aclient: anthropic.AsyncAnthropic = self.get_client(endpoint, model)
         async with aclient.messages.stream(**kwargs) as stream:
-            has_thinking = False
             async for event in stream:
                 logger.debug(f'Received event ({chat_id=}, {msg_id=}): {event.type}')
                 if event.type == 'content_block_start':
                     logger.debug(f'Block start ({chat_id=}, {msg_id=}): type={event.content_block.type}')
-                    if event.content_block.type == 'thinking':
-                        has_thinking = True
-                    elif event.content_block.type == 'server_tool_use' and event.content_block.name == 'web_search':
-                        yield '\x01Searching...\x01'
+                    if event.content_block.type == 'server_tool_use' and event.content_block.name == 'web_search':
+                        yield StatusChange(status='Searching...')
                     elif event.content_block.type == 'web_search_tool_result':
-                        yield '\x01Generating...\x01'
-                    elif event.content_block.type == 'text' and has_thinking:
-                        yield '\x00'
+                        yield StatusChange(status='Generating...')
                 elif event.type == 'content_block_delta':
                     if event.delta.type == 'thinking_delta':
-                        yield event.delta.thinking
+                        yield ThinkingDelta(text=event.delta.thinking)
                     elif event.delta.type == 'text_delta':
-                        yield event.delta.text
+                        yield ResponseDelta(text=event.delta.text)
             final_message = await stream.get_final_message()
             if final_message.stop_reason == 'max_tokens':
-                yield '\n\n[!] Error: Output truncated due to limit'
+                yield ResponseDelta(text='\n\n[!] Error: Output truncated due to limit')
             elif final_message.stop_reason not in ('end_turn', 'stop_sequence'):
-                yield f'\n\n[!] Error: stop_reason="{final_message.stop_reason}"'
+                yield ResponseDelta(text=f'\n\n[!] Error: stop_reason="{final_message.stop_reason}"')
         # build metadata from final message
-        meta: dict[str, Any] = {}
+        meta = StreamMeta()
         search_queries: list[str] = []
         for block in final_message.content:
             if block.type == 'server_tool_use' and block.name == 'web_search':
@@ -724,7 +778,7 @@ class ChatGPTTelegramBot:
                 if query:
                     search_queries.append(str(query))
         if search_queries:
-            meta['tool_calls'] = search_queries
+            meta.tool_calls = search_queries
         usage: dict[str, Any] = {
             'in': final_message.usage.input_tokens,
             'out': final_message.usage.output_tokens,
@@ -740,8 +794,8 @@ class ChatGPTTelegramBot:
             web_search_requests = getattr(server_tool_use, 'web_search_requests', None)
             if web_search_requests:
                 usage['web_searches'] = web_search_requests
-        meta['usage'] = usage
-        yield '\x02' + json.dumps(meta)
+        meta.usage = usage
+        yield meta
 
     def construct_chat_history(self, chat_id: int, msg_id: int) -> tuple[list[list[MsgPartInHistory]], Model, str]:
         """Returns (history, model, system_prompt). History is a list of messages in neutral format (MsgPartInHistory)."""
@@ -818,7 +872,6 @@ class ChatGPTTelegramBot:
         _ = await self.send_message_html(message.chat_id, text, message.id)
 
     @retry()
-    @ensure_interval
     async def send_message(self, chat_id: int, text: str | RichText, reply_to_message_id: int) -> int:
         logger.debug(f'Sending message: {chat_id=}, {reply_to_message_id=}, {text=}')
         text = RichText(text)
@@ -836,7 +889,6 @@ class ChatGPTTelegramBot:
         return msg.id
 
     @retry()
-    @ensure_interval
     async def send_message_html(self, chat_id: int, text: str, reply_to_message_id: int) -> int:
         logger.debug(f'Sending message html: {chat_id=}, {reply_to_message_id=}, {text=}')
         msg = await self.bot.send_message(
@@ -850,7 +902,6 @@ class ChatGPTTelegramBot:
         return msg.id
 
     @retry()
-    @ensure_interval
     async def edit_message(self, chat_id: int, text: str | RichText, message_id: int) -> None:
         logger.debug(f'Editing message: {chat_id=}, {message_id=}, {text=}')
         text = RichText(text)
@@ -873,7 +924,6 @@ class ChatGPTTelegramBot:
             logger.debug(f'Message edited: {chat_id=}, {message_id=}')
 
     @retry()
-    @ensure_interval
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         logger.debug(f'Deleting message: {chat_id=}, {message_id=}')
         _ = await self.bot.delete_messages(
@@ -1000,7 +1050,6 @@ class ChatGPTTelegramBot:
         reply: str,
         thinking_done: bool,
         status: str | None = None,
-        expect_thinking: bool = False,
         tool_calls: list[str] | None = None,
         usage: dict[str, Any] | None = None,
     ) -> str | RichText:
@@ -1009,15 +1058,14 @@ class ChatGPTTelegramBot:
             # still in thinking phase, or no thinking at all
             if not thinking:
                 return suffix.strip() if suffix else ''
-            if expect_thinking:
-                return RichText.Blockquote(RichText.from_markdown(thinking) + suffix)
-            return RichText.from_markdown(thinking) + suffix
+            return RichText.Blockquote(RichText.from_markdown(thinking) + suffix)
         # thinking is done, show blockquote + response
         result: str | RichText = ''
         if thinking:
             result = RichText.Blockquote(RichText.from_markdown(thinking.rstrip('\n')))
         if reply or suffix:
-            result = result + '\n' + RichText.from_markdown(reply) + suffix
+            sep = '\n\n' if thinking else ''
+            result = result + sep + RichText.from_markdown(reply) + suffix
         if tool_calls or usage:
             footer_content: RichText | str = ''
             if tool_calls:
@@ -1044,8 +1092,7 @@ class ChatGPTTelegramBot:
             thinking = ''
             reply = ''
             thinking_done = False
-            stream_meta: dict[str, Any] = {}
-            expect_thinking = model.thinking is not None or model.api_type == 'anthropic'
+            stream_meta = StreamMeta()
             model_flags: list[str] = []
             if model.thinking is not None:
                 model_flags.append(f'thinking={model.thinking}')
@@ -1053,7 +1100,7 @@ class ChatGPTTelegramBot:
                 model_flags.append('search')
             prefix = '🤖 ' + RichText.Code(model.name)
             if model_flags:
-                prefix += ' ' + ' '.join(model_flags)
+                prefix += ' (' + ', '.join(model_flags) + ')'
             prefix += '\n\n'
             async with BotReplyMessages(self, chat_id, msg_id, prefix) as replymsgs:
                 try:
@@ -1061,59 +1108,41 @@ class ChatGPTTelegramBot:
                     status: str | None = 'Generating...'
                     await replymsgs.update(f'[{status}]')
                     stream = self.completion(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
-                    first_update_timestamp = None
-                    async for delta in stream:
-                        # \x02 sentinel carries JSON metadata (at end of stream)
-                        if '\x02' in delta:
-                            stream_meta = json.loads(delta.split('\x02', 1)[1])
-                            continue
-                        # \x01 sentinel signals status change
-                        if '\x01' in delta:
-                            parts = delta.split('\x01')
-                            for i, part in enumerate(parts):
-                                if i % 2 == 1:
-                                    status = part if part else 'Generating...'
-                                elif part:
-                                    if '\x00' in part:
-                                        t, r = part.split('\x00', 1)
-                                        thinking += t
-                                        reply += r
-                                        thinking_done = True
-                                    elif not thinking_done:
-                                        thinking += part
-                                    else:
-                                        reply += part
-                            await replymsgs.update(
-                                self._format_reply(thinking, reply, thinking_done, status, expect_thinking)
-                            )
-                            continue
-                        # \x00 sentinel separates thinking from response
-                        if '\x00' in delta:
-                            parts = delta.split('\x00', 1)
-                            thinking += parts[0]
-                            reply += parts[1]
+                    stream_start = time.time()
+                    first_token_time: float | None = None
+                    async for event in stream:
+                        if isinstance(event, ThinkingDelta):
+                            if first_token_time is None:
+                                first_token_time = time.time()
+                            thinking += event.text
+                        elif isinstance(event, ResponseDelta):
+                            if first_token_time is None:
+                                first_token_time = time.time()
                             thinking_done = True
-                        elif not thinking_done:
-                            thinking += delta
-                        else:
-                            reply += delta
-                        if first_update_timestamp is None:
-                            first_update_timestamp = time.time()
-                        if time.time() >= first_update_timestamp + self.FIRST_BATCH_DELAY:
-                            await replymsgs.update(
-                                self._format_reply(thinking, reply, thinking_done, status, expect_thinking)
-                            )
-                    if not thinking_done:
-                        # no \x00 sentinel received — all text is response, not thinking
-                        reply = thinking
-                        thinking = ''
+                            reply += event.text
+                        elif isinstance(event, StatusChange):
+                            status = event.status
+                        elif isinstance(event, StreamMeta):
+                            stream_meta = event
+                            continue
+                        await replymsgs.update(self._format_reply(thinking, reply, thinking_done, status))
+                    stream_end = time.time()
+                    usage = stream_meta.usage
+                    if usage:
+                        ttft = (first_token_time or stream_end) - stream_start
+                        usage['TTFT'] = f'{ttft:.1f}s'
+                        out_tokens = (usage.get('out') or 0) + (usage.get('reasoning') or 0)
+                        if out_tokens and first_token_time:
+                            gen_duration = stream_end - first_token_time
+                            if gen_duration > 0:
+                                usage['TPS'] = f'{out_tokens / gen_duration:.1f}'
                     await replymsgs.update(
                         self._format_reply(
                             thinking,
                             reply,
                             True,
-                            tool_calls=stream_meta.get('tool_calls'),
-                            usage=stream_meta.get('usage'),
+                            tool_calls=stream_meta.tool_calls or None,
+                            usage=usage or None,
                         )
                     )
                     await replymsgs.finalize()
@@ -1272,6 +1301,7 @@ class BotReplyMessages:
         self.orig_msg_id: int = orig_msg_id
         self.replied_msgs: list[tuple[int, str | RichText]] = []
         self.text: str | RichText = ''
+        self.last_update_time: float = 0.0
 
     async def __aenter__(self) -> 'BotReplyMessages':
         return self
@@ -1283,9 +1313,11 @@ class BotReplyMessages:
 
     async def _force_update(self, text: str | RichText) -> None:
         slices: list[str | RichText] = []
-        while len(text) > self.msg_len:
-            slices.append(text[: self.msg_len])
-            text = text[self.msg_len :]
+        limit = self.msg_len  # first slice accounts for prefix
+        while len(text) > limit:
+            slices.append(text[:limit])
+            text = text[limit:]
+            limit = self.cbot.TELEGRAM_LENGTH_LIMIT  # continuation slices get full limit
         if text:
             slices.append(text)
         if not slices:
@@ -1294,7 +1326,8 @@ class BotReplyMessages:
         for i in range(min(len(slices), len(self.replied_msgs))):
             msg_id, msg_text = self.replied_msgs[i]
             if slices[i] != msg_text:
-                await self.cbot.edit_message(self.chat_id, self.prefix + slices[i], msg_id)
+                content = (self.prefix + slices[i]) if i == 0 else slices[i]
+                await self.cbot.edit_message(self.chat_id, content, msg_id)
                 self.replied_msgs[i] = (msg_id, slices[i])
         if len(slices) > len(self.replied_msgs):
             for i in range(len(self.replied_msgs), len(slices)):
@@ -1302,7 +1335,8 @@ class BotReplyMessages:
                     reply_to = self.orig_msg_id
                 else:
                     reply_to, _ = self.replied_msgs[i - 1]
-                msg_id = await self.cbot.send_message(self.chat_id, self.prefix + slices[i], reply_to)
+                content = (self.prefix + slices[i]) if i == 0 else slices[i]
+                msg_id = await self.cbot.send_message(self.chat_id, content, reply_to)
                 self.replied_msgs.append((msg_id, slices[i]))
                 self.cbot.pending_reply_manager.add((self.chat_id, msg_id))
         if len(self.replied_msgs) > len(slices):
@@ -1314,7 +1348,9 @@ class BotReplyMessages:
 
     async def update(self, text: str | RichText) -> None:
         self.text = text
-        if not self.cbot.within_interval(self.chat_id):
+        now = time.time()
+        if now - self.last_update_time >= self.cbot.TELEGRAM_MIN_INTERVAL:
+            self.last_update_time = now
             await self._force_update(self.text)
 
     async def finalize(self) -> None:
@@ -1342,4 +1378,7 @@ async def async_main() -> None:
 
 
 def main():
-    asyncio.run(async_main())
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        logger.info('Interrupted, exiting')

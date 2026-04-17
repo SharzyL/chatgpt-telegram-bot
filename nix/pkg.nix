@@ -7,6 +7,7 @@
 , anthropic
 , cryptg
 , loguru
+, mistune
 , hatchling
 }:
 
@@ -39,6 +40,7 @@ buildPythonPackage {
     openai
     anthropic
     loguru
+    mistune
   ];
   doCheck = false; # since we have no test
 }

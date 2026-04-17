@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any, override
 
+import mistune
 from telethon import types
+
+_md_parser = mistune.create_markdown(renderer='ast', plugins=['strikethrough'])
 
 
 class RichText:
@@ -28,6 +31,14 @@ class RichText:
     @classmethod
     def Bold(cls, s: str | RichText) -> RichText:
         return RichText([{'type': 'bold', 'content': RichText(s)}])
+
+    @classmethod
+    def Italic(cls, s: str | RichText) -> RichText:
+        return RichText([{'type': 'italic', 'content': RichText(s)}])
+
+    @classmethod
+    def Strikethrough(cls, s: str | RichText) -> RichText:
+        return RichText([{'type': 'strikethrough', 'content': RichText(s)}])
 
     @classmethod
     def Code(cls, s: str) -> RichText:
@@ -97,66 +108,22 @@ class RichText:
         offset = 0
         new_children = []
         for c in self.children:
-            l = len(c['content'])
+            clen = len(c['content'])
             c_start = offset
-            c_stop = c_start + l
+            c_stop = c_start + clen
             i_start = max(c_start, start)
             i_stop = min(c_stop, stop)
             if i_start < i_stop:
                 new_c = c.copy()
                 new_c['content'] = c['content'][i_start - offset : i_stop - offset]
                 new_children.append(new_c)
-            offset += l
+            offset += clen
         return RichText(new_children)
 
-    # This function returns rich text that includes the raw Markdown content, with formatting tokens. The function
-    # processes only a subset of Markdown and does NOT adhere to its respective specification. The challenge in
-    # implementing a version that complies with the Markdown standard lies in the fact that common Python Markdown
-    # parser libraries do not provide character offset information for AST nodes in the source code.
     @classmethod
     def from_markdown(cls, markdown: str) -> RichText:
-        lines = markdown.splitlines(keepends=True)
-        in_pre = False
-        pre_lang: str | None = None
-        fence_len: int = 0
-        fence_prefix_spaces: int = 0
-        result = RichText('')
-        code = ''
-        for line in lines:
-            if in_pre:
-                if line.strip() == '`' * fence_len:
-                    if code and not code.isspace():
-                        if pre_lang is None:
-                            pre_lang = ''
-                        result += RichText.Pre(code, pre_lang)
-                    else:
-                        result += code
-                    code = ''
-                    result += line
-                    in_pre = False
-                    pre_lang = None
-                else:
-                    if len(line) - len(line.lstrip(' ')) >= fence_prefix_spaces:
-                        code += line[fence_prefix_spaces:]
-                    else:
-                        code += line.lstrip(' ')
-            else:
-                if line.strip().startswith('```'):
-                    fence_len = len(line.strip()) - len(line.strip().lstrip('`'))
-                    fence_prefix_spaces = len(line) - len(line.lstrip(' '))
-                    pre_lang = line.strip().lstrip('`').strip()
-                    if '`' not in pre_lang:
-                        if not pre_lang:
-                            pre_lang = None
-                        result += line
-                        in_pre = True
-                    else:
-                        result += process_line(line)
-                else:
-                    result += process_line(line)
-        if in_pre:
-            result += code
-        return result
+        ast: list[dict[str, Any]] = _md_parser(markdown)  # pyright: ignore[reportAssignmentType]  # ast renderer always returns list
+        return _render_blocks(ast)
 
     def to_telegram(self, offset: int = 0) -> tuple[str, list[Any]]:
         def utf16len(s: str) -> int:
@@ -179,6 +146,22 @@ class RichText:
                 start, length = strip_entity(t)
                 if length:
                     entities.append(types.MessageEntityBold(offset + start, length))
+                offset += utf16len(t)
+            elif c['type'] == 'italic':
+                t, e = c['content'].to_telegram(offset)
+                text += t
+                entities.extend(e)
+                start, length = strip_entity(t)
+                if length:
+                    entities.append(types.MessageEntityItalic(offset + start, length))
+                offset += utf16len(t)
+            elif c['type'] == 'strikethrough':
+                t, e = c['content'].to_telegram(offset)
+                text += t
+                entities.extend(e)
+                start, length = strip_entity(t)
+                if length:
+                    entities.append(types.MessageEntityStrike(offset + start, length))
                 offset += utf16len(t)
             elif c['type'] == 'code':
                 text += c['content']
@@ -211,53 +194,82 @@ class RichText:
         return text, entities
 
 
-def process_line(line: str) -> RichText:
-    is_title = False
-    prefix = line.strip().split(' ', 1)[0]
-    if len(prefix) in range(1, 7) and all(c == '#' for c in prefix):
-        is_title = True
-    in_code = False
-    in_bold = False
-    in_escape = False
-    buffer = ''
-    result = RichText('')
-    for c in line:
-        if in_escape:
-            in_escape = False
-            buffer += c
-        elif in_code:
-            if c == '`':
-                result += RichText.Code(buffer)
-                buffer = c
-                in_code = False
-            else:
-                buffer += c
-        elif c == '\\':
-            in_escape = True
-            buffer += c
-        elif c == '`':
-            buffer += c
-            if in_bold:
-                result += RichText.Bold(buffer)
-                buffer = ''
-            else:
-                result += buffer
-                buffer = ''
-            in_code = True
-        elif c == '*' and buffer and buffer[-1] == '*':
-            if in_bold:
-                buffer += c
-                result += RichText.Bold(buffer)
-                buffer = ''
-                in_bold = False
-            else:
-                result += buffer[:-1]
-                buffer = '**'
-                in_bold = True
-        else:
-            buffer += c
-    result += buffer
-    if is_title:
-        return RichText.Bold(result)
+def _render_node(node: dict[str, Any]) -> RichText:
+    t = node['type']
+    if t == 'text':
+        return RichText(node['raw'])
+    elif t in ('paragraph', 'block_text'):
+        return _render_children(node)
+    elif t == 'heading':
+        level = (node.get('attrs') or {}).get('level', 1)
+        return RichText.Bold('#' * level + ' ' + _render_children(node))
+    elif t == 'strong':
+        return RichText.Bold(_render_children(node))
+    elif t == 'emphasis':
+        return RichText.Italic(_render_children(node))
+    elif t == 'strikethrough':
+        return RichText.Strikethrough(_render_children(node))
+    elif t == 'codespan':
+        return RichText.Code(node['raw'])
+    elif t == 'block_code':
+        info = (node.get('attrs') or {}).get('info', '')
+        raw = node.get('raw', '')
+        if raw.endswith('\n'):
+            raw = raw[:-1]
+        return RichText.Pre(raw, info)
+    elif t == 'link':
+        url = (node.get('attrs') or {}).get('url', '')
+        return RichText.Href(_render_children(node), url)
+    elif t == 'image':
+        url = (node.get('attrs') or {}).get('url', '')
+        children = _render_children(node)
+        return RichText.Href(children if len(children) > 0 else RichText(url), url)
+    elif t == 'block_quote':
+        return RichText.Blockquote(_render_blocks(node.get('children') or []))
+    elif t == 'list':
+        return _render_list(node)
+    elif t in ('softbreak', 'hardbreak'):
+        return RichText('\n')
+    elif t == 'thematic_break':
+        return RichText('---')
+    elif t == 'blank_line':
+        return RichText('')
     else:
-        return result
+        if 'raw' in node:
+            return RichText(node['raw'])
+        if node.get('children'):
+            return _render_children(node)
+        return RichText('')
+
+
+def _render_children(node: dict[str, Any]) -> RichText:
+    result = RichText('')
+    for child in node.get('children') or []:
+        result = result + _render_node(child)
+    return result
+
+
+def _render_blocks(nodes: list[dict[str, Any]]) -> RichText:
+    result = RichText('')
+    first = True
+    for node in nodes:
+        if node['type'] == 'blank_line':
+            continue
+        if not first:
+            result = result + '\n'
+            if node['type'] == 'heading':
+                result = result + '\n'
+        first = False
+        result = result + _render_node(node)
+    return result
+
+
+def _render_list(node: dict[str, Any]) -> RichText:
+    ordered = (node.get('attrs') or {}).get('ordered', False)
+    result = RichText('')
+    for i, item in enumerate(node.get('children') or []):
+        if i > 0:
+            result = result + '\n'
+        marker = f'{i + 1}. ' if ordered else '• '
+        result = result + marker + _render_blocks(item.get('children') or [])
+    return result

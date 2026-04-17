@@ -11,6 +11,7 @@ import hashlib
 import base64
 from collections import defaultdict
 from urllib.parse import urlparse
+import json
 import tomllib
 from argparse import ArgumentParser
 from collections.abc import Sequence
@@ -18,8 +19,6 @@ from typing import Any, NamedTuple
 
 import anthropic
 import openai
-from google import genai
-from google.genai import types as genai_types
 from telethon import TelegramClient, events, errors, functions, types
 from loguru import logger
 
@@ -32,7 +31,7 @@ class Model(NamedTuple):
     endpoint: str | None = None
     no_system_prompt: bool = False
     system_prompt: str | None = None
-    api_type: str = 'openai'  # 'openai', 'anthropic', or 'gemini'
+    api_type: str = 'openai'  # 'openai' or 'anthropic'
     suffix: str | None = None  # appended to endpoint URL, None = use endpoint's default_suffix
     thinking: int | str | None = None  # None = disabled, int = budget, str = effort level or 'adaptive'
     search: bool = False
@@ -207,11 +206,6 @@ class ChatGPTTelegramBot:
                     base_url=url,
                     max_retries=0,
                     timeout=300,
-                )
-            elif api_type == 'gemini':
-                self.clients[(ep_name, api_type, suffix)] = genai.Client(
-                    api_key=api_key,
-                    http_options={'base_url': url},
                 )
             else:
                 raise ValueError(f'Unknown api_type: {api_type}')
@@ -541,8 +535,6 @@ class ChatGPTTelegramBot:
             backend = self._completion_openai(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
         elif model.api_type == 'anthropic':
             backend = self._completion_anthropic(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
-        elif model.api_type == 'gemini':
-            backend = self._completion_gemini(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
         else:
             raise ValueError(f'Unknown api_type: {model.api_type}')
 
@@ -627,8 +619,22 @@ class ChatGPTTelegramBot:
                         yield '\n\n[!] Error: Output truncated due to limit'
                     else:
                         yield f'\n\n[!] Error: incomplete reason="{reason}"'
-        if search_queries:
-            yield '\x02' + '\n'.join(search_queries)
+                # build metadata
+                meta: dict[str, Any] = {}
+                if search_queries:
+                    meta['tool_calls'] = search_queries
+                if resp.usage:
+                    usage: dict[str, Any] = {
+                        'in': resp.usage.input_tokens,
+                        'out': resp.usage.output_tokens,
+                    }
+                    if resp.usage.input_tokens_details and resp.usage.input_tokens_details.cached_tokens:
+                        usage['cached'] = resp.usage.input_tokens_details.cached_tokens
+                    if resp.usage.output_tokens_details and resp.usage.output_tokens_details.reasoning_tokens:
+                        usage['reasoning'] = resp.usage.output_tokens_details.reasoning_tokens
+                    meta['usage'] = usage
+                if meta:
+                    yield '\x02' + json.dumps(meta)
 
     def _convert_history_anthropic(self, chat_history: list[list[MsgPartInHistory]]) -> list[list[dict[str, Any]]]:
         result: list[list[dict[str, Any]]] = []
@@ -656,8 +662,8 @@ class ChatGPTTelegramBot:
         model: Model,
         system_prompt: str,
         endpoint: str,
-        _chat_id: int,
-        _msg_id: int,
+        chat_id: int,
+        msg_id: int,
     ):
         converted = self._convert_history_anthropic(chat_history)
         messages: list[Any] = []
@@ -688,9 +694,15 @@ class ChatGPTTelegramBot:
         async with aclient.messages.stream(**kwargs) as stream:
             has_thinking = False
             async for event in stream:
+                logger.debug(f'Received event ({chat_id=}, {msg_id=}): {event.type}')
                 if event.type == 'content_block_start':
+                    logger.debug(f'Block start ({chat_id=}, {msg_id=}): type={event.content_block.type}')
                     if event.content_block.type == 'thinking':
                         has_thinking = True
+                    elif event.content_block.type == 'server_tool_use' and event.content_block.name == 'web_search':
+                        yield '\x01Searching...\x01'
+                    elif event.content_block.type == 'web_search_tool_result':
+                        yield '\x01Generating...\x01'
                     elif event.content_block.type == 'text' and has_thinking:
                         yield '\x00'
                 elif event.type == 'content_block_delta':
@@ -703,74 +715,33 @@ class ChatGPTTelegramBot:
                 yield '\n\n[!] Error: Output truncated due to limit'
             elif final_message.stop_reason not in ('end_turn', 'stop_sequence'):
                 yield f'\n\n[!] Error: stop_reason="{final_message.stop_reason}"'
-
-    def _convert_history_gemini(self, chat_history: list[list[MsgPartInHistory]]) -> list[genai_types.Content]:
-        contents: list[genai_types.Content] = []
-        roles = ['user', 'model']
-        for i, msg_parts in enumerate(chat_history):
-            role = roles[i % len(roles)]
-            parts: list[genai_types.Part] = []
-            for part in msg_parts:
-                if part.type_ == 'text':
-                    assert part.text is not None
-                    parts.append(genai_types.Part.from_text(text=part.text))
-                elif part.type_ == 'image':
-                    assert part.hash is not None
-                    blob = self.load_photo(part.hash)
-                    parts.append(genai_types.Part.from_bytes(data=blob, mime_type='image/jpeg'))
-            contents.append(genai_types.Content(role=role, parts=parts))
-        return contents
-
-    async def _completion_gemini(
-        self,
-        chat_history: list[list[MsgPartInHistory]],
-        model: Model,
-        system_prompt: str,
-        endpoint: str,
-        _chat_id: int,
-        _msg_id: int,
-    ):
-        contents = self._convert_history_gemini(chat_history)
-
-        config_kwargs: dict[str, Any] = {}
-        if system_prompt and not model.no_system_prompt:
-            config_kwargs['system_instruction'] = system_prompt
-        if isinstance(model.thinking, int) and model.thinking > 0:
-            config_kwargs['thinking_config'] = genai_types.ThinkingConfig(thinking_budget=model.thinking)
-        if model.search:
-            config_kwargs['tools'] = [genai_types.Tool(google_search=genai_types.GoogleSearch())]
-
-        gclient: genai.Client = self.get_client(endpoint, model)
-        finish_reason = None
-        has_thought = False
-        thought_ended = False
-        async for chunk in await gclient.aio.models.generate_content_stream(
-            model=model.name,
-            contents=contents,
-            config=genai_types.GenerateContentConfig(**config_kwargs) if config_kwargs else None,
-        ):
-            if chunk.candidates and chunk.candidates[0].content and chunk.candidates[0].content.parts:
-                for part in chunk.candidates[0].content.parts:
-                    if part.thought:
-                        has_thought = True
-                        if part.text:
-                            yield part.text
-                    elif part.text:
-                        if has_thought and not thought_ended:
-                            thought_ended = True
-                            yield '\x00'
-                        yield part.text
-            if chunk.candidates and chunk.candidates[0].finish_reason:
-                finish_reason = chunk.candidates[0].finish_reason
-
-        if finish_reason is not None:
-            fr = str(finish_reason)
-            if 'MAX_TOKENS' in fr:
-                yield '\n\n[!] Error: Output truncated due to limit'
-            elif 'SAFETY' in fr:
-                yield '\n\n[!] Error: Response blocked by safety filter'
-            elif 'STOP' not in fr:
-                yield f'\n\n[!] Error: finish_reason="{fr}"'
+        # build metadata from final message
+        meta: dict[str, Any] = {}
+        search_queries: list[str] = []
+        for block in final_message.content:
+            if block.type == 'server_tool_use' and block.name == 'web_search':
+                query = block.input.get('query', '')
+                if query:
+                    search_queries.append(str(query))
+        if search_queries:
+            meta['tool_calls'] = search_queries
+        usage: dict[str, Any] = {
+            'in': final_message.usage.input_tokens,
+            'out': final_message.usage.output_tokens,
+        }
+        cache_creation = getattr(final_message.usage, 'cache_creation_input_tokens', None)
+        cache_read = getattr(final_message.usage, 'cache_read_input_tokens', None)
+        if cache_creation:
+            usage['cache_write'] = cache_creation
+        if cache_read:
+            usage['cache_read'] = cache_read
+        server_tool_use = getattr(final_message.usage, 'server_tool_use', None)
+        if server_tool_use:
+            web_search_requests = getattr(server_tool_use, 'web_search_requests', None)
+            if web_search_requests:
+                usage['web_searches'] = web_search_requests
+        meta['usage'] = usage
+        yield '\x02' + json.dumps(meta)
 
     def construct_chat_history(self, chat_id: int, msg_id: int) -> tuple[list[list[MsgPartInHistory]], Model, str]:
         """Returns (history, model, system_prompt). History is a list of messages in neutral format (MsgPartInHistory)."""
@@ -1031,6 +1002,7 @@ class ChatGPTTelegramBot:
         status: str | None = None,
         expect_thinking: bool = False,
         tool_calls: list[str] | None = None,
+        usage: dict[str, Any] | None = None,
     ) -> str | RichText:
         suffix = f' [!{status}]' if status else ''
         if not thinking_done:
@@ -1046,9 +1018,17 @@ class ChatGPTTelegramBot:
             result = RichText.Blockquote(RichText.from_markdown(thinking.rstrip('\n')))
         if reply or suffix:
             result = result + '\n' + RichText.from_markdown(reply) + suffix
-        if tool_calls:
-            footer = RichText.Bold('Tool calls') + '\n' + '\n'.join(f'🔍 {q}' for q in tool_calls)
-            result = result + '\n\n' + footer
+        if tool_calls or usage:
+            footer_content: RichText | str = ''
+            if tool_calls:
+                footer_content = footer_content + RichText.Bold('Tool calls') + '\n'
+                footer_content = footer_content + '\n'.join(f'🔍 {q}' for q in tool_calls)
+            if usage:
+                if footer_content:
+                    footer_content = footer_content + '\n\n'
+                footer_content = footer_content + RichText.Bold('Usage') + '\n'
+                footer_content = footer_content + ', '.join(f'{k}={v}' for k, v in usage.items())
+            result = result + '\n\n' + RichText.Blockquote(footer_content)
         return result
 
     async def _run_completion(self, chat_id: int, msg_id: int):
@@ -1064,7 +1044,7 @@ class ChatGPTTelegramBot:
             thinking = ''
             reply = ''
             thinking_done = False
-            tool_calls: list[str] = []
+            stream_meta: dict[str, Any] = {}
             expect_thinking = model.thinking is not None or model.api_type == 'anthropic'
             model_flags: list[str] = []
             if model.thinking is not None:
@@ -1083,9 +1063,9 @@ class ChatGPTTelegramBot:
                     stream = self.completion(chat_history, model, system_prompt, endpoint, chat_id, msg_id)
                     first_update_timestamp = None
                     async for delta in stream:
-                        # \x02 sentinel carries tool call info (at end of stream)
+                        # \x02 sentinel carries JSON metadata (at end of stream)
                         if '\x02' in delta:
-                            tool_calls.extend(delta.split('\x02', 1)[1].split('\n'))
+                            stream_meta = json.loads(delta.split('\x02', 1)[1])
                             continue
                         # \x01 sentinel signals status change
                         if '\x01' in delta:
@@ -1127,7 +1107,15 @@ class ChatGPTTelegramBot:
                         # no \x00 sentinel received — all text is response, not thinking
                         reply = thinking
                         thinking = ''
-                    await replymsgs.update(self._format_reply(thinking, reply, True, tool_calls=tool_calls or None))
+                    await replymsgs.update(
+                        self._format_reply(
+                            thinking,
+                            reply,
+                            True,
+                            tool_calls=stream_meta.get('tool_calls'),
+                            usage=stream_meta.get('usage'),
+                        )
+                    )
                     await replymsgs.finalize()
                     full_reply = reply
                     for bot_msg_id, _ in replymsgs.replied_msgs:

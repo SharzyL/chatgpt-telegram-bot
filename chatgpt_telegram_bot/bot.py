@@ -54,6 +54,12 @@ class ChatGPTTelegramBot:
         self.models: Sequence[Model] = [Model(**m) for m in _config['models']]
         self.endpoints: Sequence[EndPoint] = [EndPoint(**e) for e in _config['endpoints']]
         self.default_endpoint: str = _config['default_endpoint']
+        self.system_prompt: str = _config.get(
+            'system_prompt',
+            'Current Beijing Time: {current_time}. Reply in the same language as the user sent you.',
+        )
+        self.default_image_prompt: str = _config.get('default_image_prompt', 'Describe the image')
+        self.default_image_reply_prompt: str = _config.get('default_image_reply_prompt', 'Continue')
 
         for model in self.models:
             if ' ' in model.prefix or '$' in model.prefix or ',' in model.prefix:
@@ -306,11 +312,9 @@ class ChatGPTTelegramBot:
 
         _ = await self.bot.run_until_disconnected()  # pyright: ignore[reportGeneralTypeIssues]  # telethon's run_until_disconnected() is awaitable at runtime
 
-    @staticmethod
-    def get_prompt(_model: str) -> str:
+    def get_prompt(self, model: str) -> str:
         current_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
-        return f"""Current Beijing Time: {current_time}. Reply in the same language as the user sent you.
-    """
+        return self.system_prompt.format_map({'current_time': current_time, 'model': model})
 
     def is_whitelist(self, chat_id: int) -> bool:
         whitelist = self.db['whitelist']
@@ -574,7 +578,7 @@ class ChatGPTTelegramBot:
                 return
 
         if photo_hash and not text:
-            text = 'Continue' if reply_to_id is not None else 'Describe the image in Chinese'
+            text = self.default_image_reply_prompt if reply_to_id is not None else self.default_image_prompt
 
         if photo_hash:
             new_message: list[MsgPartInHistory] = [

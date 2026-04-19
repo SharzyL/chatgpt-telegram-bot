@@ -77,7 +77,7 @@ async def async_main() -> None:
         )
 
     data_dir: str = args.data_dir
-    logger.info(f'Data directory: {data_dir}')
+    logger.info(f'Data directory: {data_dir}, config path: {args.config}')
     cbot = ChatGPTTelegramBot(args.config, data_dir)
     await cbot.start()
 

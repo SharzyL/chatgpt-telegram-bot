@@ -8,6 +8,7 @@ class Model(NamedTuple):
     endpoint: str | None = None
     no_system_prompt: bool = False
     system_prompt: str | None = None
+    system_prompt_append: str | None = None  # appended to default system prompt via +[...] syntax
     api_type: str = 'openai'  # 'openai', 'openai_legacy', or 'anthropic'
     suffix: str | None = None  # appended to endpoint URL, None = use endpoint's default_suffix
     thinking: int | str | None = None  # None = disabled, int = budget, str = effort level or 'adaptive'

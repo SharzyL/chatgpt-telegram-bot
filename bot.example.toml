@@ -1,6 +1,8 @@
 admin_id = 114514
+# allowed_chats = [114514, -1001234567890]  # admin is always allowed
 
-# system_prompt = "Current Beijing Time: {current_time}. Reply in the same language as the user sent you."  # supports {current_time}, {model}
+# timezone = "Asia/Shanghai"  # default: UTC
+# system_prompt = "Current date: {current_date}. Reply in the same language as the user sent you."  # supports {current_date}, {model}
 # default_image_prompt = "Describe the image"
 # default_image_reply_prompt = "Continue"
 # image_cache_size = 52428800  # 50MB default
@@ -18,6 +20,6 @@ models = [
 
   { prefix = "t", name = "claude-3-7-sonnet-latest", endpoint = "anthropic", api_type = "anthropic", system_prompt = "The user will send you some text and optionally a language name. You need to translate it into Chinese. If the user sends a single word, you should also include some expanations and usages. Note that your answer should also in Chinese." },
 
-  # inline system prompt: om,[You are a helpful bot, current time {current_time}] hello
+  # inline system prompt: om,[You are a helpful bot, current date {current_date}] hello
   # escaped brackets: om,[Respond with JSON like \[1,2,3\]] hello
 ]

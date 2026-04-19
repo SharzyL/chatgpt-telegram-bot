@@ -125,6 +125,21 @@ class TestParseOverrides:
     def test_value_with_equals(self):
         assert parse_overrides('t=a=b') == {'t': 'a=b'}
 
+    def test_system_prompt_append(self):
+        assert parse_overrides('+[Reply in JSON]') == {'system_prompt_append': 'Reply in JSON'}
+
+    def test_system_prompt_append_with_commas(self):
+        result = parse_overrides('+[Be concise, clear]')
+        assert result == {'system_prompt_append': 'Be concise, clear'}
+
+    def test_system_prompt_append_with_overrides(self):
+        result = parse_overrides('t=high,+[Reply in JSON]')
+        assert result == {'t': 'high', 'system_prompt_append': 'Reply in JSON'}
+
+    def test_system_prompt_append_escaped_brackets(self):
+        result = parse_overrides(r'+[Use format \[key: value\]]')
+        assert result == {'system_prompt_append': 'Use format [key: value]'}
+
 
 # ---------------------------------------------------------------------------
 # ChatGPTTelegramBot.match_prefix
@@ -215,3 +230,25 @@ class TestMatchPrefix:
         assert result is not None
         # '[You are a bot]$hello' is a single part that doesn't match [..] pattern, becomes bare key
         assert result == ('', {'[You are a bot]$hello': None})
+
+    # --- append system prompt ---
+
+    def test_system_prompt_append_basic(self):
+        result = match_prefix('om,+[Reply in JSON] hello', 'om')
+        assert result is not None
+        assert result == ('hello', {'system_prompt_append': 'Reply in JSON'})
+
+    def test_system_prompt_append_with_overrides(self):
+        result = match_prefix('om,t=high,+[Be concise] hello', 'om')
+        assert result is not None
+        assert result == ('hello', {'t': 'high', 'system_prompt_append': 'Be concise'})
+
+    def test_system_prompt_append_no_text(self):
+        result = match_prefix('om,+[Reply in JSON]', 'om')
+        assert result is not None
+        assert result == ('', {'system_prompt_append': 'Reply in JSON'})
+
+    def test_system_prompt_append_with_commas(self):
+        result = match_prefix('om,+[Be concise, clear, helpful] hello', 'om')
+        assert result is not None
+        assert result == ('hello', {'system_prompt_append': 'Be concise, clear, helpful'})

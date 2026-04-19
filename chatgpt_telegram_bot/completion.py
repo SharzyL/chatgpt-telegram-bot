@@ -298,8 +298,16 @@ async def completion(
 ) -> AsyncIterator[StreamEvent]:
     """Dispatch to the appropriate completion backend based on model.api_type."""
     assert len(chat_history) % 2 == 1
-    log_history = [[{'type': p.type_, 'text': p.text} for p in msg] for msg in chat_history]
-    logger.info(f'Starting completion ({model.api_type}) for {chat_id=}, {msg_id=}: {log_history}')
+    last_msg_parts = chat_history[-1]
+    last_text = ' '.join(p.text for p in last_msg_parts if p.type_ == 'text' and p.text)
+    if len(last_text) > 80:
+        last_text = last_text[:80] + '…'
+    n_img = sum(1 for p in last_msg_parts if p.type_ == 'image')
+    img_info = f' +{n_img}img' if n_img else ''
+    sys_info = f' sys="{system_prompt[:60]}…"' if len(system_prompt) > 60 else f' sys="{system_prompt}"'
+    logger.info(
+        f'Completion {model.api_type} {chat_id}:{msg_id}{sys_info} [{len(chat_history)}msg] "{last_text}"{img_info}'
+    )
 
     if model.api_type == 'openai':
         backend = completion_openai(client, chat_history, model, system_prompt, chat_id, msg_id, load_image)

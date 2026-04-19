@@ -6,6 +6,8 @@ import datetime
 import time
 import traceback
 import tomllib
+from html import escape as html_escape
+from zoneinfo import ZoneInfo
 from collections.abc import Sequence
 from typing import Any
 
@@ -60,8 +62,11 @@ class ChatGPTTelegramBot:
         self.default_endpoint: str = _config['default_endpoint']
         self.system_prompt: str = _config.get(
             'system_prompt',
-            'You are {model} model. Current time: {current_time}. Reply in the same language as the user sent you. Format the reply in MarkdownV2 but do not use markdown headings, tables, separator lines and TeX math.',
+            'You are {model} model. Current date: {current_date}. Reply in the same language as the user sent you. Format the reply in MarkdownV2 but do not use markdown headings, tables, separator lines and TeX math.',
         )
+        self.allowed_chats: set[int] = set(_config.get('allowed_chats', []))
+        self.allowed_chats.add(self.admin_id)
+        self.timezone: ZoneInfo = ZoneInfo(_config.get('timezone', 'UTC'))
         self.default_image_prompt: str = _config.get('default_image_prompt', 'Describe the image')
         self.default_image_reply_prompt: str = _config.get('default_image_reply_prompt', 'Continue')
 
@@ -117,9 +122,7 @@ class ChatGPTTelegramBot:
         self.pending_reply_manager: PendingReplyManager = PendingReplyManager()
 
         # db scheme:
-        # whitelist: Set[int]
         # msg_info_{chat_id}_{msg_id}: MsgInfo
-        # system_prompt_{chat_id}: str
         self.db: shelve.Shelf[Any] = shelve.open(os.path.join(data_dir, 'db'))
         image_cache_size = _config.get('image_cache_size', 50 * 1024 * 1024)
         if not isinstance(image_cache_size, int):
@@ -130,8 +133,6 @@ class ChatGPTTelegramBot:
 
         _ = atexit.register(self.db.close)
         _ = atexit.register(self.image_cache.close)
-        if 'whitelist' not in self.db:
-            self.db['whitelist'] = {self.admin_id}
 
         self.bot_id: int = int(self.TELEGRAM_BOT_TOKEN.split(':')[0])
         self.pending_reply_manager = PendingReplyManager()
@@ -157,15 +158,10 @@ class ChatGPTTelegramBot:
         key = f'msg_info_{chat_id}_{msg_id}'
         self.db[key] = msg_info
 
-    def get_system_prompt_by_chat(self, chat_id: int):
-        key = f'system_prompt_{chat_id}'
-        if key in self.db:
-            return self.db[key]
-        else:
-            return None
+    def is_allowed(self, chat_id: int) -> bool:
+        return chat_id in self.allowed_chats
 
     async def start(self) -> None:
-        logger.info('Pre bot start, config: {}', self.config_path)
         await self.bot.start(bot_token=self.TELEGRAM_BOT_TOKEN)  # pyright: ignore[reportGeneralTypeIssues]  # telethon's start() is awaitable at runtime
         logger.info('Bot started')
         self.bot.parse_mode = None  # pyright: ignore[reportAttributeAccessIssue]  # telethon supports this at runtime
@@ -175,7 +171,6 @@ class ChatGPTTelegramBot:
         async def _process(event: events.NewMessage.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
             if event.message.grouped_id is not None:
                 return
-            prompt_db_key = f'system_prompt_{event.message.chat_id}'
             if event.message.chat_id is None:
                 return
             if event.message.sender_id is None:
@@ -185,40 +180,8 @@ class ChatGPTTelegramBot:
             text = event.message.message
             if text == '/ping' or text == f'/ping@{me.username}':
                 await self.ping(event.message)
-            elif text == '/list_models' or text == f'/list_models@{me.username}':
-                await self.list_models_handler(event.message)
-            elif text == '/add_whitelist' or text == f'/add_whitelist@{me.username}':
-                await self.add_whitelist_handler(event.message)
-            elif text == '/del_whitelist' or text == f'/del_whitelist@{me.username}':
-                await self.del_whitelist_handler(event.message)
-            elif text == '/get_whitelist' or text == f'/get_whitelist@{me.username}':
-                await self.get_whitelist_handler(event.message)
-
-            elif text == '/get_prompt' or text == f'/get_prompt@{me.username}':
-                if prompt_db_key in self.db:
-                    prompt = self.db[prompt_db_key]
-                    _ = await self.send_message(
-                        event.message.chat_id,
-                        f'system prompt:\n\n{prompt}',
-                        event.message.id,
-                    )
-                else:
-                    _ = await self.send_message(event.message.chat_id, 'no prompt set yet', event.message.id)
-            elif text.startswith('/set_prompt'):
-                space_pos = text.find(' ')
-                if space_pos == -1:
-                    space_pos = len(text) - 1
-                prompt = text[space_pos + 1 :]
-                self.db[prompt_db_key] = prompt
-                _ = await self.send_message(
-                    event.message.chat_id,
-                    f'system prompt set to:\n\n{prompt}',
-                    event.message.id,
-                )
-            elif text == '/clear_prompt' or text == f'/clear_prompt@{me.username}':
-                if prompt_db_key in self.db:
-                    del self.db[prompt_db_key]
-                _ = await self.send_message(event.message.chat_id, 'system prompt cleared', event.message.id)
+            elif text == '/help' or text == f'/help@{me.username}':
+                await self.help_handler(event.message)
             else:
                 await self.reply_handler(event.message)
 
@@ -237,16 +200,7 @@ class ChatGPTTelegramBot:
                     types.BotCommand(command, description)
                     for command, description in [
                         ('ping', 'Test bot connectivity'),
-                        ('list_models', 'List supported models'),
-                        ('add_whitelist', 'Add this group to whitelist (only admin)'),
-                        (
-                            'del_whitelist',
-                            'Delete this group from whitelist (only admin)',
-                        ),
-                        ('get_whitelist', 'List groups in whitelist (only admin)'),
-                        ('get_prompt', 'Get system prompt'),
-                        ('set_prompt', 'Set system prompt'),
-                        ('clear_prompt', 'Clear system prompt'),
+                        ('help', 'Show available models and usage'),
                     ]
                 ],
             )
@@ -260,7 +214,7 @@ class ChatGPTTelegramBot:
                     types.BotCommand(command, description)
                     for command, description in [
                         ('ping', 'Test bot connectivity'),
-                        ('list_models', 'List supported models'),
+                        ('help', 'Show available models and usage'),
                     ]
                 ],
             )
@@ -270,28 +224,21 @@ class ChatGPTTelegramBot:
         _ = await self.bot.run_until_disconnected()  # pyright: ignore[reportGeneralTypeIssues]  # telethon's run_until_disconnected() is awaitable at runtime
 
     def _format_system_prompt(self, template: str, model: str) -> str:
-        current_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
-        return template.format_map({'current_time': current_time, 'model': model})
+        current_date = datetime.datetime.now(self.timezone).strftime('%Y-%m-%d')
+        return template.format_map({'current_date': current_date, 'model': model})
 
     def get_prompt(self, model: str) -> str:
         return self._format_system_prompt(self.system_prompt, model)
 
-    def is_whitelist(self, chat_id: int) -> bool:
-        whitelist = self.db['whitelist']
-        return chat_id in whitelist
-
-    def add_whitelist(self, chat_id: int) -> None:
-        whitelist = self.db['whitelist']
-        whitelist.add(chat_id)
-        self.db['whitelist'] = whitelist
-
-    def del_whitelist(self, chat_id: int) -> None:
-        whitelist = self.db['whitelist']
-        whitelist.discard(chat_id)
-        self.db['whitelist'] = whitelist
-
-    def get_whitelist(self) -> Any:
-        return self.db['whitelist']
+    def _model_flags(self, model: Model) -> list[str]:
+        flags: list[str] = []
+        if model.endpoint is not None and model.endpoint != self.default_endpoint:
+            flags.append(f'endpoint={model.endpoint}')
+        if model.thinking is not None:
+            flags.append(f'thinking={model.thinking}')
+        if model.search:
+            flags.append('search')
+        return flags
 
     @staticmethod
     def only_admin(func):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
@@ -304,27 +251,13 @@ class ChatGPTTelegramBot:
         return new_func
 
     @staticmethod
-    def only_private(func):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
-        async def new_func(self, message):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
-            if message.chat_id != message.sender_id:
-                _ = await self.send_message(
-                    message.chat_id,
-                    'This command only works in private chat',
-                    message.id,
-                )
-                return
-            await func(self, message)
-
-        return new_func
-
-    @staticmethod
-    def only_whitelist(func):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
-        async def new_func(self, message):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
-            if not self.is_whitelist(message.chat_id):
+    def only_allowed(func):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
+        async def new_func(self, message, *args, **kwargs):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
+            if not self.is_allowed(message.chat_id):
                 if message.chat_id == message.sender_id:
-                    _ = await self.send_message(message.chat_id, 'This chat is not in whitelist', message.id)
+                    _ = await self.send_message(message.chat_id, 'This chat is not allowed', message.id)
                 return
-            await func(self, message)
+            await func(self, message, *args, **kwargs)
 
         return new_func
 
@@ -349,7 +282,7 @@ class ChatGPTTelegramBot:
                         overrides = getattr(msg_info, 'overrides', None) or {}
                         model_of_history = apply_overrides(model, overrides)
 
-            if msg_info.system_prompt:
+            if msg_info.system_prompt is not None:
                 system_prompt = msg_info.system_prompt
 
             if msg_info.sent_by_bot != should_be_bot:
@@ -371,36 +304,34 @@ class ChatGPTTelegramBot:
         assert model_of_history
         return history[::-1], model_of_history, system_prompt
 
-    @only_admin
-    async def add_whitelist_handler(self, message: Any) -> None:
-        if self.is_whitelist(message.chat_id):
-            _ = await self.send_message(message.chat_id, 'Already in whitelist', message.id)
-            return
-        self.add_whitelist(message.chat_id)
-        _ = await self.send_message(message.chat_id, 'Whitelist added', message.id)
-
-    @only_admin
-    async def del_whitelist_handler(self, message: Any) -> None:
-        if not self.is_whitelist(message.chat_id):
-            _ = await self.send_message(message.chat_id, 'Not in whitelist', message.id)
-            return
-        self.del_whitelist(message.chat_id)
-        _ = await self.send_message(message.chat_id, 'Whitelist deleted', message.id)
-
-    @only_admin
-    @only_private
-    async def get_whitelist_handler(self, message: Any) -> None:
-        _ = await self.send_message(message.chat_id, str(self.get_whitelist()), message.id)
-
-    @only_whitelist
-    async def list_models_handler(self, message: Any) -> None:
-        text = ''
+    def _build_help_text(self, error: str | None = None) -> str:
+        lines: list[str] = []
+        if error:
+            lines.append(f'⚠️ {error}\n')
+        lines.append('<b>Models</b>')
         for m in self.models:
-            if 'endpoint' in m:
-                text += f'"<code>{m.prefix}</code>": <code>{m.name}</code> (from {m.endpoint})\n'
-            else:
-                text += f'"<code>{m.prefix}</code>": <code>{m.name}</code>\n'
-        _ = await self.send_message_html(message.chat_id, text, message.id)
+            flags = ', '.join(self._model_flags(m))
+            suffix = f' ({flags})' if flags else ''
+            lines.append(f'  <code>{m.prefix}</code> → <code>{m.name}</code>{suffix}')
+        lines.append('')
+        lines.append('<b>Usage</b>')
+        lines.append('  <code>&lt;prefix&gt; &lt;message&gt;</code>')
+        lines.append('  <code>&lt;prefix&gt;,t &lt;message&gt;</code>  — enable thinking')
+        lines.append('  <code>&lt;prefix&gt;,t=high &lt;message&gt;</code>  — set thinking effort')
+        lines.append('  <code>&lt;prefix&gt;,t= &lt;message&gt;</code>  — disable thinking')
+        lines.append('  <code>&lt;prefix&gt;,s &lt;message&gt;</code>  — enable search')
+        lines.append('  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt')
+        lines.append('  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt')
+        lines.append('  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt')
+        lines.append('')
+        lines.append('Reply to a bot message to continue the conversation.')
+        lines.append('')
+        lines.append(f'<b>Default system prompt</b>\n<code>{html_escape(self.system_prompt)}</code>')
+        return '\n'.join(lines)
+
+    @only_allowed
+    async def help_handler(self, message: Any, error: str | None = None) -> None:
+        _ = await self.send_message_html(message.chat_id, self._build_help_text(error), message.id)
 
     @retry()
     async def send_message(self, chat_id: int, text: str | RichText, reply_to_message_id: int) -> int:
@@ -463,7 +394,7 @@ class ChatGPTTelegramBot:
         )
         logger.debug(f'Message deleted: {chat_id=}, {message_id=}')
 
-    @only_whitelist
+    @only_allowed
     async def reply_handler(self, message: Any) -> None:
         chat_id = message.chat_id
         sender_id = message.sender_id
@@ -508,13 +439,9 @@ class ChatGPTTelegramBot:
                         _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
                         return
                     break
-            else:  # not reply or new message to bot
-                if chat_id == sender_id:  # if in private chat, send hint
-                    _ = await self.send_message(
-                        chat_id,
-                        'Please start a new conversation with specified prefixes or reply to a bot message',
-                        msg_id,
-                    )
+            else:  # no matching prefix
+                if chat_id == sender_id:  # in private chat, show help with error
+                    await self.help_handler(message, error='Unknown prefix. Use one of the prefixes below.')
                 return
 
         photo_message = message if message.photo is not None else extra_photo_message
@@ -553,16 +480,17 @@ class ChatGPTTelegramBot:
         else:
             new_message = [make_text_part(text)]
 
-        if model_by_prefix and model_by_prefix.system_prompt:
-            # format_map supports {current_time} and {model} in both config and inline [...]  prompts
+        if model_by_prefix and model_by_prefix.system_prompt is not None:
             system_prompt: str | None = self._format_system_prompt(model_by_prefix.system_prompt, model_by_prefix.name)
+        elif model_by_prefix:
+            system_prompt = self.get_prompt(model_by_prefix.name)
         else:
             system_prompt = None
-        system_prompt = (
-            self.get_system_prompt_by_chat(chat_id)
-            or system_prompt
-            or (model_by_prefix and self.get_prompt(model_by_prefix.name))
-        )
+        if model_by_prefix and model_by_prefix.system_prompt_append is not None:
+            base = system_prompt if system_prompt is not None else self.get_prompt(model_by_prefix.name)
+            system_prompt = (
+                base + '\n' + self._format_system_prompt(model_by_prefix.system_prompt_append, model_by_prefix.name)
+            )
 
         # note that prefix and system_prompt are None when reply_id is not None
         self.set_msg_info(
@@ -594,11 +522,7 @@ class ChatGPTTelegramBot:
             reply = ''
             thinking_done = False
             stream_meta = StreamMeta()
-            model_flags: list[str] = []
-            if model.thinking is not None:
-                model_flags.append(f'thinking={model.thinking}')
-            if model.search:
-                model_flags.append('search')
+            model_flags = self._model_flags(model)
             prefix = '🤖 ' + RichText.Code(model.name)
             if model_flags:
                 prefix += ' (' + ', '.join(model_flags) + ')'
@@ -698,10 +622,10 @@ class ChatGPTTelegramBot:
         chat_id: int = event.chat_id  # pyright: ignore[reportAssignmentType]  # checked for None in process_album
         sender_id = event.sender_id
 
-        # Inline whitelist check (Album.Event lacks .id, so @only_whitelist cannot be used)
-        if not self.is_whitelist(chat_id):
+        # Inline allowed check (Album.Event lacks .id, so @only_allowed cannot be used)
+        if not self.is_allowed(chat_id):
             if chat_id == sender_id:
-                _ = await self.send_message(chat_id, 'This chat is not in whitelist', event.messages[0].id)
+                _ = await self.send_message(chat_id, 'This chat is not allowed', event.messages[0].id)
             return
 
         msg_id = event.messages[0].id
@@ -763,15 +687,17 @@ class ChatGPTTelegramBot:
         for h in photo_hashes:
             new_message.append(make_image_part(h))
 
-        if model_by_prefix and model_by_prefix.system_prompt:
+        if model_by_prefix and model_by_prefix.system_prompt is not None:
             system_prompt: str | None = self._format_system_prompt(model_by_prefix.system_prompt, model_by_prefix.name)
+        elif model_by_prefix:
+            system_prompt = self.get_prompt(model_by_prefix.name)
         else:
             system_prompt = None
-        system_prompt = (
-            self.get_system_prompt_by_chat(chat_id)
-            or system_prompt
-            or (model_by_prefix and self.get_prompt(model_by_prefix.name))
-        )
+        if model_by_prefix and model_by_prefix.system_prompt_append is not None:
+            base = system_prompt if system_prompt is not None else self.get_prompt(model_by_prefix.name)
+            system_prompt = (
+                base + '\n' + self._format_system_prompt(model_by_prefix.system_prompt_append, model_by_prefix.name)
+            )
 
         msg_info = MsgInfo(
             sent_by_bot=False,
@@ -793,7 +719,7 @@ class ChatGPTTelegramBot:
             f"""
 chat_id={message.chat_id}
 user_id={message.sender_id}
-is_whitelisted={self.is_whitelist(message.chat_id)}
+is_allowed={self.is_allowed(message.chat_id)}
 """,
             message.id,
         )

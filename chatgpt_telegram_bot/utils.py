@@ -70,15 +70,19 @@ def parse_overrides(s: str) -> dict[str, str | None]:
     """Parse ``key=val,key2=val2,key3,[custom system prompt]`` into a dict.
 
     Bare keys (no ``=``) map to ``None`` (use default).  A ``[…]``-delimited
-    segment is stored under the ``system_prompt`` key; brackets inside the
-    prompt can be escaped with a leading backslash (``\\[``, ``\\]``).
+    segment is stored under the ``system_prompt`` key; ``+[…]`` is stored
+    under ``system_prompt_append``.  Brackets inside the prompt can be
+    escaped with a leading backslash (``\\[``, ``\\]``).
     """
     overrides: dict[str, str | None] = {}
     for part in split_respecting_brackets(s):
         part = part.strip()
         if not part:
             continue
-        if part.startswith('[') and part.endswith(']'):
+        if part.startswith('+[') and part.endswith(']'):
+            content = part[2:-1].replace('\\[', '[').replace('\\]', ']')
+            overrides['system_prompt_append'] = content
+        elif part.startswith('[') and part.endswith(']'):
             content = part[1:-1].replace('\\[', '[').replace('\\]', ']')
             overrides['system_prompt'] = content
         elif '=' in part:
@@ -140,6 +144,8 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
             replacements['search'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
         elif field == 'system_prompt':
             replacements['system_prompt'] = value
+        elif field == 'system_prompt_append':
+            replacements['system_prompt_append'] = value
         else:
             raise ValueError(f'Unknown override key: {key}')
     return model._replace(**replacements)

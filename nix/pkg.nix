@@ -10,6 +10,7 @@
 , mistune
 , systemd-python
 , hatchling
+, pytestCheckHook
 }:
 
 let
@@ -44,6 +45,6 @@ buildPythonPackage {
     mistune
     systemd-python
   ];
-  doCheck = false; # since we have no test
+  nativeCheckInputs = [ pytestCheckHook ];
 }
 

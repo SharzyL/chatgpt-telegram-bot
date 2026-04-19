@@ -1,27 +1,146 @@
 import asyncio
 import hashlib
 import os
+from typing import Any
 from urllib.parse import urlparse
 
 from loguru import logger
 from telethon import errors
 
+from chatgpt_telegram_bot.models import Model, OVERRIDE_ALIASES
 from chatgpt_telegram_bot.richtext import RichText
 
 
+def split_respecting_brackets(s: str, delimiters: str = ',') -> list[str]:
+    """Split *s* on any char in *delimiters*, but skip content inside ``[…]``.
+
+    Backslash-escaped brackets (``\\[``, ``\\]``) are treated as literal characters
+    and do **not** affect nesting depth.
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == '\\' and i + 1 < len(s) and s[i + 1] in '[]':
+            current.append(c)
+            current.append(s[i + 1])
+            i += 2
+            continue
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            if depth > 0:
+                depth -= 1
+        if c in delimiters and depth == 0:
+            parts.append(''.join(current))
+            current = []
+        else:
+            current.append(c)
+        i += 1
+    if current:
+        parts.append(''.join(current))
+    return parts
+
+
+def find_delimiter_outside_brackets(s: str) -> int:
+    """Return the index of the first space outside ``[…]``, or ``-1``."""
+    depth = 0
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == '\\' and i + 1 < len(s) and s[i + 1] in '[]':
+            i += 2
+            continue
+        if c == '[':
+            depth += 1
+        elif c == ']':
+            if depth > 0:
+                depth -= 1
+        elif c == ' ' and depth == 0:
+            return i
+        i += 1
+    return -1
+
+
 def parse_overrides(s: str) -> dict[str, str | None]:
-    """Parse 'key=val,key2=val2,key3' into dict. Bare key (no '=') maps to None (use default)."""
+    """Parse ``key=val,key2=val2,key3,[custom system prompt]`` into a dict.
+
+    Bare keys (no ``=``) map to ``None`` (use default).  A ``[…]``-delimited
+    segment is stored under the ``system_prompt`` key; brackets inside the
+    prompt can be escaped with a leading backslash (``\\[``, ``\\]``).
+    """
     overrides: dict[str, str | None] = {}
-    for part in s.split(','):
+    for part in split_respecting_brackets(s):
         part = part.strip()
         if not part:
             continue
-        if '=' in part:
+        if part.startswith('[') and part.endswith(']'):
+            content = part[1:-1].replace('\\[', '[').replace('\\]', ']')
+            overrides['system_prompt'] = content
+        elif '=' in part:
             k, v = part.split('=', 1)
             overrides[k.strip()] = v.strip()
         else:
             overrides[part] = None
     return overrides
+
+
+def match_prefix(text: str, prefix: str) -> tuple[str, dict[str, str | None]] | None:
+    """Check if text matches prefix with optional overrides. Returns (remaining_text, overrides) or None."""
+    # Case 1: prefix with overrides (prefix,key=val+... delim text)
+    if text.startswith(prefix + ','):
+        after_pipe = text[len(prefix) + 1 :]
+        # Find where overrides end (space delimiter, or end of string)
+        # Must skip over [...] bracket sections which may contain spaces
+        idx = find_delimiter_outside_brackets(after_pipe)
+        if idx != -1:
+            return (after_pipe[idx + 1 :], parse_overrides(after_pipe[:idx]))
+        # No delimiter — entire rest is overrides, no text
+        return ('', parse_overrides(after_pipe))
+    # Case 2: bare prefix (existing behavior)
+    if text == prefix:
+        return ('', {})
+    if text.startswith(prefix + ' '):
+        return (text[len(prefix) + 1 :], {})
+    return None
+
+
+THINKING_DEFAULTS: dict[str, str] = {
+    'openai': 'high',
+    'openai_legacy': 'high',
+    'anthropic': 'adaptive',
+}
+
+
+def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
+    """Apply inline parameter overrides to a model, returning a new Model."""
+    if not overrides:
+        return model
+    replacements: dict[str, Any] = {}
+    for key, value in overrides.items():
+        field = OVERRIDE_ALIASES.get(key, key)
+        if field == 'thinking':
+            if value is None:
+                # bare key (e.g. |t) — use api_type default
+                replacements['thinking'] = THINKING_DEFAULTS.get(model.api_type)
+            elif value == '':
+                # explicit empty (e.g. |t=) — disable thinking
+                replacements['thinking'] = None
+            else:
+                try:
+                    replacements['thinking'] = int(value)
+                except ValueError:
+                    replacements['thinking'] = value
+        elif field == 'search':
+            # bare key (|s) enables, explicit empty (|s=) disables
+            replacements['search'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
+        elif field == 'system_prompt':
+            replacements['system_prompt'] = value
+        else:
+            raise ValueError(f'Unknown override key: {key}')
+    return model._replace(**replacements)
 
 
 def parse_proxy():

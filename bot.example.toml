@@ -16,4 +16,7 @@ models = [
   { prefix = "$", name = "claude-3-opus", endpoint = "anthropic", api_type = "anthropic" },
 
   { prefix = "t", name = "claude-3-7-sonnet-latest", endpoint = "anthropic", api_type = "anthropic", system_prompt = "The user will send you some text and optionally a language name. You need to translate it into Chinese. If the user sends a single word, you should also include some expanations and usages. Note that your answer should also in Chinese." },
+
+  # inline system prompt: om,[You are a helpful bot, current time {current_time}] hello
+  # escaped brackets: om,[Respond with JSON like \[1,2,3\]] hello
 ]

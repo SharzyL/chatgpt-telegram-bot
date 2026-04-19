@@ -1,4 +1,4 @@
-name: Nix Build Check
+name: CI
 
 on:
   push:
@@ -17,9 +17,11 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@v31
 
-      - name: Check Nix flake
-        run: |
-          nix build
-          nix flake check
-          nix develop -c basedpyright
+      - name: Build and test
+        run: nix build
 
+      - name: Type check
+        run: nix develop -c basedpyright
+
+      - name: Flake check
+        run: nix flake check

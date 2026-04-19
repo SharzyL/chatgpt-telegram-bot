@@ -26,10 +26,10 @@ from chatgpt_telegram_bot.models import (
     StatusChange,
     make_image_part,
     make_text_part,
-    OVERRIDE_ALIASES,
 )
 from chatgpt_telegram_bot.utils import (
-    parse_overrides,
+    apply_overrides,
+    match_prefix,
     parse_proxy,
     retry,
     telegram_len,
@@ -56,14 +56,14 @@ class ChatGPTTelegramBot:
         self.default_endpoint: str = _config['default_endpoint']
         self.system_prompt: str = _config.get(
             'system_prompt',
-            'Current Beijing Time: {current_time}. Reply in the same language as the user sent you.',
+            'You are {model} model. Current time: {current_time}. Reply in the same language as the user sent you. Format the reply in MarkdownV2 but do not use markdown headings, tables, separator lines and TeX math.',
         )
         self.default_image_prompt: str = _config.get('default_image_prompt', 'Describe the image')
         self.default_image_reply_prompt: str = _config.get('default_image_reply_prompt', 'Continue')
 
         for model in self.models:
-            if ' ' in model.prefix or '$' in model.prefix or ',' in model.prefix:
-                raise ValueError(f'prefix must not contain space, "$", or ",": "{model.prefix}"')
+            if ' ' in model.prefix or ',' in model.prefix:
+                raise ValueError(f'prefix must not contain space or ",": "{model.prefix}"')
             if model.thinking == 'adaptive' and model.api_type != 'anthropic':
                 raise ValueError(
                     'thinking="adaptive" is only supported for api_type="anthropic",'
@@ -130,60 +130,6 @@ class ChatGPTTelegramBot:
             self.TELEGRAM_API_HASH,
             proxy=parse_proxy(),  # pyright: ignore[reportArgumentType]  # telethon proxy type is broader at runtime
         )
-
-    @staticmethod
-    def match_prefix(text: str, prefix: str) -> tuple[str, dict[str, str | None]] | None:
-        """Check if text matches prefix with optional overrides. Returns (remaining_text, overrides) or None."""
-        # Case 1: prefix with overrides (prefix,key=val+... delim text)
-        if text.startswith(prefix + ','):
-            after_pipe = text[len(prefix) + 1 :]
-            # Find where overrides end (space or $ delimiter, or end of string)
-            for delim in (' ', '$'):
-                idx = after_pipe.find(delim)
-                if idx != -1:
-                    return (after_pipe[idx + 1 :], parse_overrides(after_pipe[:idx]))
-            # No delimiter — entire rest is overrides, no text
-            return ('', parse_overrides(after_pipe))
-        # Case 2: bare prefix (existing behavior)
-        if text == prefix:
-            return ('', {})
-        for delim in (' ', '$'):
-            if text.startswith(prefix + delim):
-                return (text[len(prefix) + len(delim) :], {})
-        return None
-
-    THINKING_DEFAULTS: dict[str, str] = {
-        'openai': 'high',
-        'openai_legacy': 'high',
-        'anthropic': 'adaptive',
-    }
-
-    @staticmethod
-    def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
-        """Apply inline parameter overrides to a model, returning a new Model."""
-        if not overrides:
-            return model
-        replacements: dict[str, Any] = {}
-        for key, value in overrides.items():
-            field = OVERRIDE_ALIASES.get(key, key)
-            if field == 'thinking':
-                if value is None:
-                    # bare key (e.g. |t) — use api_type default
-                    replacements['thinking'] = ChatGPTTelegramBot.THINKING_DEFAULTS.get(model.api_type)
-                elif value == '':
-                    # explicit empty (e.g. |t=) — disable thinking
-                    replacements['thinking'] = None
-                else:
-                    try:
-                        replacements['thinking'] = int(value)
-                    except ValueError:
-                        replacements['thinking'] = value
-            elif field == 'search':
-                # bare key (|s) enables, explicit empty (|s=) disables
-                replacements['search'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
-            else:
-                raise ValueError(f'Unknown override key: {key}')
-        return model._replace(**replacements)
 
     def get_client(self, endpoint: str, model: Model) -> Any:
         suffix = model.suffix if model.suffix is not None else self.endpoint_by_name[endpoint].default_suffix
@@ -312,9 +258,12 @@ class ChatGPTTelegramBot:
 
         _ = await self.bot.run_until_disconnected()  # pyright: ignore[reportGeneralTypeIssues]  # telethon's run_until_disconnected() is awaitable at runtime
 
-    def get_prompt(self, model: str) -> str:
+    def _format_system_prompt(self, template: str, model: str) -> str:
         current_time = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
-        return self.system_prompt.format_map({'current_time': current_time, 'model': model})
+        return template.format_map({'current_time': current_time, 'model': model})
+
+    def get_prompt(self, model: str) -> str:
+        return self._format_system_prompt(self.system_prompt, model)
 
     def is_whitelist(self, chat_id: int) -> bool:
         whitelist = self.db['whitelist']
@@ -387,7 +336,7 @@ class ChatGPTTelegramBot:
                 for model in self.models:
                     if model.prefix == msg_info.prefix:
                         overrides = getattr(msg_info, 'overrides', None) or {}
-                        model_of_history = self.apply_overrides(model, overrides)
+                        model_of_history = apply_overrides(model, overrides)
 
             if msg_info.system_prompt:
                 system_prompt = msg_info.system_prompt
@@ -539,11 +488,11 @@ class ChatGPTTelegramBot:
         overrides: dict[str, str | None] = {}
         if not message.is_reply or extra_photo_message is not None or extra_document_message is not None:  # new message
             for m in self.models:
-                match = self.match_prefix(text, m.prefix)
+                match = match_prefix(text, m.prefix)
                 if match is not None:
                     text, overrides = match
                     try:
-                        model_by_prefix = self.apply_overrides(m, overrides)
+                        model_by_prefix = apply_overrides(m, overrides)
                     except ValueError as e:
                         _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
                         return
@@ -593,9 +542,14 @@ class ChatGPTTelegramBot:
         else:
             new_message = [make_text_part(text)]
 
-        system_prompt: str | None = (
+        if model_by_prefix and model_by_prefix.system_prompt:
+            # format_map supports {current_time} and {model} in both config and inline [...]  prompts
+            system_prompt: str | None = self._format_system_prompt(model_by_prefix.system_prompt, model_by_prefix.name)
+        else:
+            system_prompt = None
+        system_prompt = (
             self.get_system_prompt_by_chat(chat_id)
-            or (model_by_prefix and model_by_prefix.system_prompt)
+            or system_prompt
             or (model_by_prefix and self.get_prompt(model_by_prefix.name))
         )
 
@@ -758,11 +712,11 @@ class ChatGPTTelegramBot:
         overrides: dict[str, str | None] = {}
         if not event.is_reply:
             for m in self.models:
-                match = self.match_prefix(text, m.prefix)
+                match = match_prefix(text, m.prefix)
                 if match is not None:
                     text, overrides = match
                     try:
-                        model_by_prefix = self.apply_overrides(m, overrides)
+                        model_by_prefix = apply_overrides(m, overrides)
                     except ValueError as e:
                         _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
                         return
@@ -788,9 +742,13 @@ class ChatGPTTelegramBot:
         for h in photo_hashes:
             new_message.append(make_image_part(h))
 
-        system_prompt: str | None = (
+        if model_by_prefix and model_by_prefix.system_prompt:
+            system_prompt: str | None = self._format_system_prompt(model_by_prefix.system_prompt, model_by_prefix.name)
+        else:
+            system_prompt = None
+        system_prompt = (
             self.get_system_prompt_by_chat(chat_id)
-            or (model_by_prefix and model_by_prefix.system_prompt)
+            or system_prompt
             or (model_by_prefix and self.get_prompt(model_by_prefix.name))
         )
 

@@ -1,5 +1,5 @@
 {
-  "include": ["chatgpt_telegram_bot"],
+  "include": ["chatgpt_telegram_bot", "tests"],
   "typeCheckingMode": "all",
   "reportMissingTypeStubs": false,
   "reportUnknownMemberType": false,

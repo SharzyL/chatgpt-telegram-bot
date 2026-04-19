@@ -34,3 +34,8 @@ line-length = 120
 
 [tool.ruff.format]
 quote-style = "single"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

@@ -256,9 +256,7 @@ def _render_blocks(nodes: list[dict[str, Any]]) -> RichText:
         if node['type'] == 'blank_line':
             continue
         if not first:
-            result = result + '\n'
-            if node['type'] == 'heading':
-                result = result + '\n'
+            result = result + '\n\n'
         first = False
         result = result + _render_node(node)
     return result

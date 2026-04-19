@@ -3,6 +3,7 @@ admin_id = 114514
 # system_prompt = "Current Beijing Time: {current_time}. Reply in the same language as the user sent you."  # supports {current_time}, {model}
 # default_image_prompt = "Describe the image"
 # default_image_reply_prompt = "Continue"
+# image_cache_size = 52428800  # 50MB default
 
 api_endpoints = [
   { name = "openai", url = "https://api.openai.com/v1" },

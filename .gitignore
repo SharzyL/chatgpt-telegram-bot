@@ -3,12 +3,6 @@ __pycache__
 *.pyc
 .DS_Store
 
-db
-db-*
-*.session
-*.session-journal
-photos/
-
 bot.toml
 dist
 .pdm-python

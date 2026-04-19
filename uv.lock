@@ -59,6 +59,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "cryptg" },
+    { name = "diskcache" },
     { name = "loguru" },
     { name = "mistune" },
     { name = "openai" },
@@ -75,6 +76,7 @@ dev = [
 requires-dist = [
     { name = "anthropic" },
     { name = "cryptg", specifier = ">=0.4.0,<1.0.0" },
+    { name = "diskcache", specifier = ">=5.6.3" },
     { name = "loguru", specifier = ">=0.7.2" },
     { name = "mistune", specifier = ">=3.0.0,<4.0.0" },
     { name = "openai" },
@@ -134,6 +136,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/5d/2e/f037bd5a94770f0bac4dd0486e416082194ba5399a0434d8ed2377acfd22/cryptg-0.6.0-pp311-pypy311_pp73-manylinux_2_28_aarch64.whl", hash = "sha256:81c60f348987800f41c9c584709f0d04881005672382d3fe0f93f2409a08e17f", size = 240352, upload-time = "2026-04-12T18:35:27.105Z" },
     { url = "https://files.pythonhosted.org/packages/2d/35/07ba2b678358a13dcba99c7c0521d01c3de9c683593bd701ed93b3939d8b/cryptg-0.6.0-pp311-pypy311_pp73-manylinux_2_28_x86_64.whl", hash = "sha256:9f7315515406b58bee7d83bd512222d3e46372b900459a633bb025e04bc6fe8e", size = 253382, upload-time = "2026-04-12T18:35:46.397Z" },
     { url = "https://files.pythonhosted.org/packages/0b/8c/12550ba35f917ca80b14d1e46d9f0c6ead40b058f21087466bb46ab9a637/cryptg-0.6.0-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:e2b21ea80854922de224c2f2cce1b8b02ac138f2307eff302083cd99e1d08232", size = 110938, upload-time = "2026-04-12T18:36:18.667Z" },
+]
+
+[[package]]
+name = "diskcache"
+version = "5.6.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3f/21/1c1ffc1a039ddcc459db43cc108658f32c57d271d7289a2794e401d0fdb6/diskcache-5.6.3.tar.gz", hash = "sha256:2c3a3fa2743d8535d832ec61c2054a1641f41775aa7c556758a109941e33e4fc", size = 67916, upload-time = "2023-08-31T06:12:00.316Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/27/4570e78fc0bf5ea0ca45eb1de3818a23787af9b390c0b0a0033a1b8236f9/diskcache-5.6.3-py3-none-any.whl", hash = "sha256:5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19", size = 45550, upload-time = "2023-08-31T06:11:58.822Z" },
 ]
 
 [[package]]

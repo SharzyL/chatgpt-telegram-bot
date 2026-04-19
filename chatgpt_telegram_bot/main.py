@@ -33,10 +33,18 @@ def _journal_sink(message) -> None:  # pyright: ignore[reportMissingParameterTyp
     )
 
 
+def _default_data_dir() -> str:
+    xdg = os.environ.get('XDG_STATE_HOME', os.path.join(os.path.expanduser('~'), '.local', 'state'))
+    return os.path.join(xdg, 'chatgpt-telegram-bot')
+
+
 async def async_main() -> None:
     parser = ArgumentParser()
     _ = parser.add_argument('--debug', action='store_true')
     _ = parser.add_argument('-c', '--config', default='bot.toml')
+    _ = parser.add_argument(
+        '--data-dir', default=_default_data_dir(), help='directory for persistent data (db, image cache)'
+    )
 
     args = parser.parse_args()
 
@@ -68,7 +76,9 @@ async def async_main() -> None:
             level=log_level,
         )
 
-    cbot = ChatGPTTelegramBot(args.config)
+    data_dir: str = args.data_dir
+    logger.info(f'Data directory: {data_dir}')
+    cbot = ChatGPTTelegramBot(args.config, data_dir)
     await cbot.start()
 
 

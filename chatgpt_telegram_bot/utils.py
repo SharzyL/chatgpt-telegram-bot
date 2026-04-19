@@ -1,8 +1,10 @@
 import asyncio
-import hashlib
 import os
+from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlparse
+
+import diskcache
 
 from loguru import logger
 from telethon import errors
@@ -206,19 +208,27 @@ class PendingReplyManager:
         logger.info('PendingReplyManager waiting for %r finished', reply_id)
 
 
-def save_photo(photo_blob: bytes) -> str:
-    h = hashlib.sha256(photo_blob).hexdigest()
-    save_dir = f'photos/{h[:2]}/{h[2:4]}'
-    path = f'{save_dir}/{h}'
-    if not os.path.isfile(path):
-        os.makedirs(save_dir, exist_ok=True)
-        with open(path, 'wb') as f:
-            _ = f.write(photo_blob)
-    return h
+def save_photo(cache: diskcache.Cache, photo_blob: bytes, chat_id: int, msg_id: int) -> str:
+    key = f'{chat_id}:{msg_id}'
+    _ = cache.set(key, photo_blob)
+    return key
 
 
-def load_photo(h: str) -> bytes:
-    save_dir = f'photos/{h[:2]}/{h[2:4]}'
-    path = f'{save_dir}/{h}'
-    with open(path, 'rb') as f:
-        return f.read()
+async def load_photo(
+    cache: diskcache.Cache,
+    key: str,
+    fetcher: Callable[[int, int], Awaitable[bytes]] | None = None,
+) -> bytes | None:
+    blob: bytes | None = cache.get(key)  # pyright: ignore[reportAssignmentType]  # diskcache returns stored type
+    if blob is not None:
+        return blob
+    if fetcher and ':' in key:
+        chat_id_str, msg_id_str = key.split(':', 1)
+        try:
+            blob = await fetcher(int(chat_id_str), int(msg_id_str))
+            _ = cache.set(key, blob)
+            return blob
+        except Exception:
+            logger.warning(f'Failed to re-fetch image for key={key}')
+            return None
+    return None

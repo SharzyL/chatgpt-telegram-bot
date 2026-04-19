@@ -6,6 +6,7 @@
 , openai
 , anthropic
 , cryptg
+, diskcache
 , loguru
 , mistune
 , systemd-python
@@ -39,6 +40,7 @@ buildPythonPackage {
     telethon_1_32
     python-socks
     cryptg
+    diskcache
     openai
     anthropic
     loguru

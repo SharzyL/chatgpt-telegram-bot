@@ -1,5 +1,5 @@
 import base64
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import anthropic
@@ -15,10 +15,13 @@ from chatgpt_telegram_bot.models import (
     StreamMeta,
     ThinkingDelta,
 )
-from chatgpt_telegram_bot.utils import load_photo
+
+LoadImage = Callable[[str], Awaitable[bytes | None]]
 
 
-def convert_history_openai(chat_history: list[list[MsgPartInHistory]]) -> list[list[dict[str, Any]]]:
+async def convert_history_openai(
+    chat_history: list[list[MsgPartInHistory]], load_image: LoadImage
+) -> list[list[dict[str, Any]]]:
     result: list[list[dict[str, Any]]] = []
     for msg_parts in chat_history:
         converted: list[dict[str, Any]] = []
@@ -27,14 +30,18 @@ def convert_history_openai(chat_history: list[list[MsgPartInHistory]]) -> list[l
                 converted.append({'type': 'input_text', 'text': part.text})
             elif part.type_ == 'image':
                 assert part.hash is not None
-                blob = load_photo(part.hash)
+                blob = await load_image(part.hash)
+                if blob is None:
+                    continue
                 blob_base64 = base64.b64encode(blob).decode()
                 converted.append({'type': 'input_image', 'image_url': 'data:image/jpeg;base64,' + blob_base64})
         result.append(converted)
     return result
 
 
-def convert_history_anthropic(chat_history: list[list[MsgPartInHistory]]) -> list[list[dict[str, Any]]]:
+async def convert_history_anthropic(
+    chat_history: list[list[MsgPartInHistory]], load_image: LoadImage
+) -> list[list[dict[str, Any]]]:
     result: list[list[dict[str, Any]]] = []
     for msg_parts in chat_history:
         converted: list[dict[str, Any]] = []
@@ -43,7 +50,9 @@ def convert_history_anthropic(chat_history: list[list[MsgPartInHistory]]) -> lis
                 converted.append({'type': 'text', 'text': part.text})
             elif part.type_ == 'image':
                 assert part.hash is not None
-                blob = load_photo(part.hash)
+                blob = await load_image(part.hash)
+                if blob is None:
+                    continue
                 blob_base64 = base64.b64encode(blob).decode()
                 converted.append(
                     {
@@ -62,8 +71,9 @@ async def completion_openai(
     system_prompt: str,
     chat_id: int,
     msg_id: int,
+    load_image: LoadImage,
 ) -> AsyncIterator[StreamEvent]:
-    converted = convert_history_openai(chat_history)
+    converted = await convert_history_openai(chat_history, load_image)
     input_messages: list[Any] = []
     roles = ['user', 'assistant']
     for i, msg in enumerate(converted):
@@ -132,6 +142,7 @@ async def completion_openai_legacy(
     system_prompt: str,
     chat_id: int,
     msg_id: int,
+    load_image: LoadImage,
 ) -> AsyncIterator[StreamEvent]:
     messages: list[dict[str, Any]] = []
     if system_prompt and not model.no_system_prompt:
@@ -145,7 +156,9 @@ async def completion_openai_legacy(
                 parts.append({'type': 'text', 'text': part.text})
             elif part.type_ == 'image':
                 assert part.hash is not None
-                blob = load_photo(part.hash)
+                blob = await load_image(part.hash)
+                if blob is None:
+                    continue
                 blob_base64 = base64.b64encode(blob).decode()
                 parts.append({'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + blob_base64}})
         content: Any = parts
@@ -199,8 +212,9 @@ async def completion_anthropic(
     system_prompt: str,
     chat_id: int,
     msg_id: int,
+    load_image: LoadImage,
 ) -> AsyncIterator[StreamEvent]:
-    converted = convert_history_anthropic(chat_history)
+    converted = await convert_history_anthropic(chat_history, load_image)
     messages: list[Any] = []
     roles = ['user', 'assistant']
     for i, msg in enumerate(converted):
@@ -280,6 +294,7 @@ async def completion(
     system_prompt: str,
     chat_id: int,
     msg_id: int,
+    load_image: LoadImage,
 ) -> AsyncIterator[StreamEvent]:
     """Dispatch to the appropriate completion backend based on model.api_type."""
     assert len(chat_history) % 2 == 1
@@ -287,11 +302,11 @@ async def completion(
     logger.info(f'Starting completion ({model.api_type}) for {chat_id=}, {msg_id=}: {log_history}')
 
     if model.api_type == 'openai':
-        backend = completion_openai(client, chat_history, model, system_prompt, chat_id, msg_id)
+        backend = completion_openai(client, chat_history, model, system_prompt, chat_id, msg_id, load_image)
     elif model.api_type == 'openai_legacy':
-        backend = completion_openai_legacy(client, chat_history, model, system_prompt, chat_id, msg_id)
+        backend = completion_openai_legacy(client, chat_history, model, system_prompt, chat_id, msg_id, load_image)
     elif model.api_type == 'anthropic':
-        backend = completion_anthropic(client, chat_history, model, system_prompt, chat_id, msg_id)
+        backend = completion_anthropic(client, chat_history, model, system_prompt, chat_id, msg_id, load_image)
     else:
         raise ValueError(f'Unknown api_type: {model.api_type}')
 

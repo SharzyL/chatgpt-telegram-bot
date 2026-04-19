@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import anthropic
+import diskcache
 import openai
 from telethon import TelegramClient, events, errors, functions, types
 from loguru import logger
@@ -29,20 +30,23 @@ from chatgpt_telegram_bot.models import (
 )
 from chatgpt_telegram_bot.utils import (
     apply_overrides,
+    load_photo,
     match_prefix,
     parse_proxy,
     retry,
+    save_photo,
     telegram_len,
     PendingReplyManager,
-    save_photo,
 )
 from chatgpt_telegram_bot.completion import completion
 from chatgpt_telegram_bot.reply import format_reply
 
 
 class ChatGPTTelegramBot:
-    def __init__(self, config_path: str) -> None:
+    def __init__(self, config_path: str, data_dir: str) -> None:
         self.config_path: str = config_path
+        self.data_dir: str = data_dir
+        os.makedirs(data_dir, exist_ok=True)
         # parse env
         self.TELEGRAM_BOT_TOKEN: str = os.environ['TELEGRAM_BOT_TOKEN']
         self.TELEGRAM_API_ID: int = int(os.environ['TELEGRAM_API_ID'])
@@ -116,16 +120,23 @@ class ChatGPTTelegramBot:
         # whitelist: Set[int]
         # msg_info_{chat_id}_{msg_id}: MsgInfo
         # system_prompt_{chat_id}: str
-        self.db: shelve.Shelf[Any] = shelve.open('db')
+        self.db: shelve.Shelf[Any] = shelve.open(os.path.join(data_dir, 'db'))
+        image_cache_size = _config.get('image_cache_size', 50 * 1024 * 1024)
+        if not isinstance(image_cache_size, int):
+            raise ValueError(f'image_cache_size must be an integer, got {type(image_cache_size).__name__}')
+        self.image_cache: diskcache.Cache = diskcache.Cache(
+            os.path.join(data_dir, 'image_cache'), size_limit=image_cache_size
+        )
 
         _ = atexit.register(self.db.close)
+        _ = atexit.register(self.image_cache.close)
         if 'whitelist' not in self.db:
             self.db['whitelist'] = {self.admin_id}
 
         self.bot_id: int = int(self.TELEGRAM_BOT_TOKEN.split(':')[0])
         self.pending_reply_manager = PendingReplyManager()
         self.bot: TelegramClient = TelegramClient(
-            'bot',
+            os.path.join(data_dir, 'bot'),
             self.TELEGRAM_API_ID,
             self.TELEGRAM_API_HASH,
             proxy=parse_proxy(),  # pyright: ignore[reportArgumentType]  # telethon proxy type is broader at runtime
@@ -510,7 +521,7 @@ class ChatGPTTelegramBot:
         photo_hash = None
         if photo_message is not None:
             photo_blob = await photo_message.download_media(bytes)
-            photo_hash = save_photo(photo_blob)
+            photo_hash = save_photo(self.image_cache, photo_blob, chat_id, photo_message.id)
 
         document_message = message if message.document is not None else extra_document_message
         document_text = None
@@ -598,7 +609,15 @@ class ChatGPTTelegramBot:
                     status: str | None = 'Generating...'
                     await replymsgs.update(f'[{status}]')
                     client = self.get_client(endpoint, model)
-                    stream = completion(client, chat_history, model, system_prompt, chat_id, msg_id)
+
+                    async def fetch_image(cid: int, mid: int) -> bytes:
+                        msg = await self.bot.get_messages(cid, ids=mid)
+                        return await msg.download_media(bytes)  # pyright: ignore[reportAttributeAccessIssue]  # ids=int returns single Message at runtime
+
+                    async def load_image(key: str) -> bytes | None:
+                        return await load_photo(self.image_cache, key, fetch_image)
+
+                    stream = completion(client, chat_history, model, system_prompt, chat_id, msg_id, load_image)
                     stream_start = time.time()
                     first_token_time: float | None = None
                     async for event in stream:
@@ -732,7 +751,9 @@ class ChatGPTTelegramBot:
 
         photo_messages = [m for m in event.messages if m.photo is not None]
         photo_blobs = await asyncio.gather(*[m.download_media(bytes) for m in photo_messages])
-        photo_hashes = [save_photo(blob) for blob in photo_blobs]
+        photo_hashes = [
+            save_photo(self.image_cache, blob, chat_id, msg.id) for blob, msg in zip(photo_blobs, photo_messages)
+        ]
 
         if not photo_hashes:
             logger.debug(f'Album has no photos {chat_id=}, {msg_id=}')

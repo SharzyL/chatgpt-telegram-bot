@@ -22,9 +22,8 @@ in
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/chatgpt-telegram-bot -c ${cfg.configFile}";
+        ExecStart = "${cfg.package}/bin/chatgpt-telegram-bot -c ${cfg.configFile} --data-dir %S/chatgpt-telegram-bot";
         StateDirectory = "chatgpt-telegram-bot";
-        WorkingDirectory = "%S/chatgpt-telegram-bot";
         Restart = "on-failure";
         DynamicUser = true;
         EnvironmentFile = cfg.envFile;

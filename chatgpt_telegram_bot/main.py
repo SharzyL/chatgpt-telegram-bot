@@ -28,7 +28,7 @@ def _journal_sink(message) -> None:  # pyright: ignore[reportMissingParameterTyp
         record['message'],
         PRIORITY=priority,
         CODE_FILE=record['file'].path,
-        CODE_LINE=str(record['line']),
+        CODE_LINE=record['line'],
         CODE_FUNC=record['function'],
     )
 
@@ -44,12 +44,18 @@ async def async_main() -> None:
     logger.remove()
 
     use_journal = False
-    if os.environ.get('JOURNAL_STREAM'):
+    journal_stream = os.environ.get('JOURNAL_STREAM')
+    if journal_stream:
         try:
-            import systemd.journal  # noqa: F401  # pyright: ignore[reportUnusedImport]
+            # JOURNAL_STREAM contains "dev:inode" of the journal socket assigned to this service.
+            # Verify that our stderr actually points to it (not inherited from a parent session).
+            expected_dev, expected_ino = (int(x) for x in journal_stream.split(':'))
+            stat = os.fstat(sys.stderr.fileno())
+            if stat.st_dev == expected_dev and stat.st_ino == expected_ino:
+                import systemd.journal  # noqa: F401  # pyright: ignore[reportUnusedImport]
 
-            use_journal = True
-        except ImportError:
+                use_journal = True
+        except (ImportError, ValueError, OSError):
             pass
 
     if use_journal:

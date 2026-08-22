@@ -15,6 +15,7 @@ import anthropic
 import diskcache
 import openai
 from telethon import TelegramClient, events, errors, functions, types
+from telethon.tl.custom import Message
 from loguru import logger
 
 from chatgpt_telegram_bot.richtext import RichText
@@ -375,7 +376,7 @@ class ChatGPTTelegramBot:
         try:
             _ = await self.bot.edit_message(
                 chat_id,
-                message_id,  # pyright: ignore[reportArgumentType]  # telethon accepts int message_id at runtime
+                message_id,
                 text,
                 link_preview=False,
                 formatting_entities=entities,
@@ -536,7 +537,13 @@ class ChatGPTTelegramBot:
 
                     async def fetch_image(cid: int, mid: int) -> bytes:
                         msg = await self.bot.get_messages(cid, ids=mid)
-                        return await msg.download_media(bytes)  # pyright: ignore[reportAttributeAccessIssue]  # ids=int returns single Message at runtime
+                        # ids=int returns a single Message at runtime, or None if it no longer exists
+                        if not isinstance(msg, Message):
+                            raise ValueError(f'cannot fetch message {mid} in chat {cid}')
+                        blob = await msg.download_media(bytes)
+                        if not isinstance(blob, bytes):
+                            raise ValueError(f'message {mid} in chat {cid} has no downloadable media')
+                        return blob
 
                     async def load_image(key: str) -> bytes | None:
                         return await load_photo(self.image_cache, key, fetch_image)

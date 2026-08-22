@@ -1,5 +1,4 @@
 { buildPythonPackage
-, fetchFromGitHub
 , lib
 , telethon
 , python-socks
@@ -14,18 +13,6 @@
 , pytestCheckHook
 }:
 
-let
-  telethon_1_32 = telethon.overridePythonAttrs (oldAttrs: rec {
-    version = "1.32.1";
-    src = fetchFromGitHub {
-      owner = "LonamiWebs";
-      repo = "Telethon";
-      rev = "refs/tags/v${version}";
-      hash = "sha256-0477SxYRVqRnCDPsu+q9zxejCnKVj+qa5DmH0VHuJyI=";
-    };
-    doCheck = false;
-  });
-in
 buildPythonPackage {
   name = "chatgpt-telegram-bot";
   pyproject = true;
@@ -37,7 +24,7 @@ buildPythonPackage {
   };
 
   propagatedBuildInputs = [
-    telethon_1_32
+    telethon
     python-socks
     cryptg
     diskcache

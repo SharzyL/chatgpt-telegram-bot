@@ -1,16 +1,15 @@
 import asyncio
 import os
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlparse
 
 import diskcache
-
 from loguru import logger
 from telethon import errors
 
-from chatgpt_telegram_bot.models import Model, OVERRIDE_ALIASES
-from chatgpt_telegram_bot.richtext import RichText
+from chatgpt_telegram_bot.models import OVERRIDE_ALIASES, Model
 
 
 def split_respecting_brackets(s: str, delimiters: str = ',') -> list[str]:
@@ -32,9 +31,8 @@ def split_respecting_brackets(s: str, delimiters: str = ',') -> list[str]:
             continue
         if c == '[':
             depth += 1
-        elif c == ']':
-            if depth > 0:
-                depth -= 1
+        elif c == ']' and depth > 0:
+            depth -= 1
         if c in delimiters and depth == 0:
             parts.append(''.join(current))
             current = []
@@ -184,11 +182,8 @@ def retry(max_retry: int = 30, interval: int = 10):
     return decorator
 
 
-def telegram_len(s: str | RichText) -> int:
+def telegram_len(s: str) -> int:
     """Length in UTF-16 code units, matching Telegram's counting."""
-    if isinstance(s, RichText):
-        text, _ = s.to_telegram()
-        return len(text.encode('utf-16-le')) // 2
     return len(s.encode('utf-16-le')) // 2
 
 
@@ -234,7 +229,112 @@ async def load_photo(
             blob = await fetcher(int(chat_id_str), int(msg_id_str))
             _ = cache.set(key, blob)
             return blob
-        except Exception:
+        except Exception:  # noqa: BLE001  # any re-fetch failure just means the image is unavailable
             logger.warning(f'Failed to re-fetch image for key={key}')
             return None
     return None
+
+
+# a code fence, optionally inside a blockquote (`>` prefixed, as thinking blocks are)
+_FENCE_LINE_RE = re.compile(r'^(>*)\s*(```.*)$')
+# room reserved for a closing fence appended to a part, in UTF-16 units
+_FENCE_MARGIN = 8
+
+
+def telegram_truncate(s: str, units: int) -> str:
+    """Truncate *s* to at most *units* UTF-16 code units, the unit Telegram counts in."""
+    return s[: _utf16_prefix(s, units)]
+
+
+def _utf16_prefix(s: str, units: int) -> int:
+    """Largest index i for which ``telegram_len(s[:i]) <= units``."""
+    total = 0
+    for i, ch in enumerate(s):
+        width = 2 if ord(ch) > 0xFFFF else 1
+        if total + width > units:
+            return i
+        total += width
+    return len(s)
+
+
+def _open_fence(text: str) -> tuple[str, str] | None:
+    """The (blockquote prefix, opener) of a code fence *text* leaves unclosed, if any."""
+    opener: tuple[str, str] | None = None
+    for line in text.split('\n'):
+        m = _FENCE_LINE_RE.match(line)
+        if m:
+            opener = None if opener else (m.group(1), m.group(2))
+    return opener
+
+
+def _cut_at(text: str, at: int) -> tuple[str, str]:
+    """Split *text* at *at*, closing and reopening a fence that straddles the boundary."""
+    head, rest = text[:at], text[at:].lstrip('\n')
+    fence = _open_fence(head)
+    if fence:
+        quote, opener = fence
+        head += '\n' + quote + '```'
+        rest = quote + opener + '\n' + rest
+    return head, rest
+
+
+def split_markdown(text: str, first_limit: int, limit: int) -> list[str]:
+    """Split markdown source into parts of at most *first_limit* / *limit* UTF-16 units.
+
+    Rich messages are rendered server-side, so a part has to stay valid markdown on its
+    own. Cuts are made at a paragraph break where possible, then a line break, and only
+    mid-line as a last resort. A fenced code block left open by a cut is closed and
+    reopened across the boundary, including inside a blockquote.
+    """
+    parts: list[str] = []
+    cur_limit = first_limit
+    while telegram_len(text) > cur_limit:
+        # closing a fence appends to the part, so leave room for it
+        budget = max(1, cur_limit - _FENCE_MARGIN) if '```' in text else cur_limit
+        end = _utf16_prefix(text, budget)
+        cut = text.rfind('\n\n', 0, end + 1)
+        if cut <= 0:
+            cut = text.rfind('\n', 0, end + 1)
+        if cut <= 0:
+            cut = end
+        head, rest = _cut_at(text, cut)
+        # a cut landing on a fence opener reproduces `text` unchanged, which would spin
+        # forever; fall back to cutting at the budget, then to no fence handling at all
+        if len(rest) >= len(text):
+            head, rest = _cut_at(text, end)
+        if len(rest) >= len(text):
+            head, rest = text[:end], text[end:]
+        parts.append(head)
+        text = rest
+        cur_limit = limit
+    if text:
+        parts.append(text)
+    return parts
+
+
+# fenced blocks and inline code spans, whose contents must not be rewritten
+_CODE_SPAN_RE = re.compile(r'```.*?```|``.*?``|`[^`\n]*`', re.DOTALL)
+_INLINE_MATH_RE = re.compile(r'\\\((.+?)\\\)', re.DOTALL)
+_DISPLAY_MATH_RE = re.compile(r'\\\[(.+?)\\\]', re.DOTALL)
+
+
+def normalize_math(markdown: str) -> str:
+    r"""Rewrite LaTeX ``\(…\)`` and ``\[…\]`` delimiters into the ``$`` forms.
+
+    Telegram's rich-message markdown recognises ``$…$`` and ``$$…$$`` (and a ```` ```math ````
+    fence) but leaves the backslash-delimiter forms as plain text, so models that emit those
+    would otherwise show raw LaTeX. Code spans are left untouched.
+    """
+
+    def convert(s: str) -> str:
+        s = _INLINE_MATH_RE.sub(r'$\1$', s)
+        return _DISPLAY_MATH_RE.sub(r'$$\1$$', s)
+
+    parts: list[str] = []
+    pos = 0
+    for m in _CODE_SPAN_RE.finditer(markdown):
+        parts.append(convert(markdown[pos : m.start()]))
+        parts.append(m.group(0))
+        pos = m.end()
+    parts.append(convert(markdown[pos:]))
+    return ''.join(parts)

@@ -1,6 +1,10 @@
 from typing import Any
 
-from chatgpt_telegram_bot.richtext import RichText
+from chatgpt_telegram_bot.utils import normalize_math
+
+
+def _blockquote_markdown(text: str) -> str:
+    return '\n'.join('>' + line if line else '>' for line in text.split('\n'))
 
 
 def format_reply(
@@ -10,29 +14,32 @@ def format_reply(
     status: str | None = None,
     tool_calls: list[str] | None = None,
     usage: dict[str, Any] | None = None,
-) -> str | RichText:
-    suffix = f' [!{status}]' if status else ''
+) -> str:
+    """Assemble a reply as markdown source, for server-side rendering as a rich message.
+
+    The model's own markdown is passed through untouched, so headings, tables, math and
+    rules survive; only the thinking block and the footer are marked up here.
+    """
+    suffix = f' \\[!{status}]' if status else ''
+    thinking = normalize_math(thinking)
+    reply = normalize_math(reply)
     if not thinking_done:
-        # still in thinking phase, or no thinking at all
         if not thinking:
-            return suffix.strip() if suffix else ''
-        return RichText.Blockquote(RichText.from_markdown(thinking) + suffix)
-    # thinking is done, show blockquote + response
-    result: str | RichText = ''
+            return suffix.strip()
+        return _blockquote_markdown(thinking + suffix)
+    result = ''
     if thinking:
-        result = RichText.Blockquote(RichText.from_markdown(thinking.rstrip('\n')))
+        result = _blockquote_markdown(thinking.rstrip('\n'))
     if reply or suffix:
         sep = '\n\n' if thinking else ''
-        result = result + sep + RichText.from_markdown(reply) + suffix
+        result = result + sep + reply + suffix
     if tool_calls or usage:
-        footer_content: RichText | str = ''
+        footer = ''
         if tool_calls:
-            footer_content = footer_content + RichText.Bold('Tool calls') + '\n'
-            footer_content = footer_content + '\n'.join(f'🔍 {q}' for q in tool_calls)
+            footer += '**Tool calls**\n' + '\n'.join(f'🔍 {q}' for q in tool_calls)
         if usage:
-            if footer_content:
-                footer_content = footer_content + '\n\n'
-            footer_content = footer_content + RichText.Bold('Usage') + '\n'
-            footer_content = footer_content + ', '.join(f'{k}={v}' for k, v in usage.items())
-        result = result + '\n\n' + RichText.Blockquote(footer_content)
+            if footer:
+                footer += '\n\n'
+            footer += '**Usage**\n' + ', '.join(f'{k}={v}' for k, v in usage.items())
+        result = result + '\n\n' + _blockquote_markdown(footer)
     return result

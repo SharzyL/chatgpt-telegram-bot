@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+import asyncio
 import os
 import sys
-import asyncio
 from argparse import ArgumentParser
 
 from loguru import logger

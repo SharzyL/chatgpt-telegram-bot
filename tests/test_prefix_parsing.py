@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from chatgpt_telegram_bot.utils import (
-    split_respecting_brackets,
     find_delimiter_outside_brackets,
     match_prefix,
     parse_overrides,
+    split_respecting_brackets,
 )
-
 
 # ---------------------------------------------------------------------------
 # split_respecting_brackets

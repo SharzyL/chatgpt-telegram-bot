@@ -7,7 +7,6 @@
 , cryptg
 , diskcache
 , loguru
-, mistune
 , systemd-python
 , hatchling
 , pytestCheckHook
@@ -31,7 +30,6 @@ buildPythonPackage {
     openai
     anthropic
     loguru
-    mistune
     systemd-python
   ];
   nativeCheckInputs = [ pytestCheckHook ];

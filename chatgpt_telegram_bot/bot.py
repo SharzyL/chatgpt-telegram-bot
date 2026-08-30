@@ -1,48 +1,50 @@
-import atexit
 import asyncio
+import atexit
+import datetime
 import os
 import shelve
-import datetime
 import time
-import traceback
 import tomllib
-from html import escape as html_escape
-from zoneinfo import ZoneInfo
+import traceback
 from collections.abc import Sequence
-from typing import Any
+from html import escape as html_escape
+from types import TracebackType
+from typing import Any, Self
+from zoneinfo import ZoneInfo
 
 import anthropic
 import diskcache
 import openai
-from telethon import TelegramClient, events, errors, functions, types
-from telethon.tl.custom import Message
 from loguru import logger
+from telethon import TelegramClient, errors, events, functions, types
+from telethon.tl.custom import Message
 
-from chatgpt_telegram_bot.richtext import RichText
+from chatgpt_telegram_bot.completion import completion
 from chatgpt_telegram_bot.models import (
     EndPoint,
     Model,
     MsgInfo,
     MsgPartInHistory,
-    StreamMeta,
-    ThinkingDelta,
     ResponseDelta,
     StatusChange,
+    StreamMeta,
+    ThinkingDelta,
     make_image_part,
     make_text_part,
 )
+from chatgpt_telegram_bot.reply import format_reply
 from chatgpt_telegram_bot.utils import (
+    PendingReplyManager,
     apply_overrides,
     load_photo,
     match_prefix,
     parse_proxy,
     retry,
     save_photo,
+    split_markdown,
     telegram_len,
-    PendingReplyManager,
+    telegram_truncate,
 )
-from chatgpt_telegram_bot.completion import completion
-from chatgpt_telegram_bot.reply import format_reply
 
 
 class ChatGPTTelegramBot:
@@ -61,10 +63,12 @@ class ChatGPTTelegramBot:
         self.models: Sequence[Model] = [Model(**m) for m in _config['models']]
         self.endpoints: Sequence[EndPoint] = [EndPoint(**e) for e in _config['endpoints']]
         self.default_endpoint: str = _config['default_endpoint']
-        self.system_prompt: str = _config.get(
-            'system_prompt',
-            'You are {model} model. Current date: {current_date}. Reply in the same language as the user sent you. Format the reply in MarkdownV2 but do not use markdown headings, tables, separator lines and TeX math.',
+        default_prompt = (
+            'You are {model} model. Current date: {current_date}. Reply in the same language as the user sent you.'
+            + ' Format the reply in Markdown; headings, tables, horizontal rules and LaTeX math are all supported.'
+            + ' Delimit math with $...$ inline and $$...$$ on its own line.'
         )
+        self.system_prompt: str = _config.get('system_prompt', default_prompt)
         self.allowed_chats: set[int] = set(_config.get('allowed_chats', []))
         self.allowed_chats.add(self.admin_id)
         self.timezone: ZoneInfo = ZoneInfo(_config.get('timezone', 'UTC'))
@@ -114,7 +118,9 @@ class ChatGPTTelegramBot:
             else:
                 raise ValueError(f'Unknown api_type: {api_type}')
 
-        self.TELEGRAM_LENGTH_LIMIT: int = 4096
+        # rich messages are rendered server-side; the server rejects a longer rendered body
+        # with RICH_MESSAGE_TEXT_TOO_LONG
+        self.MESSAGE_LENGTH_LIMIT: int = 32768
         self.TELEGRAM_MIN_INTERVAL: float = 0.5
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
@@ -124,10 +130,11 @@ class ChatGPTTelegramBot:
 
         # db scheme:
         # msg_info_{chat_id}_{msg_id}: MsgInfo
-        self.db: shelve.Shelf[Any] = shelve.open(os.path.join(data_dir, 'db'))
+        # the shelf lives for the whole process and is closed via atexit below
+        self.db: shelve.Shelf[Any] = shelve.open(os.path.join(data_dir, 'db'))  # noqa: SIM115
         image_cache_size = _config.get('image_cache_size', 50 * 1024 * 1024)
         if not isinstance(image_cache_size, int):
-            raise ValueError(f'image_cache_size must be an integer, got {type(image_cache_size).__name__}')
+            raise TypeError(f'image_cache_size must be an integer, got {type(image_cache_size).__name__}')
         self.image_cache: diskcache.Cache = diskcache.Cache(
             os.path.join(data_dir, 'image_cache'), size_limit=image_cache_size
         )
@@ -334,22 +341,41 @@ class ChatGPTTelegramBot:
     async def help_handler(self, message: Any, error: str | None = None) -> None:
         _ = await self.send_message_html(message.chat_id, self._build_help_text(error), message.id)
 
+    @staticmethod
+    def _rich_fallback(markdown: str) -> str:
+        """Plain-text stand-in for the rich body, capped the way Telegram counts."""
+        return telegram_truncate(markdown, 4096)
+
+    @staticmethod
+    def _sent_message_id(result: Any) -> int:
+        """Pull the new message id out of any of the shapes sendMessage can answer with."""
+        # a private-chat send can come back as UpdateShortSentMessage, which has no .updates
+        if isinstance(result, types.UpdateShortSentMessage):
+            return result.id
+        for update in getattr(result, 'updates', ()):
+            if isinstance(update, types.UpdateMessageID):
+                return update.id
+            if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
+                return update.message.id
+        raise RuntimeError(f'sendMessage returned no message id: {type(result).__name__}')
+
     @retry()
-    async def send_message(self, chat_id: int, text: str | RichText, reply_to_message_id: int) -> int:
-        logger.debug(f'Sending message: {chat_id=}, {reply_to_message_id=}, {text=}')
-        text = RichText(text)
-        text, entities = text.to_telegram()
-        entity_info = [(type(e).__name__, e.offset, e.length) for e in entities]
-        logger.debug(f'Sending message entities: {chat_id=}, text_len={len(text)}, entities={entity_info}')
-        msg = await self.bot.send_message(
-            chat_id,
-            text,
-            reply_to=reply_to_message_id,
-            link_preview=False,
-            formatting_entities=entities,
+    async def send_message(self, chat_id: int, markdown: str, reply_to_message_id: int) -> int:
+        logger.debug(f'Sending message: {chat_id=}, {reply_to_message_id=}, {markdown=}')
+        # telethon has no high-level wrapper for rich messages, so sendMessage is invoked directly
+        peer = await self.bot.get_input_entity(chat_id)
+        result: Any = await self.bot(
+            functions.messages.SendMessageRequest(
+                peer=peer,
+                message=self._rich_fallback(markdown),
+                reply_to=types.InputReplyToMessage(reply_to_msg_id=reply_to_message_id),
+                no_webpage=True,
+                rich_message=types.InputRichMessageMarkdown(markdown=markdown),
+            )
         )
-        logger.debug(f'Message sent: {chat_id=}, {reply_to_message_id=}, {msg.id=}')
-        return msg.id
+        msg_id = self._sent_message_id(result)
+        logger.debug(f'Message sent: {chat_id=}, {reply_to_message_id=}, {msg_id=}')
+        return msg_id
 
     @retry()
     async def send_message_html(self, chat_id: int, text: str, reply_to_message_id: int) -> int:
@@ -365,21 +391,18 @@ class ChatGPTTelegramBot:
         return msg.id
 
     @retry()
-    async def edit_message(self, chat_id: int, text: str | RichText, message_id: int) -> None:
-        logger.debug(f'Editing message: {chat_id=}, {message_id=}, {text=}')
-        text = RichText(text)
-        text, entities = text.to_telegram()
-        entity_info = [(type(e).__name__, e.offset, e.length) for e in entities]
-        logger.debug(
-            f'Editing message entities: {chat_id=}, {message_id=}, text_len={len(text)}, entities={entity_info}'
-        )
+    async def edit_message(self, chat_id: int, markdown: str, message_id: int) -> None:
+        logger.debug(f'Editing message: {chat_id=}, {message_id=}, {markdown=}')
+        peer = await self.bot.get_input_entity(chat_id)
         try:
-            _ = await self.bot.edit_message(
-                chat_id,
-                message_id,
-                text,
-                link_preview=False,
-                formatting_entities=entities,
+            _ = await self.bot(
+                functions.messages.EditMessageRequest(
+                    peer=peer,
+                    id=message_id,
+                    message=self._rich_fallback(markdown),
+                    no_webpage=True,
+                    rich_message=types.InputRichMessageMarkdown(markdown=markdown),
+                )
             )
         except errors.MessageNotModifiedError:
             logger.debug(f'Message not modified: {chat_id=}, {message_id=}')
@@ -524,7 +547,7 @@ class ChatGPTTelegramBot:
             thinking_done = False
             stream_meta = StreamMeta()
             model_flags = self._model_flags(model)
-            prefix = '🤖 ' + RichText.Code(model.name)
+            prefix = f'🤖 `{model.name}`'
             if model_flags:
                 prefix += ' (' + ', '.join(model_flags) + ')'
             prefix += '\n\n'
@@ -539,10 +562,12 @@ class ChatGPTTelegramBot:
                         msg = await self.bot.get_messages(cid, ids=mid)
                         # ids=int returns a single Message at runtime, or None if it no longer exists
                         if not isinstance(msg, Message):
-                            raise ValueError(f'cannot fetch message {mid} in chat {cid}')
+                            # a vanished message is a lookup failure, not a type error
+                            raise ValueError(f'cannot fetch message {mid} in chat {cid}')  # noqa: TRY004
                         blob = await msg.download_media(bytes)
                         if not isinstance(blob, bytes):
-                            raise ValueError(f'message {mid} in chat {cid} has no downloadable media')
+                            # absent media is a lookup failure, not a type error
+                            raise ValueError(f'message {mid} in chat {cid} has no downloadable media')  # noqa: TRY004
                         return blob
 
                     async def load_image(key: str) -> bytes | None:
@@ -603,7 +628,7 @@ class ChatGPTTelegramBot:
                     return
 
                 # handling completion errors
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001  # the retry loop handles every completion failure
                     error_cnt += 1
                     logger.exception(f'Error on generating exception({chat_id=}, {msg_id=}, {error_cnt=})')
                     retryable_errors = (
@@ -733,34 +758,30 @@ is_allowed={self.is_allowed(message.chat_id)}
 
 
 class BotReplyMessages:
-    def __init__(self, cbot: ChatGPTTelegramBot, chat_id: int, orig_msg_id: int, prefix: str | RichText) -> None:
+    def __init__(self, cbot: ChatGPTTelegramBot, chat_id: int, orig_msg_id: int, prefix: str) -> None:
         self.cbot: ChatGPTTelegramBot = cbot
-        self.prefix: str | RichText = prefix
-        self.msg_len: int = cbot.TELEGRAM_LENGTH_LIMIT - telegram_len(prefix)
+        self.prefix: str = prefix
+        self.msg_len: int = cbot.MESSAGE_LENGTH_LIMIT - telegram_len(prefix)
         assert self.msg_len > 0
         self.chat_id: int = chat_id
         self.orig_msg_id: int = orig_msg_id
-        self.replied_msgs: list[tuple[int, str | RichText]] = []
-        self.text: str | RichText = ''
+        self.replied_msgs: list[tuple[int, str]] = []
+        self.text: str = ''
         self.last_update_time: float = 0.0
 
-    async def __aenter__(self) -> 'BotReplyMessages':
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __aexit__(self, type_: type[BaseException] | None, value: BaseException | None, tb: Any) -> None:
+    async def __aexit__(
+        self, type_: type[BaseException] | None, value: BaseException | None, tb: TracebackType | None
+    ) -> None:
         await self.finalize()
         for msg_id, _ in self.replied_msgs:
             self.cbot.pending_reply_manager.remove((self.chat_id, msg_id))
 
-    async def _force_update(self, text: str | RichText) -> None:
-        slices: list[str | RichText] = []
-        limit = self.msg_len  # first slice accounts for prefix
-        while len(text) > limit:
-            slices.append(text[:limit])
-            text = text[limit:]
-            limit = self.cbot.TELEGRAM_LENGTH_LIMIT  # continuation slices get full limit
-        if text:
-            slices.append(text)
+    async def _force_update(self, text: str) -> None:
+        # markdown is rendered server-side, so every part has to stay valid markdown on its own
+        slices = split_markdown(text, self.msg_len, self.cbot.MESSAGE_LENGTH_LIMIT)
         if not slices:
             slices = ['']  # deal with empty message
 
@@ -787,7 +808,7 @@ class BotReplyMessages:
                 self.cbot.pending_reply_manager.remove((self.chat_id, msg_id))
             self.replied_msgs = self.replied_msgs[: len(slices)]
 
-    async def update(self, text: str | RichText) -> None:
+    async def update(self, text: str) -> None:
         self.text = text
         now = time.time()
         if now - self.last_update_time >= self.cbot.TELEGRAM_MIN_INTERVAL:

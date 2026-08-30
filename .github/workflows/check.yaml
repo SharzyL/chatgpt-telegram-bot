@@ -23,5 +23,8 @@ jobs:
       - name: Type check
         run: nix develop -c basedpyright
 
+      - name: Ruff check
+        run: nix develop -c ruff check
+
       - name: Flake check
         run: nix flake check

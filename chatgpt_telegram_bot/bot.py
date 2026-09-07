@@ -30,21 +30,46 @@ from chatgpt_telegram_bot.models import (
     StreamMeta,
     ThinkingDelta,
     make_image_part,
+    make_reasoning_part,
     make_text_part,
+    make_thinking_text_part,
 )
+from chatgpt_telegram_bot.render import ENTITY_RENDERER, SERVER_MARKDOWN_RENDERER, Rendered, Renderer
 from chatgpt_telegram_bot.reply import format_reply
 from chatgpt_telegram_bot.utils import (
     PendingReplyManager,
     apply_overrides,
     load_photo,
     match_prefix,
+    parse_manipulation,
     parse_proxy,
     retry,
     save_photo,
-    split_markdown,
-    telegram_len,
-    telegram_truncate,
 )
+
+# Formatting guidance depends on which renderer the reply goes through, so it is appended to
+# the default system prompt rather than baked into it. A custom prompt (`,[…]`) is left exactly
+# as the user wrote it.
+RICHTEXT_PROMPT_APPEND = (
+    'Format the reply in Markdown; headings, tables, horizontal rules and LaTeX math all render.'
+    + ' Delimit math with $...$ inline and $$...$$ on its own line.'
+)
+ENTITY_PROMPT_APPEND = (
+    'Format the reply in Markdown, but do not use tables or LaTeX math: they do not render and'
+    + ' would reach the user as raw source. Bold, italic, strikethrough, inline code, code blocks,'
+    + ' links, blockquotes and lists all render.'
+)
+
+
+# /manipulate is deliberately not registered as a bot command: it needs both a reply target
+# and a body, so picking it from the command palette could only ever fail
+MANIPULATE_USAGE = """[!] `/manipulate` rewrites a bot reply, so it has to reply to one:
+
+`/manipulate <text>`
+
+or, to supply a chain of thought too:
+
+`/manipulate <think>your cot</think> <text>`"""
 
 
 class ChatGPTTelegramBot:
@@ -118,9 +143,6 @@ class ChatGPTTelegramBot:
             else:
                 raise ValueError(f'Unknown api_type: {api_type}')
 
-        # rich messages are rendered server-side; the server rejects a longer rendered body
-        # with RICH_MESSAGE_TEXT_TOO_LONG
-        self.MESSAGE_LENGTH_LIMIT: int = 32768
         self.TELEGRAM_MIN_INTERVAL: float = 0.5
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
@@ -186,10 +208,16 @@ class ChatGPTTelegramBot:
             if event.message.message is None:
                 return
             text = event.message.message
+            # a /manipulate body may start on the next line, so the command is the first token
+            command_parts = text.split(maxsplit=1)
+            command = command_parts[0] if command_parts else ''
             if text == '/ping' or text == f'/ping@{me.username}':
                 await self.ping(event.message)
             elif text == '/help' or text == f'/help@{me.username}':
                 await self.help_handler(event.message)
+            elif command in ('/manipulate', f'/manipulate@{me.username}'):
+                body = command_parts[1] if len(command_parts) > 1 else ''
+                await self.manipulate_handler(event.message, body)
             else:
                 await self.reply_handler(event.message)
 
@@ -235,8 +263,23 @@ class ChatGPTTelegramBot:
         current_date = datetime.datetime.now(self.timezone).strftime('%Y-%m-%d')
         return template.format_map({'current_date': current_date, 'model': model})
 
-    def get_prompt(self, model: str) -> str:
-        return self._format_system_prompt(self.system_prompt, model)
+    def get_prompt(self, model: Model) -> str:
+        """The default system prompt, with formatting guidance for this model's renderer."""
+        append = RICHTEXT_PROMPT_APPEND if model.richtext else ENTITY_PROMPT_APPEND
+        return self._format_system_prompt(self.system_prompt + '\n' + append, model.name)
+
+    @staticmethod
+    def get_renderer(model: Model) -> Renderer:
+        return SERVER_MARKDOWN_RENDERER if model.richtext else ENTITY_RENDERER
+
+    def _reply_prefix(self, model: Model, manipulated: bool = False) -> str:
+        prefix = f'🤖 `{model.name}`'
+        flags = self._model_flags(model)
+        if flags:
+            prefix += ' (' + ', '.join(flags) + ')'
+        if manipulated:
+            prefix += ' (manipulated)'
+        return prefix + '\n\n'
 
     def _model_flags(self, model: Model) -> list[str]:
         flags: list[str] = []
@@ -246,6 +289,8 @@ class ChatGPTTelegramBot:
             flags.append(f'thinking={model.thinking}')
         if model.search:
             flags.append('search')
+        if model.richtext:
+            flags.append('richtext')
         return flags
 
     @staticmethod
@@ -307,7 +352,7 @@ class ChatGPTTelegramBot:
 
         assert model_of_history
         if system_prompt is None:
-            system_prompt = self.get_prompt(model_of_history.name)
+            system_prompt = self.get_prompt(model_of_history)
 
         assert model_of_history
         return history[::-1], model_of_history, system_prompt
@@ -328,23 +373,30 @@ class ChatGPTTelegramBot:
         lines.append('  <code>&lt;prefix&gt;,t=high &lt;message&gt;</code>  — set thinking effort')
         lines.append('  <code>&lt;prefix&gt;,t= &lt;message&gt;</code>  — disable thinking')
         lines.append('  <code>&lt;prefix&gt;,s &lt;message&gt;</code>  — enable search')
+        lines.append('  <code>&lt;prefix&gt;,r &lt;message&gt;</code>  — let Telegram render the markdown')
+        lines.append('  <code>&lt;prefix&gt;,r= &lt;message&gt;</code>  — render to entities instead')
         lines.append('  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt')
         lines.append('  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt')
         lines.append('  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt')
         lines.append('')
+        lines.append('<b>Manipulation</b>')
+        lines.append('  Reply to a bot message with:')
+        lines.append('  <code>/manipulate &lt;text&gt;</code>')
+        lines.append('  <code>/manipulate &lt;think&gt;cot&lt;/think&gt; &lt;text&gt;</code>')
+        lines.append('  The stored reply becomes yours, and later turns build on it.')
+        lines.append('')
         lines.append('Reply to a bot message to continue the conversation.')
         lines.append('')
         lines.append(f'<b>Default system prompt</b>\n<code>{html_escape(self.system_prompt)}</code>')
+        lines.append('')
+        lines.append('Formatting guidance is appended to it, depending on <code>richtext</code>:')
+        lines.append(f'  on → <code>{html_escape(RICHTEXT_PROMPT_APPEND)}</code>')
+        lines.append(f'  off → <code>{html_escape(ENTITY_PROMPT_APPEND)}</code>')
         return '\n'.join(lines)
 
     @only_allowed
     async def help_handler(self, message: Any, error: str | None = None) -> None:
         _ = await self.send_message_html(message.chat_id, self._build_help_text(error), message.id)
-
-    @staticmethod
-    def _rich_fallback(markdown: str) -> str:
-        """Plain-text stand-in for the rich body, capped the way Telegram counts."""
-        return telegram_truncate(markdown, 4096)
 
     @staticmethod
     def _sent_message_id(result: Any) -> int:
@@ -359,18 +411,31 @@ class ChatGPTTelegramBot:
                 return update.message.id
         raise RuntimeError(f'sendMessage returned no message id: {type(result).__name__}')
 
+    @staticmethod
+    def _rich_message(body: Rendered) -> types.InputRichMessageMarkdown | None:
+        if body.rich_markdown is None:
+            return None
+        return types.InputRichMessageMarkdown(markdown=body.rich_markdown)
+
+    @staticmethod
+    def _as_body(body: Rendered | str) -> Rendered:
+        """The bot's own short messages are given as markdown and always rendered server-side."""
+        return body if isinstance(body, Rendered) else SERVER_MARKDOWN_RENDERER.render_one(body)
+
     @retry()
-    async def send_message(self, chat_id: int, markdown: str, reply_to_message_id: int) -> int:
-        logger.debug(f'Sending message: {chat_id=}, {reply_to_message_id=}, {markdown=}')
+    async def send_message(self, chat_id: int, body: Rendered | str, reply_to_message_id: int) -> int:
+        body = self._as_body(body)
+        logger.debug(f'Sending message: {chat_id=}, {reply_to_message_id=}, text={body.text!r}')
         # telethon has no high-level wrapper for rich messages, so sendMessage is invoked directly
         peer = await self.bot.get_input_entity(chat_id)
         result: Any = await self.bot(
             functions.messages.SendMessageRequest(
                 peer=peer,
-                message=self._rich_fallback(markdown),
+                message=body.text,
                 reply_to=types.InputReplyToMessage(reply_to_msg_id=reply_to_message_id),
                 no_webpage=True,
-                rich_message=types.InputRichMessageMarkdown(markdown=markdown),
+                entities=body.entities or None,
+                rich_message=self._rich_message(body),
             )
         )
         msg_id = self._sent_message_id(result)
@@ -391,23 +456,25 @@ class ChatGPTTelegramBot:
         return msg.id
 
     @retry()
-    async def edit_message(self, chat_id: int, markdown: str, message_id: int) -> None:
-        logger.debug(f'Editing message: {chat_id=}, {message_id=}, {markdown=}')
+    async def edit_message(self, chat_id: int, body: Rendered | str, message_id: int) -> None:
+        body = self._as_body(body)
+        logger.trace(f'Editing message: {chat_id=}, {message_id=}, text={body.text!r}')
         peer = await self.bot.get_input_entity(chat_id)
         try:
             _ = await self.bot(
                 functions.messages.EditMessageRequest(
                     peer=peer,
                     id=message_id,
-                    message=self._rich_fallback(markdown),
+                    message=body.text,
                     no_webpage=True,
-                    rich_message=types.InputRichMessageMarkdown(markdown=markdown),
+                    entities=body.entities or None,
+                    rich_message=self._rich_message(body),
                 )
             )
         except errors.MessageNotModifiedError:
-            logger.debug(f'Message not modified: {chat_id=}, {message_id=}')
+            logger.trace(f'Message not modified: {chat_id=}, {message_id=}')
         else:
-            logger.debug(f'Message edited: {chat_id=}, {message_id=}')
+            logger.trace(f'Message edited: {chat_id=}, {message_id=}')
 
     @retry()
     async def delete_message(self, chat_id: int, message_id: int) -> None:
@@ -417,6 +484,71 @@ class ChatGPTTelegramBot:
             message_id,
         )
         logger.debug(f'Message deleted: {chat_id=}, {message_id=}')
+
+    @only_allowed
+    async def manipulate_handler(self, message: Any, body: str) -> None:
+        """Replace a stored bot reply with user-supplied text (and optionally a chain of thought)."""
+        chat_id = message.chat_id
+        msg_id = message.id
+        logger.info(f'Manipulate requested: {chat_id=}, {msg_id=}, {body=}')
+
+        if not message.is_reply:
+            _ = await self.send_message(chat_id, MANIPULATE_USAGE, msg_id)
+            return
+        reply_to_message = await message.get_reply_message()
+        if reply_to_message is None or reply_to_message.sender_id != self.bot_id:
+            _ = await self.send_message(chat_id, MANIPULATE_USAGE, msg_id)
+            return
+        target_id = message.reply_to.reply_to_msg_id
+        assert isinstance(target_id, int)
+        # the reply may still be streaming, and its MsgInfo is only written once it finishes
+        await self.pending_reply_manager.wait_for((chat_id, target_id))
+
+        target_info = self.get_msg_info(chat_id, target_id)
+        if target_info is None or not target_info.sent_by_bot or target_info.reply_id is None:
+            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
+            return
+
+        thinking, text = parse_manipulation(body)
+        if not text:
+            _ = await self.send_message(chat_id, MANIPULATE_USAGE, msg_id)
+            return
+
+        # the model is only recorded at the head of the chain, so resolve it from there
+        try:
+            _, model, _ = self.construct_chat_history(chat_id, target_info.reply_id)
+        except RuntimeError as e:
+            logger.exception(e)
+            _ = await self.send_message(chat_id, f'[!] Error on resolving conversation: {e}', msg_id)
+            return
+
+        # only the message replied to is rewritten, so a body that no longer fits is refused
+        bodies = self.get_renderer(model).render(
+            format_reply(thinking or '', text, True), self._reply_prefix(model, manipulated=True)
+        )
+        if len(bodies) > 1:
+            _ = await self.send_message(chat_id, '[!] Manipulated message is too long', msg_id)
+            return
+
+        # any stored reasoning items describe the output being replaced, so they are dropped
+        new_parts: list[MsgPartInHistory] = []
+        if thinking:
+            new_parts.append(make_thinking_text_part(thinking))
+        new_parts.append(make_text_part(text))
+        self.set_msg_info(
+            chat_id,
+            target_id,
+            MsgInfo(
+                sent_by_bot=True,
+                message=new_parts,
+                reply_id=target_info.reply_id,
+                prefix=target_info.prefix,
+                system_prompt=target_info.system_prompt,
+                overrides=target_info.overrides,
+            ),
+        )
+        await self.edit_message(chat_id, bodies[0], target_id)
+        logger.info(f'Manipulated {chat_id=}, {target_id=}, has_thinking={thinking is not None}')
 
     @only_allowed
     async def reply_handler(self, message: Any) -> None:
@@ -507,11 +639,11 @@ class ChatGPTTelegramBot:
         if model_by_prefix and model_by_prefix.system_prompt is not None:
             system_prompt: str | None = self._format_system_prompt(model_by_prefix.system_prompt, model_by_prefix.name)
         elif model_by_prefix:
-            system_prompt = self.get_prompt(model_by_prefix.name)
+            system_prompt = self.get_prompt(model_by_prefix)
         else:
             system_prompt = None
         if model_by_prefix and model_by_prefix.system_prompt_append is not None:
-            base = system_prompt if system_prompt is not None else self.get_prompt(model_by_prefix.name)
+            base = system_prompt if system_prompt is not None else self.get_prompt(model_by_prefix)
             system_prompt = (
                 base + '\n' + self._format_system_prompt(model_by_prefix.system_prompt_append, model_by_prefix.name)
             )
@@ -546,12 +678,8 @@ class ChatGPTTelegramBot:
             reply = ''
             thinking_done = False
             stream_meta = StreamMeta()
-            model_flags = self._model_flags(model)
-            prefix = f'🤖 `{model.name}`'
-            if model_flags:
-                prefix += ' (' + ', '.join(model_flags) + ')'
-            prefix += '\n\n'
-            async with BotReplyMessages(self, chat_id, msg_id, prefix) as replymsgs:
+            prefix = self._reply_prefix(model)
+            async with BotReplyMessages(self, chat_id, msg_id, prefix, self.get_renderer(model)) as replymsgs:
                 try:
                     endpoint = model.endpoint or self.default_endpoint
                     status: str | None = 'Generating...'
@@ -614,13 +742,18 @@ class ChatGPTTelegramBot:
                     )
                     await replymsgs.finalize()
                     full_reply = reply
+                    # reasoning first: replaying it requires the order the provider emitted
+                    reply_parts: list[MsgPartInHistory] = [
+                        make_reasoning_part(model.name, item) for item in stream_meta.carry_items
+                    ]
+                    reply_parts.append(make_text_part(full_reply))
                     for bot_msg_id, _ in replymsgs.replied_msgs:
                         self.set_msg_info(
                             chat_id,
                             bot_msg_id,
                             MsgInfo(
                                 sent_by_bot=True,
-                                message=[make_text_part(full_reply)],
+                                message=list(reply_parts),
                                 reply_id=msg_id,
                                 prefix=None,
                                 system_prompt=None,
@@ -723,11 +856,11 @@ class ChatGPTTelegramBot:
         if model_by_prefix and model_by_prefix.system_prompt is not None:
             system_prompt: str | None = self._format_system_prompt(model_by_prefix.system_prompt, model_by_prefix.name)
         elif model_by_prefix:
-            system_prompt = self.get_prompt(model_by_prefix.name)
+            system_prompt = self.get_prompt(model_by_prefix)
         else:
             system_prompt = None
         if model_by_prefix and model_by_prefix.system_prompt_append is not None:
-            base = system_prompt if system_prompt is not None else self.get_prompt(model_by_prefix.name)
+            base = system_prompt if system_prompt is not None else self.get_prompt(model_by_prefix)
             system_prompt = (
                 base + '\n' + self._format_system_prompt(model_by_prefix.system_prompt_append, model_by_prefix.name)
             )
@@ -759,14 +892,15 @@ is_allowed={self.is_allowed(message.chat_id)}
 
 
 class BotReplyMessages:
-    def __init__(self, cbot: ChatGPTTelegramBot, chat_id: int, orig_msg_id: int, prefix: str) -> None:
+    def __init__(
+        self, cbot: ChatGPTTelegramBot, chat_id: int, orig_msg_id: int, prefix: str, renderer: Renderer
+    ) -> None:
         self.cbot: ChatGPTTelegramBot = cbot
         self.prefix: str = prefix
-        self.msg_len: int = cbot.MESSAGE_LENGTH_LIMIT - telegram_len(prefix)
-        assert self.msg_len > 0
+        self.renderer: Renderer = renderer
         self.chat_id: int = chat_id
         self.orig_msg_id: int = orig_msg_id
-        self.replied_msgs: list[tuple[int, str]] = []
+        self.replied_msgs: list[tuple[int, Rendered]] = []
         self.text: str = ''
         self.last_update_time: float = 0.0
 
@@ -781,33 +915,39 @@ class BotReplyMessages:
             self.cbot.pending_reply_manager.remove((self.chat_id, msg_id))
 
     async def _force_update(self, text: str) -> None:
-        # markdown is rendered server-side, so every part has to stay valid markdown on its own
-        slices = split_markdown(text, self.msg_len, self.cbot.MESSAGE_LENGTH_LIMIT)
-        if not slices:
-            slices = ['']  # deal with empty message
+        # how the reply is cut, and how long a part may be, are the renderer's business
+        try:
+            await self._apply(self.renderer.render(text, self.prefix))
+        except errors.BadRequestError as e:
+            # the server renderer rejects constructs it cannot lay out (an image with no
+            # media, an unsupported block); rendering to entities instead keeps the reply
+            if self.renderer is ENTITY_RENDERER or 'RICH_MESSAGE' not in str(e):
+                raise
+            logger.warning(f'Rich rendering rejected, falling back to entities ({self.chat_id=}): {e}')
+            self.renderer = ENTITY_RENDERER
+            await self._apply(self.renderer.render(text, self.prefix))
 
-        for i in range(min(len(slices), len(self.replied_msgs))):
-            msg_id, msg_text = self.replied_msgs[i]
-            if slices[i] != msg_text:
-                content = (self.prefix + slices[i]) if i == 0 else slices[i]
-                await self.cbot.edit_message(self.chat_id, content, msg_id)
-                self.replied_msgs[i] = (msg_id, slices[i])
-        if len(slices) > len(self.replied_msgs):
-            for i in range(len(self.replied_msgs), len(slices)):
+    async def _apply(self, bodies: list[Rendered]) -> None:
+        for i in range(min(len(bodies), len(self.replied_msgs))):
+            msg_id, previous = self.replied_msgs[i]
+            if bodies[i] != previous:
+                await self.cbot.edit_message(self.chat_id, bodies[i], msg_id)
+                self.replied_msgs[i] = (msg_id, bodies[i])
+        if len(bodies) > len(self.replied_msgs):
+            for i in range(len(self.replied_msgs), len(bodies)):
                 if i == 0:
                     reply_to = self.orig_msg_id
                 else:
                     reply_to, _ = self.replied_msgs[i - 1]
-                content = (self.prefix + slices[i]) if i == 0 else slices[i]
-                msg_id = await self.cbot.send_message(self.chat_id, content, reply_to)
-                self.replied_msgs.append((msg_id, slices[i]))
+                msg_id = await self.cbot.send_message(self.chat_id, bodies[i], reply_to)
+                self.replied_msgs.append((msg_id, bodies[i]))
                 self.cbot.pending_reply_manager.add((self.chat_id, msg_id))
-        if len(self.replied_msgs) > len(slices):
-            for i in range(len(slices), len(self.replied_msgs)):
+        if len(self.replied_msgs) > len(bodies):
+            for i in range(len(bodies), len(self.replied_msgs)):
                 msg_id, _ = self.replied_msgs[i]
                 await self.cbot.delete_message(self.chat_id, msg_id)
                 self.cbot.pending_reply_manager.remove((self.chat_id, msg_id))
-            self.replied_msgs = self.replied_msgs[: len(slices)]
+            self.replied_msgs = self.replied_msgs[: len(bodies)]
 
     async def update(self, text: str) -> None:
         self.text = text

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from chatgpt_telegram_bot.models import Model
 from chatgpt_telegram_bot.utils import (
+    apply_overrides,
     find_delimiter_outside_brackets,
     match_prefix,
     parse_overrides,
@@ -251,3 +253,34 @@ class TestMatchPrefix:
         result = match_prefix('om,+[Be concise, clear, helpful] hello', 'om')
         assert result is not None
         assert result == ('hello', {'system_prompt_append': 'Be concise, clear, helpful'})
+
+    def test_richtext_bare_key(self):
+        assert parse_overrides('r') == {'r': None}
+
+    def test_richtext_explicit_empty(self):
+        assert parse_overrides('r=') == {'r': ''}
+
+    def test_richtext_with_other_overrides(self):
+        result = match_prefix('om,t=high,r hello', 'om')
+        assert result is not None
+        assert result == ('hello', {'t': 'high', 'r': None})
+
+
+class TestApplyRichtextOverride:
+    BASE: Model = Model(prefix='om', name='gpt')
+
+    def test_default_is_off(self):
+        assert self.BASE.richtext is False
+
+    def test_bare_key_enables(self):
+        assert apply_overrides(self.BASE, {'r': None}).richtext is True
+
+    def test_explicit_empty_disables(self):
+        assert apply_overrides(self.BASE._replace(richtext=True), {'r': ''}).richtext is False
+
+    def test_false_word_disables(self):
+        assert apply_overrides(self.BASE._replace(richtext=True), {'r': 'false'}).richtext is False
+        assert apply_overrides(self.BASE._replace(richtext=True), {'r': '0'}).richtext is False
+
+    def test_long_name_also_works(self):
+        assert apply_overrides(self.BASE, {'richtext': None}).richtext is True

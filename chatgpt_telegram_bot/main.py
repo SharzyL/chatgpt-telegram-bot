@@ -41,6 +41,7 @@ def _default_data_dir() -> str:
 async def async_main() -> None:
     parser = ArgumentParser()
     _ = parser.add_argument('--debug', action='store_true')
+    _ = parser.add_argument('--trace', action='store_true', help='DEBUG plus per-event stream logging')
     _ = parser.add_argument('-c', '--config', default='bot.toml')
     _ = parser.add_argument(
         '--data-dir', default=_default_data_dir(), help='directory for persistent data (db, image cache)'
@@ -48,7 +49,7 @@ async def async_main() -> None:
 
     args = parser.parse_args()
 
-    log_level = 'DEBUG' if args.debug else 'INFO'
+    log_level = 'TRACE' if args.trace else 'DEBUG' if args.debug else 'INFO'
     logger.remove()
 
     use_journal = False

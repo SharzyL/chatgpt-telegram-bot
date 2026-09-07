@@ -140,6 +140,9 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
         elif field == 'search':
             # bare key (|s) enables, explicit empty (|s=) disables
             replacements['search'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
+        elif field == 'richtext':
+            # bare key (|r) enables, explicit empty (|r=) disables
+            replacements['richtext'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
         elif field == 'system_prompt':
             replacements['system_prompt'] = value
         elif field == 'system_prompt_append':
@@ -147,6 +150,24 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
         else:
             raise ValueError(f'Unknown override key: {key}')
     return model._replace(**replacements)
+
+
+_THINK_BLOCK = re.compile(r'\A<think>(.*?)</think>', re.DOTALL)
+
+
+def parse_manipulation(body: str) -> tuple[str | None, str]:
+    """Split a ``/manipulate`` body into an optional chain of thought and the reply text.
+
+    A leading ``<think>…</think>`` block is taken as the chain of thought and everything
+    after it as the reply text; without the block the whole body is the reply text.
+    """
+    body = body.strip()
+    match = _THINK_BLOCK.match(body)
+    if match is None:
+        return None, body
+    thinking = match.group(1).strip()
+    text = body[match.end() :].strip()
+    return (thinking or None), text
 
 
 def parse_proxy():

@@ -43,10 +43,11 @@ def make_text_part(text: str) -> MsgPartInHistory:
 
 def make_thinking_text_part(text: str) -> MsgPartInHistory:
     """
-    Store a user-supplied chain of thought (see the /manipulate command).
+    Store a chain of thought as plain text rather than as an opaque provider item.
 
-    Unlike a `reasoning` part this is plain text, not an opaque provider item, so every
-    backend can replay it.
+    Used for a chain of thought supplied by the user (see the /manipulate command) and for
+    one the provider returns in the clear, which `merge_thinking_text()` folds into the
+    message as a <think> block so that every backend replays it.
     """
     return MsgPartInHistory(type_='thinking_text', hash=None, text=text)
 

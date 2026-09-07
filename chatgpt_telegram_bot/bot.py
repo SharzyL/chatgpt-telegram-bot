@@ -19,7 +19,7 @@ from loguru import logger
 from telethon import TelegramClient, errors, events, functions, types
 from telethon.tl.custom import Message
 
-from chatgpt_telegram_bot.completion import completion
+from chatgpt_telegram_bot.completion import completion, reasoning_text_of
 from chatgpt_telegram_bot.models import (
     EndPoint,
     Model,
@@ -746,9 +746,20 @@ class ChatGPTTelegramBot:
                     await replymsgs.finalize()
                     full_reply = reply
                     # reasoning first: replaying it requires the order the provider emitted
-                    reply_parts: list[MsgPartInHistory] = [
-                        make_reasoning_part(model.name, item) for item in stream_meta.carry_items
-                    ]
+                    reply_parts: list[MsgPartInHistory] = []
+                    for item in stream_meta.carry_items:
+                        chain_of_thought = reasoning_text_of(item)
+                        if chain_of_thought:
+                            # A chain of thought we can read is carried as text rather than
+                            # as a reasoning item. DeepSeek returns the text beside a handle
+                            # into a response `store=false` never kept, and drops the item on
+                            # replay whichever way it is sent -- observed by the reasoning
+                            # tokens never reaching the next turn's input, and by the model
+                            # reinventing numbers it had picked. A <think> block in the
+                            # message is ordinary input and cannot be ignored.
+                            reply_parts.append(make_thinking_text_part(chain_of_thought))
+                        else:
+                            reply_parts.append(make_reasoning_part(model.name, item))
                     reply_parts.append(make_text_part(full_reply))
                     for bot_msg_id, _ in replymsgs.replied_msgs:
                         self.set_msg_info(

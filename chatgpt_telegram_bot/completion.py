@@ -64,19 +64,15 @@ def merge_thinking_text(msg_parts: list[MsgPartInHistory]) -> list[MsgPartInHist
     return merged
 
 
-def self_contained_reasoning(item: dict[str, Any]) -> dict[str, Any]:
+def reasoning_text_of(item: dict[str, Any]) -> str:
     """
-    Keep whichever payload can be replayed without server-side state.
+    The plain reasoning text an item carries, if any.
 
-    DeepSeek sets `encrypted_content` to a handle into a stored response (`<uuid>-0`) and
-    ships the reasoning as plain `reasoning_text` content beside it. Since `store=false` is
-    sent, that handle resolves to nothing and the endpoint appears to drop the whole item --
-    including the text it could have read instead. Where the text is there, send only that.
-    OpenAI is the other way round: real ciphertext and no content, so nothing is dropped.
+    DeepSeek's Responses API ships the chain of thought as `reasoning_text` content parts;
+    OpenAI ships opaque ciphertext and leaves these empty.
     """
-    if not item.get('content'):
-        return item
-    return {key: value for key, value in item.items() if key != 'encrypted_content'}
+    parts = item.get('content') or []
+    return '\n\n'.join(p['text'] for p in parts if isinstance(p, dict) and p.get('text'))
 
 
 def read_reasoning_part(part: MsgPartInHistory, model_name: str) -> dict[str, Any] | None:
@@ -99,7 +95,7 @@ def read_reasoning_part(part: MsgPartInHistory, model_name: str) -> dict[str, An
     if not isinstance(item, dict):
         logger.warning('Discarding reasoning part without an item')
         return None
-    return self_contained_reasoning(item)
+    return item
 
 
 async def build_input_openai(

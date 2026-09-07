@@ -2,7 +2,12 @@ import asyncio
 import json
 from typing import Any
 
-from chatgpt_telegram_bot.completion import build_input_openai, has_reasoning_items, strip_reasoning_items
+from chatgpt_telegram_bot.completion import (
+    build_input_openai,
+    has_reasoning_items,
+    reasoning_text_of,
+    strip_reasoning_items,
+)
 from chatgpt_telegram_bot.models import (
     MsgPartInHistory,
     make_image_part,
@@ -104,24 +109,25 @@ DEEPSEEK_ITEM: dict[str, Any] = {
     'id': 'abc',
     'summary': [],
     'content': [{'type': 'reasoning_text', 'text': 'step by step'}],
-    # a handle into a stored response, useless under store=false
     'encrypted_content': '8dda0680-c4fc-43e4-86c1-a31349147d72-0',
 }
 
 
-def test_plain_reasoning_text_is_sent_without_the_handle():
-    history = [[make_text_part('hi')], [make_reasoning_part(MODEL, DEEPSEEK_ITEM), make_text_part('hello')]]
-    replayed = build(history)[1]
-    assert replayed['content'] == DEEPSEEK_ITEM['content']
-    assert 'encrypted_content' not in replayed
+def test_reasoning_text_is_read_from_content_parts():
+    assert reasoning_text_of(DEEPSEEK_ITEM) == 'step by step'
 
 
-def test_ciphertext_is_kept_when_there_is_no_text():
-    history = [[make_text_part('hi')], [make_reasoning_part(MODEL, ITEM), make_text_part('hello')]]
-    assert build(history)[1] == ITEM
+def test_several_content_parts_are_joined():
+    item = {'content': [{'type': 'reasoning_text', 'text': 'one'}, {'type': 'reasoning_text', 'text': 'two'}]}
+    assert reasoning_text_of(item) == 'one\n\ntwo'
 
 
-def test_an_item_with_empty_content_keeps_its_ciphertext():
-    item = {**ITEM, 'content': []}
-    history = [[make_text_part('hi')], [make_reasoning_part(MODEL, item), make_text_part('hello')]]
-    assert build(history)[1]['encrypted_content'] == 'blob'
+def test_ciphertext_only_item_has_no_readable_text():
+    assert reasoning_text_of(ITEM) == ''
+
+
+def test_missing_or_malformed_content_reads_as_empty():
+    assert reasoning_text_of({'content': None}) == ''
+    assert reasoning_text_of({'content': []}) == ''
+    assert reasoning_text_of({'content': ['not a dict']}) == ''
+    assert reasoning_text_of({'content': [{'type': 'reasoning_text'}]}) == ''

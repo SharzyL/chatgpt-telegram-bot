@@ -177,30 +177,34 @@ class TestImageNeutralization:
 
 
 class TestCollapsibleQuotes:
-    """A blockquote folds in the clients only when its entity carries `collapsed`."""
+    """A quote folds in the clients only when its entity carries `collapsed`."""
 
     @staticmethod
     def quotes(body: Rendered) -> list[Any]:
         return [e for e in body.entities if type(e).__name__ == 'MessageEntityBlockquote']
 
-    def test_long_quote_is_collapsed(self):
-        body = ENTITY_RENDERER.render('> ' + 'reasoning at length. ' * 40)[0]
-        assert [e.collapsed for e in self.quotes(body)] == [True]
+    def test_thinking_quote_is_collapsed_however_short(self):
+        source = format_reply('Brief.', 'Answer.', True)
+        assert [e.collapsed for e in self.quotes(ENTITY_RENDERER.render(source, PREFIX, True)[0])] == [True]
 
-    def test_short_quote_stays_open(self):
-        body = ENTITY_RENDERER.render('> brief thought')[0]
-        assert [e.collapsed for e in self.quotes(body)] == [None]
-
-    def test_thinking_folds_while_the_usage_footer_stays_open(self):
-        source = format_reply('Reasoning at length. ' * 40, 'The answer.', True, usage={'in': 84, 'out': 44})
-        found = self.quotes(ENTITY_RENDERER.render(source, PREFIX)[0])
-        assert len(found) == 2
-        thinking, footer = found
+    def test_footer_stays_open_while_thinking_folds(self):
+        source = format_reply('Reasoning at length. ' * 40, 'The answer.', True, usage={'in': 84})
+        thinking, footer = self.quotes(ENTITY_RENDERER.render(source, PREFIX, True)[0])
         assert thinking.collapsed is True
         assert footer.collapsed is None
-        assert thinking.length > footer.length
+
+    def test_model_quotes_stay_open_without_thinking(self):
+        source = format_reply('', '> a quote the model wrote\n\nanswer', True, usage={'in': 1})
+        found = self.quotes(ENTITY_RENDERER.render(source, PREFIX, False)[0])
+        assert len(found) == 2
+        assert all(e.collapsed is None for e in found)
+
+    def test_only_the_leading_quote_folds(self):
+        source = format_reply('Thinking.', '> the model also quotes\n\nanswer', True)
+        found = self.quotes(ENTITY_RENDERER.render(source, PREFIX, True)[0])
+        assert [e.collapsed for e in found] == [True, None]
 
     def test_a_collapsed_quote_split_across_bodies_stays_collapsed(self):
-        bodies = ENTITY_RENDERER.render(format_reply('Reasoning step. ' * 900, 'Answer.', True), PREFIX)
+        bodies = ENTITY_RENDERER.render(format_reply('Reasoning step. ' * 900, 'Answer.', True), PREFIX, True)
         assert len(bodies) > 1
         assert all(e.collapsed is True for b in bodies for e in self.quotes(b))

@@ -524,7 +524,9 @@ class ChatGPTTelegramBot:
 
         # only the message replied to is rewritten, so a body that no longer fits is refused
         bodies = self.get_renderer(model).render(
-            format_reply(thinking or '', text, True), self._reply_prefix(model, manipulated=True)
+            format_reply(thinking or '', text, True),
+            self._reply_prefix(model, manipulated=True),
+            thinking is not None,
         )
         if len(bodies) > 1:
             _ = await self.send_message(chat_id, '[!] Manipulated message is too long', msg_id)
@@ -719,7 +721,7 @@ class ChatGPTTelegramBot:
                         elif isinstance(event, StreamMeta):
                             stream_meta = event
                             continue
-                        await replymsgs.update(format_reply(thinking, reply, thinking_done, status))
+                        await replymsgs.update(format_reply(thinking, reply, thinking_done, status), bool(thinking))
                     stream_end = time.time()
                     usage = stream_meta.usage
                     if usage:
@@ -738,7 +740,8 @@ class ChatGPTTelegramBot:
                             True,
                             tool_calls=stream_meta.tool_calls or None,
                             usage=usage or None,
-                        )
+                        ),
+                        bool(thinking),
                     )
                     await replymsgs.finalize()
                     full_reply = reply
@@ -902,6 +905,7 @@ class BotReplyMessages:
         self.orig_msg_id: int = orig_msg_id
         self.replied_msgs: list[tuple[int, Rendered]] = []
         self.text: str = ''
+        self.collapse_first_quote: bool = False
         self.last_update_time: float = 0.0
 
     async def __aenter__(self) -> Self:
@@ -917,7 +921,7 @@ class BotReplyMessages:
     async def _force_update(self, text: str) -> None:
         # how the reply is cut, and how long a part may be, are the renderer's business
         try:
-            await self._apply(self.renderer.render(text, self.prefix))
+            await self._apply(self.renderer.render(text, self.prefix, self.collapse_first_quote))
         except errors.BadRequestError as e:
             # the server renderer rejects constructs it cannot lay out (an image with no
             # media, an unsupported block); rendering to entities instead keeps the reply
@@ -925,7 +929,7 @@ class BotReplyMessages:
                 raise
             logger.warning(f'Rich rendering rejected, falling back to entities ({self.chat_id=}): {e}')
             self.renderer = ENTITY_RENDERER
-            await self._apply(self.renderer.render(text, self.prefix))
+            await self._apply(self.renderer.render(text, self.prefix, self.collapse_first_quote))
 
     async def _apply(self, bodies: list[Rendered]) -> None:
         for i in range(min(len(bodies), len(self.replied_msgs))):
@@ -949,8 +953,9 @@ class BotReplyMessages:
                 self.cbot.pending_reply_manager.remove((self.chat_id, msg_id))
             self.replied_msgs = self.replied_msgs[: len(bodies)]
 
-    async def update(self, text: str) -> None:
+    async def update(self, text: str, collapse_first_quote: bool = False) -> None:
         self.text = text
+        self.collapse_first_quote = collapse_first_quote
         if time.time() - self.last_update_time >= self.cbot.TELEGRAM_MIN_INTERVAL:
             await self._force_update(self.text)
             # timed from the end of the flush: one tick can edit several messages when a

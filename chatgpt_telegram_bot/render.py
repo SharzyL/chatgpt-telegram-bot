@@ -50,11 +50,13 @@ class Renderer(ABC):
     limit: int
 
     @abstractmethod
-    def render(self, markdown: str, prefix: str = '') -> list[Rendered]:
+    def render(self, markdown: str, prefix: str = '', collapse_first_quote: bool = False) -> list[Rendered]:
         """
         Bodies for *markdown*, with *prefix* prepended to the first one.
 
-        Always returns at least one body, so an empty reply still has a message to occupy.
+        *collapse_first_quote* says the leading blockquote is a chain of thought and should
+        be sent folded. Always returns at least one body, so an empty reply still has a
+        message to occupy.
         """
 
     def render_one(self, markdown: str) -> Rendered:
@@ -68,7 +70,10 @@ class ServerMarkdownRenderer(Renderer):
     limit: int = RICH_LENGTH_LIMIT
 
     @override
-    def render(self, markdown: str, prefix: str = '') -> list[Rendered]:
+    def render(self, markdown: str, prefix: str = '', collapse_first_quote: bool = False) -> list[Rendered]:
+        # whether the rich markdown can express a foldable quote is untested, so the
+        # request is accepted and ignored rather than guessed at
+        _ = collapse_first_quote
         # an image would be read as a photo block and rejected for having no media
         markdown = neutralize_images(markdown)
         # the prefix is kept out of the split so that its length is charged to the first
@@ -89,10 +94,14 @@ class EntityRenderer(Renderer):
     limit: int = PLAIN_LENGTH_LIMIT
 
     @override
-    def render(self, markdown: str, prefix: str = '') -> list[Rendered]:
+    def render(self, markdown: str, prefix: str = '', collapse_first_quote: bool = False) -> list[Rendered]:
         # the prefix is part of the document here: it is formatted markdown too, and
         # slicing the rendered result places it at the head of the first body for free
-        rich = self._trim(RichText.from_markdown(prefix + markdown))
+        rich = RichText.from_markdown(prefix + markdown)
+        if collapse_first_quote:
+            # set before any slicing, so every part of a quote spanning bodies stays folded
+            rich.collapse_first_blockquote()
+        rich = self._trim(rich)
         bodies: list[Rendered] = []
         while len(rich) > 0:
             head, rest = self._split(rich, self.limit)

@@ -97,3 +97,31 @@ def test_strip_reasoning_items_leaves_messages():
     stripped = strip_reasoning_items(items)
     assert not has_reasoning_items(stripped)
     assert stripped == [{'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'hello'}]
+
+
+DEEPSEEK_ITEM: dict[str, Any] = {
+    'type': 'reasoning',
+    'id': 'abc',
+    'summary': [],
+    'content': [{'type': 'reasoning_text', 'text': 'step by step'}],
+    # a handle into a stored response, useless under store=false
+    'encrypted_content': '8dda0680-c4fc-43e4-86c1-a31349147d72-0',
+}
+
+
+def test_plain_reasoning_text_is_sent_without_the_handle():
+    history = [[make_text_part('hi')], [make_reasoning_part(MODEL, DEEPSEEK_ITEM), make_text_part('hello')]]
+    replayed = build(history)[1]
+    assert replayed['content'] == DEEPSEEK_ITEM['content']
+    assert 'encrypted_content' not in replayed
+
+
+def test_ciphertext_is_kept_when_there_is_no_text():
+    history = [[make_text_part('hi')], [make_reasoning_part(MODEL, ITEM), make_text_part('hello')]]
+    assert build(history)[1] == ITEM
+
+
+def test_an_item_with_empty_content_keeps_its_ciphertext():
+    item = {**ITEM, 'content': []}
+    history = [[make_text_part('hi')], [make_reasoning_part(MODEL, item), make_text_part('hello')]]
+    assert build(history)[1]['encrypted_content'] == 'blob'

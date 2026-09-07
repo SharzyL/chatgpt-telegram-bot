@@ -64,6 +64,21 @@ def merge_thinking_text(msg_parts: list[MsgPartInHistory]) -> list[MsgPartInHist
     return merged
 
 
+def self_contained_reasoning(item: dict[str, Any]) -> dict[str, Any]:
+    """
+    Keep whichever payload can be replayed without server-side state.
+
+    DeepSeek sets `encrypted_content` to a handle into a stored response (`<uuid>-0`) and
+    ships the reasoning as plain `reasoning_text` content beside it. Since `store=false` is
+    sent, that handle resolves to nothing and the endpoint appears to drop the whole item --
+    including the text it could have read instead. Where the text is there, send only that.
+    OpenAI is the other way round: real ciphertext and no content, so nothing is dropped.
+    """
+    if not item.get('content'):
+        return item
+    return {key: value for key, value in item.items() if key != 'encrypted_content'}
+
+
 def read_reasoning_part(part: MsgPartInHistory, model_name: str) -> dict[str, Any] | None:
     """Decode a stored reasoning item, discarding it unless it belongs to model_name."""
     if not part.text:
@@ -84,7 +99,7 @@ def read_reasoning_part(part: MsgPartInHistory, model_name: str) -> dict[str, An
     if not isinstance(item, dict):
         logger.warning('Discarding reasoning part without an item')
         return None
-    return item
+    return self_contained_reasoning(item)
 
 
 async def build_input_openai(
@@ -255,9 +270,10 @@ async def completion_openai(
             encrypted = getattr(item, 'encrypted_content', None)
             replayable = 'yes' if is_replayable_reasoning(item) else 'no'
             payload = f'{len(encrypted)}B' if encrypted else 'none'
-            n_content = len(getattr(item, 'content', None) or [])
+            parts = getattr(item, 'content', None) or []
+            cot_chars = sum(len(getattr(c, 'text', '') or '') for c in parts)
             n_summary = len(item.summary or [])
-            counts = f'content_parts={n_content} summary_parts={n_summary}'
+            counts = f'content_parts={len(parts)} cot_chars={cot_chars} summary_parts={n_summary}'
             fields = sorted(item.model_dump(exclude_none=True).keys())
             desc = f'id={item.id} replayable={replayable} encrypted={payload} {counts} fields={fields}'
             logger.debug(f'Reasoning item ({chat_id=}, {msg_id=}): {desc}')

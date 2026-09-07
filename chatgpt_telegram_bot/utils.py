@@ -194,8 +194,10 @@ def retry(max_retry: int = 30, interval: int = 10):
                 except ValueError as e:
                     logger.exception(e)
                 except errors.FloodWaitError as e:
-                    logger.exception(e)
-                    await asyncio.sleep(interval)
+                    # Telegram states how long to wait; sleeping less just floods again
+                    wait = getattr(e, 'seconds', None) or interval
+                    logger.warning(f'Flood wait {wait}s on {func.__name__}')
+                    await asyncio.sleep(wait + 1)
             return await func(*args, **kwargs)
 
         return new_func

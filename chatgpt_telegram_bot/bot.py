@@ -143,7 +143,7 @@ class ChatGPTTelegramBot:
             else:
                 raise ValueError(f'Unknown api_type: {api_type}')
 
-        self.TELEGRAM_MIN_INTERVAL: float = 0.5
+        self.TELEGRAM_MIN_INTERVAL: float = 1.0
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
         self.TEXT_FILE_SIZE_LIMIT: int = 100_000
@@ -951,10 +951,11 @@ class BotReplyMessages:
 
     async def update(self, text: str) -> None:
         self.text = text
-        now = time.time()
-        if now - self.last_update_time >= self.cbot.TELEGRAM_MIN_INTERVAL:
-            self.last_update_time = now
+        if time.time() - self.last_update_time >= self.cbot.TELEGRAM_MIN_INTERVAL:
             await self._force_update(self.text)
+            # timed from the end of the flush: one tick can edit several messages when a
+            # cut shifts, and starting the clock before that would shorten the next gap
+            self.last_update_time = time.time()
 
     async def finalize(self) -> None:
         await self._force_update(self.text)

@@ -8,6 +8,7 @@ from chatgpt_telegram_bot.render import (
     SERVER_MARKDOWN_RENDERER,
     Rendered,
 )
+from chatgpt_telegram_bot.reply import format_reply
 from chatgpt_telegram_bot.utils import telegram_len
 
 PREFIX = '🤖 `gpt`\n\n'
@@ -60,6 +61,30 @@ class TestEntityRenderer:
 
     def test_empty_reply_still_has_a_body(self):
         assert ENTITY_RENDERER.render('') == [Rendered(text='')]
+
+    def test_whitespace_only_reply_still_has_a_body(self):
+        assert ENTITY_RENDERER.render('   \n\n  ') == [Rendered(text='')]
+
+    def test_astral_text_fills_its_bodies(self):
+        """A UTF-16 budget spent one character at a time would emit thousands of messages."""
+        bodies = ENTITY_RENDERER.render('😀' * 6000)
+        assert len(bodies) == 3
+        assert telegram_len(bodies[0].text) > PLAIN_LENGTH_LIMIT - 4
+
+    def test_bodies_carry_no_edge_whitespace(self):
+        # Telegram strips it, which would shift every entity in the body left
+        bodies = ENTITY_RENDERER.render('para text here\n\n' * 900, PREFIX)
+        assert len(bodies) > 1
+        assert all(b.text == b.text.strip() for b in bodies)
+
+    def test_entities_stay_in_bounds_after_telegram_trims(self):
+        source = format_reply('Reasoning step. ' * 900, 'Answer **now** with `code`.', True)
+        bodies = ENTITY_RENDERER.render(source, PREFIX)
+        assert len(bodies) > 1
+        for body in bodies:
+            trimmed = telegram_len(body.text.strip())
+            assert all(e.length > 0 and e.offset >= 0 for e in body.entities)
+            assert all(e.offset + e.length <= trimmed for e in body.entities)
 
 
 class TestServerMarkdownRenderer:

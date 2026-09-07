@@ -19,7 +19,13 @@ from dataclasses import dataclass, field
 from typing import Any, override
 
 from chatgpt_telegram_bot.richtext import RichText
-from chatgpt_telegram_bot.utils import neutralize_images, split_markdown, telegram_len, telegram_truncate
+from chatgpt_telegram_bot.utils import (
+    neutralize_images,
+    split_markdown,
+    telegram_len,
+    telegram_truncate,
+    utf16_prefix,
+)
 
 # a plain message body, and the `message` field of a rich one, are capped here
 PLAIN_LENGTH_LIMIT = 4096
@@ -86,34 +92,46 @@ class EntityRenderer(Renderer):
     def render(self, markdown: str, prefix: str = '') -> list[Rendered]:
         # the prefix is part of the document here: it is formatted markdown too, and
         # slicing the rendered result places it at the head of the first body for free
-        rich = RichText.from_markdown(prefix + markdown)
+        rich = self._trim(RichText.from_markdown(prefix + markdown))
         bodies: list[Rendered] = []
         while len(rich) > 0:
-            head, rich = self._take(rich, self.limit)
+            head, rest = self._split(rich, self.limit)
             text, entities = head.to_telegram()
             bodies.append(Rendered(text=text, entities=entities))
+            rich = self._trim(rest)
         if not bodies:
             bodies.append(Rendered(text=''))
         return bodies
 
     @staticmethod
-    def _take(rich: RichText, budget: int) -> tuple[RichText, RichText]:
+    def _split(rich: RichText, budget: int) -> tuple[RichText, RichText]:
         """
-        Cut at most *budget* UTF-16 units off the front of *rich*.
+        Cut *rich* into a head of at most *budget* UTF-16 units and the rest.
 
-        RichText indexes by character while Telegram counts UTF-16 units, so a slice of
-        *budget* characters can still be too long once astral characters are involved.
-        Shrink until it fits rather than let the server reject the message.
+        RichText indexes by character while Telegram counts UTF-16 units, so the cut is
+        found on the rendered text, whose characters map one to one onto the RichText.
         """
-        chars = min(budget, len(rich))
-        while chars > 1:
-            text, _ = rich[:chars].to_telegram()
-            excess = telegram_len(text) - budget
-            if excess <= 0:
-                break
-            chars -= excess
-        chars = max(chars, 1)
-        return rich[:chars], rich[chars:]
+        text, _ = rich.to_telegram()
+        cut = max(utf16_prefix(text, budget), 1)
+        # trailing whitespace is dropped from the head: Telegram trims it from the message
+        # and every entity would then sit two units to the right of where it was measured
+        end = cut
+        while end > 0 and text[end - 1].isspace():
+            end -= 1
+        return rich[: end or cut], rich[cut:]
+
+    @staticmethod
+    def _trim(rich: RichText) -> RichText:
+        """Drop whitespace at either end, which Telegram would strip and shift entities by."""
+        if len(rich) == 0:
+            return rich
+        text, _ = rich.to_telegram()
+        start, end = 0, len(text)
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        return rich[start:end]
 
 
 SERVER_MARKDOWN_RENDERER = ServerMarkdownRenderer()

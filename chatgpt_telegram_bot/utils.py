@@ -264,10 +264,10 @@ _FENCE_MARGIN = 8
 
 def telegram_truncate(s: str, units: int) -> str:
     """Truncate *s* to at most *units* UTF-16 code units, the unit Telegram counts in."""
-    return s[: _utf16_prefix(s, units)]
+    return s[: utf16_prefix(s, units)]
 
 
-def _utf16_prefix(s: str, units: int) -> int:
+def utf16_prefix(s: str, units: int) -> int:
     """Largest index i for which ``telegram_len(s[:i]) <= units``."""
     total = 0
     for i, ch in enumerate(s):
@@ -312,7 +312,7 @@ def split_markdown(text: str, first_limit: int, limit: int) -> list[str]:
     while telegram_len(text) > cur_limit:
         # closing a fence appends to the part, so leave room for it
         budget = max(1, cur_limit - _FENCE_MARGIN) if '```' in text else cur_limit
-        end = _utf16_prefix(text, budget)
+        end = utf16_prefix(text, budget)
         cut = text.rfind('\n\n', 0, end + 1)
         if cut <= 0:
             cut = text.rfind('\n', 0, end + 1)

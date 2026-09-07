@@ -14,6 +14,7 @@ dependencies = [
     "openai>=2.41.1,<3.0.0",
     "loguru>=0.7.2",
     "diskcache>=5.6.3",
+    "mistune>=3.0.0,<4.0.0",  # markdown -> AST for client-side entity rendering
 ]
 requires-python = "<4.0,>=3.11"
 readme = "README.md"

@@ -314,8 +314,22 @@ def split_markdown(text: str, first_limit: int, limit: int) -> list[str]:
 
 # fenced blocks and inline code spans, whose contents must not be rewritten
 _CODE_SPAN_RE = re.compile(r'```.*?```|``.*?``|`[^`\n]*`', re.DOTALL)
+# a markdown image, inline `![alt](url)` or reference `![alt][ref]`
+_IMAGE_RE = re.compile(r'!(\[[^\]]*\])(\([^)]*\)|\[[^\]]*\])')
 _INLINE_MATH_RE = re.compile(r'\\\((.+?)\\\)', re.DOTALL)
 _DISPLAY_MATH_RE = re.compile(r'\\\[(.+?)\\\]', re.DOTALL)
+
+
+def _rewrite_outside_code(markdown: str, convert: Callable[[str], str]) -> str:
+    """Apply *convert* to every stretch of *markdown* that is not a code span."""
+    parts: list[str] = []
+    pos = 0
+    for m in _CODE_SPAN_RE.finditer(markdown):
+        parts.append(convert(markdown[pos : m.start()]))
+        parts.append(m.group(0))
+        pos = m.end()
+    parts.append(convert(markdown[pos:]))
+    return ''.join(parts)
 
 
 def normalize_math(markdown: str) -> str:
@@ -330,11 +344,23 @@ def normalize_math(markdown: str) -> str:
         s = _INLINE_MATH_RE.sub(r'$\1$', s)
         return _DISPLAY_MATH_RE.sub(r'$$\1$$', s)
 
-    parts: list[str] = []
-    pos = 0
-    for m in _CODE_SPAN_RE.finditer(markdown):
-        parts.append(convert(markdown[pos : m.start()]))
-        parts.append(m.group(0))
-        pos = m.end()
-    parts.append(convert(markdown[pos:]))
-    return ''.join(parts)
+    return _rewrite_outside_code(markdown, convert)
+
+
+def _image_to_link(m: re.Match[str]) -> str:
+    alt, target = m.group(1), m.group(2)
+    # an empty alt would leave a link with no clickable text, so show the target instead
+    if alt == '[]' and target.startswith('(') and target.endswith(')'):
+        return f'[{target[1:-1]}]{target}'
+    return alt + target
+
+
+def neutralize_images(markdown: str) -> str:
+    """Turn markdown images into ordinary links.
+
+    Telegram's rich-message renderer reads an image as a photo block and rejects the whole
+    message with ``RICH_MESSAGE_PHOTO_NO_MEDIA_FOUND`` when no media is attached, which is
+    always the case for a text reply. Demoting the image keeps the alt text and the URL
+    reachable. Code spans are left untouched.
+    """
+    return _rewrite_outside_code(markdown, lambda s: _IMAGE_RE.sub(_image_to_link, s))

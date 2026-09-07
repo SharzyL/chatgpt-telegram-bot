@@ -65,6 +65,7 @@ dependencies = [
     { name = "cryptg" },
     { name = "diskcache" },
     { name = "loguru" },
+    { name = "mistune" },
     { name = "openai" },
     { name = "python-socks" },
     { name = "telethon" },
@@ -81,6 +82,7 @@ requires-dist = [
     { name = "cryptg", specifier = ">=0.4.0,<1.0.0" },
     { name = "diskcache", specifier = ">=5.6.3" },
     { name = "loguru", specifier = ">=0.7.2" },
+    { name = "mistune", specifier = ">=3.0.0,<4.0.0" },
     { name = "openai", specifier = ">=2.41.1,<3.0.0" },
     { name = "python-socks", specifier = ">=2.4.4,<3.0.1" },
     { name = "telethon", specifier = ">=1.44.0,<2.0.0" },
@@ -319,6 +321,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/3a/05/a1dae3dffd1116099471c643b8924f5aa6524411dc6c63fdae648c4f1aca/loguru-0.7.3.tar.gz", hash = "sha256:19480589e77d47b8d85b2c827ad95d49bf31b0dcde16593892eb51dd18706eb6", size = 63559, upload-time = "2024-12-06T11:20:56.608Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/29/0348de65b8cc732daa3e33e67806420b2ae89bdce2b04af740289c5c6c8c/loguru-0.7.3-py3-none-any.whl", hash = "sha256:31a33c10c8e1e10422bfd431aeb5d351c7cf7fa671e3c4df004162264b28220c", size = 61595, upload-time = "2024-12-06T11:20:54.538Z" },
+]
+
+[[package]]
+name = "mistune"
+version = "3.3.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/7b/92/328a294a6de83bacb95bed01f04e0eaff4e3616ee359fc821a5dfc539b02/mistune-3.3.4.tar.gz", hash = "sha256:58b5c96d6fcb61190dfe5fae498d2b2065f99cf61e9649418fd54cf1ada86dfe", size = 121426, upload-time = "2026-07-22T05:22:30.89Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/77/e4/288365afae98953bc01de09f686f40d8ee84578135aa7767d5d4e60b5278/mistune-3.3.4-py3-none-any.whl", hash = "sha256:ee015381e955e370962968befe1d729ab60fafb6a715ac6751763fbce38c8d4a", size = 66862, upload-time = "2026-07-22T05:22:29.419Z" },
 ]
 
 [[package]]

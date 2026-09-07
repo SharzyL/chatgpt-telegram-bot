@@ -1,0 +1,120 @@
+"""Turning a markdown reply into Telegram message bodies.
+
+Two renderers exist because Telegram offers two ways to show formatted text, and they
+differ in more than the request field they fill:
+
+- `ServerMarkdownRenderer` ships markdown source and lets Telegram render it. Headings,
+  tables, horizontal rules and LaTeX math all survive, and a body may be 32768 characters,
+  but the rendering is the server's and cannot be inspected or corrected.
+- `EntityRenderer` renders on the client into message entities. Only what an entity can
+  express survives — no tables, no math — and a body is capped at 4096 characters.
+
+Because one splits markdown *source* and the other splits *rendered* text, a long reply is
+cut differently in each mode. Both are hidden behind `Renderer.render()`, which hands back
+ready message bodies, so callers never branch on the mode.
+"""
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, override
+
+from chatgpt_telegram_bot.richtext import RichText
+from chatgpt_telegram_bot.utils import neutralize_images, split_markdown, telegram_len, telegram_truncate
+
+# a plain message body, and the `message` field of a rich one, are capped here
+PLAIN_LENGTH_LIMIT = 4096
+
+# rich messages are rendered server-side; the server rejects a longer rendered body with
+# RICH_MESSAGE_TEXT_TOO_LONG
+RICH_LENGTH_LIMIT = 32768
+
+
+@dataclass
+class Rendered:
+    """One message body, ready to hand to Telegram."""
+
+    text: str
+    entities: list[Any] = field(default_factory=list)
+    rich_markdown: str | None = None
+
+
+class Renderer(ABC):
+    """Cuts a markdown reply into message bodies that Telegram will accept."""
+
+    limit: int
+
+    @abstractmethod
+    def render(self, markdown: str, prefix: str = '') -> list[Rendered]:
+        """
+        Bodies for *markdown*, with *prefix* prepended to the first one.
+
+        Always returns at least one body, so an empty reply still has a message to occupy.
+        """
+
+    def render_one(self, markdown: str) -> Rendered:
+        """The first body only, for the bot's own short messages."""
+        return self.render(markdown)[0]
+
+
+class ServerMarkdownRenderer(Renderer):
+    """Sends markdown source for Telegram to render."""
+
+    limit: int = RICH_LENGTH_LIMIT
+
+    @override
+    def render(self, markdown: str, prefix: str = '') -> list[Rendered]:
+        # an image would be read as a photo block and rejected for having no media
+        markdown = neutralize_images(markdown)
+        # the prefix is kept out of the split so that its length is charged to the first
+        # body only, and so a growing reply re-splits the same way each time
+        slices = split_markdown(markdown, self.limit - telegram_len(prefix), self.limit) or ['']
+        bodies: list[Rendered] = []
+        for i, piece in enumerate(slices):
+            source = prefix + piece if i == 0 else piece
+            # the `message` field is required by the schema even though the server discards
+            # it, so it is sent as a truncated copy of the markdown
+            bodies.append(Rendered(text=telegram_truncate(source, PLAIN_LENGTH_LIMIT), rich_markdown=source))
+        return bodies
+
+
+class EntityRenderer(Renderer):
+    """Renders markdown to message entities on the client."""
+
+    limit: int = PLAIN_LENGTH_LIMIT
+
+    @override
+    def render(self, markdown: str, prefix: str = '') -> list[Rendered]:
+        # the prefix is part of the document here: it is formatted markdown too, and
+        # slicing the rendered result places it at the head of the first body for free
+        rich = RichText.from_markdown(prefix + markdown)
+        bodies: list[Rendered] = []
+        while len(rich) > 0:
+            head, rich = self._take(rich, self.limit)
+            text, entities = head.to_telegram()
+            bodies.append(Rendered(text=text, entities=entities))
+        if not bodies:
+            bodies.append(Rendered(text=''))
+        return bodies
+
+    @staticmethod
+    def _take(rich: RichText, budget: int) -> tuple[RichText, RichText]:
+        """
+        Cut at most *budget* UTF-16 units off the front of *rich*.
+
+        RichText indexes by character while Telegram counts UTF-16 units, so a slice of
+        *budget* characters can still be too long once astral characters are involved.
+        Shrink until it fits rather than let the server reject the message.
+        """
+        chars = min(budget, len(rich))
+        while chars > 1:
+            text, _ = rich[:chars].to_telegram()
+            excess = telegram_len(text) - budget
+            if excess <= 0:
+                break
+            chars -= excess
+        chars = max(chars, 1)
+        return rich[:chars], rich[chars:]
+
+
+SERVER_MARKDOWN_RENDERER = ServerMarkdownRenderer()
+ENTITY_RENDERER = EntityRenderer()

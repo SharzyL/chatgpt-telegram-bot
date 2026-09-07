@@ -597,7 +597,8 @@ class ChatGPTTelegramBot:
                     if usage:
                         ttft = (first_token_time or stream_end) - stream_start
                         usage['TTFT'] = f'{ttft:.1f}s'
-                        out_tokens = (usage.get('out') or 0) + (usage.get('reasoning') or 0)
+                        # reasoning tokens are a breakdown of the output total, not an addition to it
+                        out_tokens = usage.get('out') or 0
                         if out_tokens and first_token_time:
                             gen_duration = stream_end - first_token_time
                             if gen_duration > 0:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from chatgpt_telegram_bot.render import (
     ENTITY_RENDERER,
     PLAIN_LENGTH_LIMIT,
@@ -172,3 +174,33 @@ class TestImageNeutralization:
         body = ENTITY_RENDERER.render('![a cat](http://x/c.png)')[0]
         assert body.text == 'a cat'
         assert [type(e).__name__ for e in body.entities] == ['MessageEntityTextUrl']
+
+
+class TestCollapsibleQuotes:
+    """A blockquote folds in the clients only when its entity carries `collapsed`."""
+
+    @staticmethod
+    def quotes(body: Rendered) -> list[Any]:
+        return [e for e in body.entities if type(e).__name__ == 'MessageEntityBlockquote']
+
+    def test_long_quote_is_collapsed(self):
+        body = ENTITY_RENDERER.render('> ' + 'reasoning at length. ' * 40)[0]
+        assert [e.collapsed for e in self.quotes(body)] == [True]
+
+    def test_short_quote_stays_open(self):
+        body = ENTITY_RENDERER.render('> brief thought')[0]
+        assert [e.collapsed for e in self.quotes(body)] == [None]
+
+    def test_thinking_folds_while_the_usage_footer_stays_open(self):
+        source = format_reply('Reasoning at length. ' * 40, 'The answer.', True, usage={'in': 84, 'out': 44})
+        found = self.quotes(ENTITY_RENDERER.render(source, PREFIX)[0])
+        assert len(found) == 2
+        thinking, footer = found
+        assert thinking.collapsed is True
+        assert footer.collapsed is None
+        assert thinking.length > footer.length
+
+    def test_a_collapsed_quote_split_across_bodies_stays_collapsed(self):
+        bodies = ENTITY_RENDERER.render(format_reply('Reasoning step. ' * 900, 'Answer.', True), PREFIX)
+        assert len(bodies) > 1
+        assert all(e.collapsed is True for b in bodies for e in self.quotes(b))

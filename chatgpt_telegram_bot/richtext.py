@@ -7,6 +7,11 @@ from telethon import types
 
 _md_parser = mistune.create_markdown(renderer='ast', plugins=['strikethrough'])
 
+# A quote longer than this is sent collapsed, so a long chain of thought folds away instead
+# of burying the answer. Short quotes -- the usage footer above all -- stay open, since
+# hiding two lines of token counts behind a tap would be worse than showing them.
+COLLAPSE_BLOCKQUOTE_OVER = 300
+
 
 class RichText:
     def __init__(self, s: str | RichText | list[dict[str, Any]]) -> None:
@@ -53,8 +58,8 @@ class RichText:
         return RichText([{'type': 'href', 'content': RichText(s), 'url': url}])
 
     @classmethod
-    def Blockquote(cls, s: str | RichText) -> RichText:
-        return RichText([{'type': 'blockquote', 'content': RichText(s)}])
+    def Blockquote(cls, s: str | RichText, collapsed: bool = False) -> RichText:
+        return RichText([{'type': 'blockquote', 'content': RichText(s), 'collapsed': collapsed}])
 
     def __len__(self) -> int:
         return sum(len(c['content']) for c in self.children)
@@ -189,7 +194,10 @@ class RichText:
                 entities.extend(e)
                 t_len = utf16len(t)
                 if t_len:
-                    entities.append(types.MessageEntityBlockquote(offset, t_len))
+                    # `collapsed` is what makes a quote foldable in the clients; it is left
+                    # unset rather than False so the flag is simply absent when not wanted
+                    collapsed = c.get('collapsed') or None
+                    entities.append(types.MessageEntityBlockquote(offset, t_len, collapsed=collapsed))
                 offset += t_len
         return text, entities
 
@@ -224,7 +232,8 @@ def _render_node(node: dict[str, Any]) -> RichText:
         children = _render_children(node)
         return RichText.Href(children if len(children) > 0 else RichText(url), url)
     elif t == 'block_quote':
-        return RichText.Blockquote(_render_blocks(node.get('children') or []))
+        content = _render_blocks(node.get('children') or [])
+        return RichText.Blockquote(content, collapsed=len(content) > COLLAPSE_BLOCKQUOTE_OVER)
     elif t == 'list':
         return _render_list(node)
     elif t in ('softbreak', 'hardbreak'):

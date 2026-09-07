@@ -143,7 +143,7 @@ class ChatGPTTelegramBot:
             else:
                 raise ValueError(f'Unknown api_type: {api_type}')
 
-        self.TELEGRAM_MIN_INTERVAL: float = 1.0
+        self.TELEGRAM_MIN_INTERVAL: float = 1.5
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
         self.TEXT_FILE_SIZE_LIMIT: int = 100_000

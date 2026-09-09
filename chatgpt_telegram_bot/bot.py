@@ -146,7 +146,7 @@ class ChatGPTTelegramBot:
         self.TELEGRAM_MIN_INTERVAL: float = 1.5
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
-        self.TEXT_FILE_SIZE_LIMIT: int = 100_000
+        self.TEXT_FILE_SIZE_LIMIT: int = 900_000
 
         self.pending_reply_manager: PendingReplyManager = PendingReplyManager()
 

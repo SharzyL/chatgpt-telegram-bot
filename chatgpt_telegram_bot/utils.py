@@ -323,9 +323,26 @@ def _open_fence(text: str) -> tuple[str, str] | None:
     opener: tuple[str, str] | None = None
     for line in text.split('\n'):
         m = _FENCE_LINE_RE.match(line)
-        if m:
-            opener = None if opener else (m.group(1), m.group(2))
+        if not m:
+            continue
+        quote, fence = m.group(1), m.group(2)
+        if opener is None:
+            opener = (quote, fence)
+        elif opener[0] == quote:
+            # only a fence at the same blockquote depth closes the block: a fence inside a
+            # quoted thinking block and one in the reply below it are different code blocks,
+            # and pairing them across the boundary reopens a `>` fence over the reply
+            opener = None
     return opener
+
+
+def balance_fences(text: str) -> str:
+    """Close a code fence *text* leaves open, so it cannot swallow what follows it."""
+    fence = _open_fence(text)
+    if fence is None:
+        return text
+    quote, _ = fence
+    return text + '\n' + quote + '```'
 
 
 def _cut_at(text: str, at: int) -> tuple[str, str]:

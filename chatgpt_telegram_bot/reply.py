@@ -1,6 +1,6 @@
 from typing import Any
 
-from chatgpt_telegram_bot.utils import normalize_math
+from chatgpt_telegram_bot.utils import balance_fences, normalize_math
 
 
 def _blockquote_markdown(text: str) -> str:
@@ -26,13 +26,18 @@ def format_reply(
     if not thinking_done:
         if not thinking:
             return suffix.strip()
-        return _blockquote_markdown(thinking + suffix)
+        return _blockquote_markdown(balance_fences(thinking) + suffix)
     result = ''
     if thinking:
-        result = _blockquote_markdown(thinking.rstrip('\n'))
+        # a fence the thinking leaves open would run past the quote and take the answer
+        # into the code block with it, and a cut reopens that fence — with its `>` prefix —
+        # at the head of the next part, quoting everything below
+        result = _blockquote_markdown(balance_fences(thinking.rstrip('\n')))
     if reply or suffix:
         sep = '\n\n' if thinking else ''
-        result = result + sep + reply + suffix
+        # the footer sits below the reply and needs the same protection
+        body = balance_fences(reply) if (tool_calls or usage) else reply
+        result = result + sep + body + suffix
     if tool_calls or usage:
         footer = ''
         if tool_calls:

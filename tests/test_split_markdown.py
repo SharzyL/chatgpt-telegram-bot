@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from chatgpt_telegram_bot.utils import split_markdown, telegram_len
+from chatgpt_telegram_bot.utils import balance_fences, split_markdown, telegram_len
 
 
 def test_short_text_is_one_part():
@@ -96,3 +96,19 @@ def test_blockquoted_fence_is_balanced():
         assert len(fences) % 2 == 0, p
     # the reopened fence stays inside the blockquote
     assert parts[1].startswith('>```python')
+
+
+def test_quoted_fence_is_not_closed_by_one_below_the_quote():
+    # a fence inside the thinking block and one in the reply are different code blocks;
+    # pairing them across the boundary left the quoted one looking closed
+    text = '>thinking\n>```python\n>x = 1\n\nAnswer:\n\n```py\nprint(1)\n```'
+    assert balance_fences(text) == text + '\n>```'
+
+
+def test_a_fence_is_closed_at_its_own_blockquote_depth():
+    assert balance_fences('>a\n>```\n>b') == '>a\n>```\n>b\n>```'
+    assert balance_fences('a\n```\nb') == 'a\n```\nb\n```'
+
+
+def test_balanced_fences_are_left_untouched():
+    assert balance_fences('>a\n>```\n>b\n>```') == '>a\n>```\n>b\n>```'

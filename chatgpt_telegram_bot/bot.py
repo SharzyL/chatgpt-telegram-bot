@@ -333,14 +333,16 @@ class ChatGPTTelegramBot:
             if msg_info is None:
                 raise RuntimeError(f'MsgInfo not found ({chat_id=}, {cur_msg_id=}, {msg_id=})')
 
-            # infer the model and endpoint from the first replied msg
-            if msg_info.prefix:
+            # the walk runs newest to oldest, so the first prefix found is the most recent
+            # one the user named; an earlier prefix only applies until a reply replaces it
+            if model_of_history is None and msg_info.prefix:
                 for model in self.models:
                     if model.prefix == msg_info.prefix:
                         overrides = getattr(msg_info, 'overrides', None) or {}
                         model_of_history = apply_overrides(model, overrides)
 
-            if msg_info.system_prompt is not None:
+            # likewise for the prompt, which a switch of model brings along with it
+            if system_prompt is None and msg_info.system_prompt is not None:
                 system_prompt = msg_info.system_prompt
 
             if msg_info.sent_by_bot != should_be_bot:
@@ -391,6 +393,7 @@ class ChatGPTTelegramBot:
         lines.append('  The stored reply becomes yours, and later turns build on it.')
         lines.append('')
         lines.append('Reply to a bot message to continue the conversation.')
+        lines.append('A prefix on that reply switches the model from there on.')
         lines.append('')
         lines.append(f'<b>Default system prompt</b>\n<code>{html_escape(self.system_prompt)}</code>')
         lines.append('')
@@ -519,7 +522,7 @@ class ChatGPTTelegramBot:
             _ = await self.send_message(chat_id, MANIPULATE_USAGE, msg_id)
             return
 
-        # the model is only recorded at the head of the chain, so resolve it from there
+        # the model may have been switched part-way down the chain, so resolve it there
         try:
             _, model, _ = self.construct_chat_history(chat_id, target_info.reply_id)
         except RuntimeError as e:
@@ -590,22 +593,27 @@ class ChatGPTTelegramBot:
             else:
                 return
 
+        # a message that opens a thread has no model unless its prefix names one, so a
+        # missing prefix is an error there; on a reply the prefix is optional and switches
+        # the model for this turn and the ones after it
+        opens_thread = not message.is_reply or extra_photo_message is not None or extra_document_message is not None
         overrides: dict[str, str | None] = {}
-        if not message.is_reply or extra_photo_message is not None or extra_document_message is not None:  # new message
-            for m in self.models:
-                match = match_prefix(text, m.prefix)
-                if match is not None:
-                    text, overrides = match
-                    try:
-                        model_by_prefix = apply_overrides(m, overrides)
-                    except ValueError as e:
-                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
-                        return
-                    break
-            else:  # no matching prefix
+        for m in self.models:
+            match = match_prefix(text, m.prefix)
+            if match is not None:
+                text, overrides = match
+                try:
+                    model_by_prefix = apply_overrides(m, overrides)
+                except ValueError as e:
+                    _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+                    return
+                break
+        else:  # no matching prefix
+            if opens_thread:
                 if chat_id == sender_id:  # in private chat, show help with error
                     await self.help_handler(message, error='Unknown prefix. Use one of the prefixes below.')
                 return
+            # continuing a thread: model and prompt carry over from the message replied to
 
         photo_message = message if message.photo is not None else extra_photo_message
         photo_hash = None
@@ -655,7 +663,8 @@ class ChatGPTTelegramBot:
                 base + '\n' + self._format_system_prompt(model_by_prefix.system_prompt_append, model_by_prefix.name)
             )
 
-        # note that prefix and system_prompt are None when reply_id is not None
+        # prefix and system_prompt stay None on a reply that named no model, which is what
+        # lets construct_chat_history fall back to the ones already in the chain
         self.set_msg_info(
             chat_id,
             msg_id,
@@ -837,19 +846,21 @@ class ChatGPTTelegramBot:
             else:
                 return
 
+        # as in reply_handler: naming a model is required to open a thread, optional to
+        # continue one, and switches the model for this turn and the ones after it
         overrides: dict[str, str | None] = {}
-        if not event.is_reply:
-            for m in self.models:
-                match = match_prefix(text, m.prefix)
-                if match is not None:
-                    text, overrides = match
-                    try:
-                        model_by_prefix = apply_overrides(m, overrides)
-                    except ValueError as e:
-                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
-                        return
-                    break
-            else:
+        for m in self.models:
+            match = match_prefix(text, m.prefix)
+            if match is not None:
+                text, overrides = match
+                try:
+                    model_by_prefix = apply_overrides(m, overrides)
+                except ValueError as e:
+                    _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+                    return
+                break
+        else:
+            if not event.is_reply:
                 if chat_id == sender_id:
                     _ = await self.send_message(
                         chat_id,

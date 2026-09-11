@@ -232,6 +232,44 @@ class PendingReplyManager:
         logger.info('PendingReplyManager waiting for %r finished', reply_id)
 
 
+class EditThrottle:
+    """Token bucket over streaming message edits.
+
+    A reply that keeps streaming settles at one edit per *interval*, which is what
+    Telegram's own rate limit cares about. A short one may edit every *burst_interval*
+    instead, paid for out of a bucket that starts full and refills at ``1 / interval``.
+    The capacity is derived from *burst_window*: it is exactly the number of extra edits
+    a burst of that length spends over what refilling covers, so a flow shorter than the
+    window never leaves burst speed and a longer one decays to *interval* on its own.
+
+    Time is passed in rather than read, so the schedule is testable.
+    """
+
+    def __init__(self, interval: float, burst_interval: float, burst_window: float) -> None:
+        self.interval: float = interval
+        self.burst_interval: float = burst_interval
+        # spending one token every burst_interval while refilling one every interval
+        self.capacity: float = max(1.0, burst_window * (1 / burst_interval - 1 / interval))
+        self.tokens: float = self.capacity
+        self.refilled: float | None = None
+        self.last_flush: float | None = None
+
+    def take(self, now: float) -> bool:
+        """Whether an edit may be sent now; consumes a token when it may."""
+        if self.refilled is None:
+            self.refilled = now
+        self.tokens = min(self.capacity, self.tokens + (now - self.refilled) / self.interval)
+        self.refilled = now
+        if self.tokens < 1.0 or (self.last_flush is not None and now - self.last_flush < self.burst_interval):
+            return False
+        self.tokens -= 1.0
+        return True
+
+    def flushed(self, now: float) -> None:
+        """Record that an edit finished; spacing is measured from here, not from take()."""
+        self.last_flush = now
+
+
 def save_photo(cache: diskcache.Cache, photo_blob: bytes, chat_id: int, msg_id: int) -> str:
     key = f'{chat_id}:{msg_id}'
     _ = cache.set(key, photo_blob)

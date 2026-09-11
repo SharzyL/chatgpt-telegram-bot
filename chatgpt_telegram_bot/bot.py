@@ -37,6 +37,7 @@ from chatgpt_telegram_bot.models import (
 from chatgpt_telegram_bot.render import ENTITY_RENDERER, SERVER_MARKDOWN_RENDERER, Rendered, Renderer
 from chatgpt_telegram_bot.reply import format_reply
 from chatgpt_telegram_bot.utils import (
+    EditThrottle,
     PendingReplyManager,
     apply_overrides,
     load_photo,
@@ -143,7 +144,11 @@ class ChatGPTTelegramBot:
             else:
                 raise ValueError(f'Unknown api_type: {api_type}')
 
-        self.TELEGRAM_MIN_INTERVAL: float = 1.5
+        # a streaming reply settles at one edit per TELEGRAM_MIN_INTERVAL; the first
+        # TELEGRAM_BURST_WINDOW seconds may go at TELEGRAM_BURST_INTERVAL instead
+        self.TELEGRAM_MIN_INTERVAL: float = 3.0
+        self.TELEGRAM_BURST_INTERVAL: float = 1.0
+        self.TELEGRAM_BURST_WINDOW: float = 15.0
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
         self.TEXT_FILE_SIZE_LIMIT: int = 900_000
@@ -917,7 +922,9 @@ class BotReplyMessages:
         self.replied_msgs: list[tuple[int, Rendered]] = []
         self.text: str = ''
         self.collapse_first_quote: bool = False
-        self.last_update_time: float = 0.0
+        self.throttle: EditThrottle = EditThrottle(
+            cbot.TELEGRAM_MIN_INTERVAL, cbot.TELEGRAM_BURST_INTERVAL, cbot.TELEGRAM_BURST_WINDOW
+        )
 
     async def __aenter__(self) -> Self:
         return self
@@ -967,11 +974,11 @@ class BotReplyMessages:
     async def update(self, text: str, collapse_first_quote: bool = False) -> None:
         self.text = text
         self.collapse_first_quote = collapse_first_quote
-        if time.time() - self.last_update_time >= self.cbot.TELEGRAM_MIN_INTERVAL:
+        if self.throttle.take(time.time()):
             await self._force_update(self.text)
             # timed from the end of the flush: one tick can edit several messages when a
             # cut shifts, and starting the clock before that would shorten the next gap
-            self.last_update_time = time.time()
+            self.throttle.flushed(time.time())
 
     async def finalize(self) -> None:
         await self._force_update(self.text)

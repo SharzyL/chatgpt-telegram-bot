@@ -42,12 +42,15 @@ from chatgpt_telegram_bot.utils import (
     Throttle,
     apply_overrides,
     decode_text_file,
+    export_filename,
+    format_export,
     load_photo,
     match_prefix,
     message_link,
     parse_import,
     parse_manipulation,
     parse_proxy,
+    preview_line,
     replace_text_part,
     replied_message_id,
     retry,
@@ -79,9 +82,17 @@ BOT_COMMANDS = [
     ('regenerate', 'Answer the replied-to prompt again'),
     ('abort', 'Stop whatever is generating in this chat'),
     ('navigate', 'List the turns of the replied-to thread'),
+    ('export', 'Save the replied-to thread as JSON'),
     ('manipulate', 'Rewrite the replied-to bot reply'),
     ('import', 'Replay a conversation from a JSON export'),
 ]
+
+EXPORT_USAGE = """[!] `/export` saves a thread as JSON, so it has to reply to a message in one.
+
+`/export` — titled after the first prompt
+`/export <title>` — with that title
+
+The file is in the format `/import` reads. Reply to a bot message to include its answer."""
 
 NAVIGATE_USAGE = """[!] `/navigate` lists the turns of a thread, so it has to reply to a message in one.
 
@@ -283,6 +294,9 @@ class ChatGPTTelegramBot:
                 await self.abort_handler(event.message)
             elif text == '/navigate' or text == f'/navigate@{me.username}':
                 await self.navigate_handler(event.message)
+            elif command in ('/export', f'/export@{me.username}'):
+                body = command_parts[1] if len(command_parts) > 1 else ''
+                await self.export_handler(event.message, body)
             else:
                 await self.reply_handler(event.message)
 
@@ -469,6 +483,7 @@ class ChatGPTTelegramBot:
         lines.append('  The reply is written over in place.')
         lines.append('  <code>/abort</code> stops whatever is generating in this chat.')
         lines.append('  <code>/navigate</code> lists the turns of the replied-to thread.')
+        lines.append('  <code>/export [title]</code> saves it as JSON that <code>/import</code> reads.')
         lines.append('')
         lines.append('<b>Manipulation</b>')
         lines.append('  Reply to a bot message with:')
@@ -546,6 +561,23 @@ class ChatGPTTelegramBot:
             buttons=buttons,
         )
         logger.debug(f'Message sent: {chat_id=}, {reply_to_message_id=}, {msg.id=}')
+        return msg.id
+
+    @retry()
+    async def send_document(
+        self, chat_id: int, data: bytes, filename: str, caption: str, reply_to_message_id: int
+    ) -> int:
+        logger.debug(f'Sending document: {chat_id=}, {reply_to_message_id=}, {filename=}, bytes={len(data)}')
+        # a single file comes back as one Message; only an album would be a list
+        msg: Any = await self.bot.send_file(
+            chat_id,
+            file=data,
+            caption=caption,
+            reply_to=reply_to_message_id,
+            force_document=True,
+            mime_type='application/json',
+            attributes=[types.DocumentAttributeFilename(filename)],
+        )
         return msg.id
 
     @retry()
@@ -765,23 +797,30 @@ class ChatGPTTelegramBot:
 
         logger.info(f'Imported {chat_id=}, {msg_id=}, title={chat.title!r}, turns={len(chat.turns)}')
 
-    def _thread_turns(self, chat_id: int, anchor_id: int) -> list[ThreadTurn] | None:
-        """The turns of the thread ending at *anchor_id*, oldest first, or None if it is not stored.
+    def _thread_chain(self, chat_id: int, anchor_id: int) -> list[tuple[int, MsgInfo]] | None:
+        """The stored nodes of the thread ending at *anchor_id*, oldest first; None if it is not stored.
 
         The walk goes backwards through reply_id, so it sees only the branch that leads to the
-        anchor: anchored on a prompt, that prompt's own answer is not part of it.
+        anchor: anchored on a prompt, that prompt's own answer is not part of it. A missing link
+        or a loop in damaged data ends the walk early, leaving a chain whose first node still
+        has a reply_id -- which is how a caller that needs the whole thread can tell.
         """
         chain: list[tuple[int, MsgInfo]] = []
         seen: set[int] = set()
         cur: int | None = anchor_id
         while cur is not None:
             info = self.get_msg_info(chat_id, cur)
-            if info is None or cur in seen:  # a missing link, or a loop in damaged data
-                return None if not chain else self._turns_of(chain[::-1])
+            if info is None or cur in seen:
+                break
             seen.add(cur)
             chain.append((cur, info))
             cur = info.reply_id
-        return self._turns_of(chain[::-1])
+        return chain[::-1] or None
+
+    def _thread_turns(self, chat_id: int, anchor_id: int) -> list[ThreadTurn] | None:
+        """The turns of the thread ending at *anchor_id*, oldest first, or None if it is not stored."""
+        chain = self._thread_chain(chat_id, anchor_id)
+        return self._turns_of(chain) if chain is not None else None
 
     @staticmethod
     def _turns_of(chain: list[tuple[int, MsgInfo]]) -> list[ThreadTurn]:
@@ -864,6 +903,63 @@ class ChatGPTTelegramBot:
         except errors.MessageNotModifiedError:
             pass
         await event.answer()
+
+    @staticmethod
+    def _export_content(info: MsgInfo) -> str:
+        """A node's text as an export carries it: the answer only, and a marker for an image."""
+        text = next((p.text for p in info.message if p.type_ == 'text' and p.text), '')
+        if not info.sent_by_bot and any(p.type_ == 'image' for p in info.message):
+            return '[image]' + ('\n\n' + text if text else '')
+        return text
+
+    async def _message_dates(self, chat_id: int, msg_ids: list[int]) -> dict[int, datetime.datetime]:
+        """When each message was sent, for those Telegram still has; an export's timestamps."""
+        if not msg_ids:
+            return {}
+        try:
+            found: Any = await self.bot.get_messages(chat_id, ids=msg_ids)
+        except Exception:  # noqa: BLE001  # timestamps are optional; a failed lookup only drops them
+            logger.warning(f'Could not fetch message dates for export ({chat_id=})')
+            return {}
+        return {m.id: m.date for m in found if m is not None and m.date is not None}
+
+    @only_allowed
+    async def export_handler(self, message: Any, body: str) -> None:
+        """Send the replied-to thread as a JSON file that /import can read back."""
+        chat_id = message.chat_id
+        msg_id = message.id
+        anchor_id = replied_message_id(message)
+        if anchor_id is None:
+            _ = await self.send_message(chat_id, EXPORT_USAGE, msg_id)
+            return
+        # a reply still streaming has no MsgInfo yet
+        await self.pending_reply_manager.wait_for((chat_id, anchor_id))
+        chain = self._thread_chain(chat_id, anchor_id)
+        if chain is None:
+            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
+            return
+        first = chain[0][1]
+        if first.reply_id is not None or first.sent_by_bot:
+            # a partial thread would start mid-conversation, which /import refuses
+            _ = await self.send_message(chat_id, '[!] Part of that thread is no longer stored', msg_id)
+            return
+
+        # an imported prompt lives under a negative id and was never a message, so it has no date
+        dates = await self._message_dates(chat_id, [mid for mid, _ in chain if mid > 0])
+        messages = [
+            ('assistant' if info.sent_by_bot else 'user', self._export_content(info), dates.get(mid))
+            for mid, info in chain
+        ]
+        title = body.strip() or preview_line(messages[0][1], 40) or 'Untitled'
+        document = format_export(title, messages, datetime.datetime.now(datetime.UTC)).encode()
+
+        caption = f'Exported "{title}" — {len(messages)} messages'
+        if len(document) > self.TEXT_FILE_SIZE_LIMIT:
+            caption += (
+                f'\nAt {len(document) // 1000} KB it is over the {self.TEXT_FILE_SIZE_LIMIT // 1000} KB /import limit.'
+            )
+        _ = await self.send_document(chat_id, document, export_filename(title), caption, msg_id)
+        logger.info(f'Exported {chat_id=}, {anchor_id=}, messages={len(messages)}, bytes={len(document)}')
 
     @only_allowed
     async def abort_handler(self, message: Any) -> None:

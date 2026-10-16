@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -257,6 +258,40 @@ def parse_import(text: str) -> ImportedChat:
     if not turns:
         raise ValueError('File has no complete prompt-and-response turn')
     return ImportedChat(title=title.replace('\n', ' '), turns=turns, trailing_prompt=prompt)
+
+
+def _iso_timestamp(moment: datetime.datetime) -> str:
+    """UTC with milliseconds and a Z, which is how the exports /import reads write their times."""
+    return moment.astimezone(datetime.UTC).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+
+def format_export(
+    title: str, messages: list[tuple[str, str, datetime.datetime | None]], exported_at: datetime.datetime
+) -> str:
+    """A thread as JSON in the shape parse_import reads, so an export can be imported back.
+
+    *messages* is (role, content, sent at) oldest first; a message with no known time gets no
+    timestamp field, which parse_import does not need anyway.
+    """
+    entries: list[dict[str, str]] = []
+    for role, content, sent_at in messages:
+        entry = {'role': role, 'content': content}
+        if sent_at is not None:
+            entry['timestamp'] = _iso_timestamp(sent_at)
+        entries.append(entry)
+    document = {'title': title, 'exportedAt': _iso_timestamp(exported_at), 'messages': entries}
+    return json.dumps(document, ensure_ascii=False, indent=2) + '\n'
+
+
+# characters a filename cannot hold on one platform or another
+_UNSAFE_FILENAME_RE = re.compile(r'[\x00-\x1f/\\:*?"<>|]+')
+
+
+def export_filename(title: str, limit: int = 60) -> str:
+    """A filename for an exported thread, from its title; `thread.json` if nothing usable is left."""
+    stem = _UNSAFE_FILENAME_RE.sub(' ', title)
+    stem = ' '.join(stem.split())[:limit].strip(' .')
+    return f'{stem or "thread"}.json'
 
 
 def decode_text_file(blob: bytes) -> str | None:

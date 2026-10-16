@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,7 @@ from chatgpt_telegram_bot.models import (
     OVERRIDE_ALIASES,
     ImportedChat,
     Model,
+    MsgInfo,
     MsgPartInHistory,
     make_text_part,
 )
@@ -349,6 +351,60 @@ def message_link(chat_id: int, msg_id: int) -> str | None:
     if not peer.startswith('-100') or msg_id <= 0:
         return None
     return f'https://t.me/c/{peer[4:]}/{msg_id}'
+
+
+def linearize_plan(nodes: dict[int, MsgInfo], anchor_id: int) -> tuple[set[int], set[int]] | None:
+    """Split the tree holding *anchor_id* into the node ids to keep and the ones to delete.
+
+    *nodes* is every stored node of one chat, by id. What is kept is the path from the first
+    message down to the anchor, as whole turns: a prompt on the path keeps every part of its
+    answer -- a split reply is stored under several ids that all name the prompt -- and so does
+    the anchor when it is a prompt. Everything else rooted at the same first message is
+    deleted, including whatever came after the anchor. Other trees in the chat are untouched.
+    None when the anchor is not stored, or its chain loops.
+    """
+    if anchor_id not in nodes:
+        return None
+    roots: dict[int, int | None] = {}
+
+    def root_of(start: int) -> int | None:
+        trail: list[int] = []
+        cur = start
+        while True:
+            if cur in roots:
+                result = roots[cur]
+                break
+            if cur in trail:  # a loop in damaged data has no root
+                result = None
+                break
+            trail.append(cur)
+            parent = nodes[cur].reply_id
+            if parent is None or parent not in nodes:
+                # the topmost stored node; a missing parent makes it the root of what is left
+                result = cur
+                break
+            cur = parent
+        for visited in trail:
+            roots[visited] = result
+        return result
+
+    root = root_of(anchor_id)
+    if root is None:
+        return None
+    keep: set[int] = set()
+    cur: int | None = anchor_id
+    while cur is not None and cur in nodes and cur not in keep:
+        keep.add(cur)
+        cur = nodes[cur].reply_id
+    tree = {n for n in nodes if root_of(n) == root}
+    prompts = {n for n in keep if not nodes[n].sent_by_bot}
+    keep |= {n for n in tree if nodes[n].sent_by_bot and nodes[n].reply_id in prompts}
+    return keep, tree - keep
+
+
+def plan_digest(ids: set[int]) -> str:
+    """A short fingerprint of a set of ids, so a confirmation can tell the plan has changed."""
+    return hashlib.sha1(','.join(map(str, sorted(ids))).encode()).hexdigest()[:8]
 
 
 def replace_text_part(parts: list[MsgPartInHistory], text: str) -> list[MsgPartInHistory]:

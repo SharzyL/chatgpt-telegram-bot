@@ -2,7 +2,7 @@ from collections.abc import Callable
 from html import escape as html_escape
 from typing import Any
 
-from chatgpt_telegram_bot.models import ThreadTurn
+from chatgpt_telegram_bot.models import MsgInfo, ThreadTurn
 from chatgpt_telegram_bot.utils import balance_fences, normalize_math, preview_line
 
 
@@ -82,3 +82,29 @@ def format_navigation_page(
             answer = f'<a href="{html_escape(url)}">{answer}</a>'
         lines.append(f'      🤖 {answer}')
     return '\n'.join(lines), page, pages
+
+
+def format_linearize_listing(nodes: dict[int, MsgInfo], delete: set[int], width: int, limit: int) -> tuple[str, int]:
+    """What a /linearize would delete, as HTML lines, with the number of messages it comes to.
+
+    Only real messages are listed: the negative id of an imported prompt was never one, and
+    its text is inside the message that showed its turn. A split answer is one line with its
+    part count, since every part holds the same stored text. At most *limit* lines are shown.
+    """
+    groups: dict[tuple[bool, int | None, int], list[int]] = {}
+    for mid in sorted(n for n in delete if n > 0):
+        info = nodes[mid]
+        # parts of one answer share their prompt; anything else stands alone
+        key = (True, info.reply_id, 0) if info.sent_by_bot else (False, None, mid)
+        groups.setdefault(key, []).append(mid)
+    lines: list[str] = []
+    for (is_bot, _, _), mids in sorted(groups.items(), key=lambda item: item[1][0]):
+        info = nodes[mids[0]]
+        text = next((p.text for p in info.message if p.type_ == 'text' and p.text), '')
+        line = f'{"🤖" if is_bot else "👤"} {html_escape(preview_line(text, width))}'
+        if len(mids) > 1:
+            line += f' <i>({len(mids)} messages)</i>'
+        lines.append(line)
+    if len(lines) > limit:
+        lines = lines[:limit] + [f'<i>…and {len(lines) - limit} more</i>']
+    return '\n'.join(lines), sum(len(m) for m in groups.values())

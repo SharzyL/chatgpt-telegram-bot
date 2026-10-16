@@ -99,6 +99,9 @@ Commands:
   buttons; in a supergroup each answer links to its message
 - `/export`, or `/export <title>` — reply to a message to save its thread as JSON in the format
   `/import` reads
+- `/linearize` — reply to a message to delete every other branch of its thread, keeping the line
+  down to it; lists what will go and asks you to confirm. In a group the bot needs delete
+  rights to remove other people's messages
 
 Attach a photo or a UTF-8 text file to a message, with or without a caption; you can also
 reply to someone else's photo or file to feed it to a model.

@@ -36,7 +36,12 @@ from chatgpt_telegram_bot.models import (
     make_thinking_text_part,
 )
 from chatgpt_telegram_bot.render import ENTITY_RENDERER, SERVER_MARKDOWN_RENDERER, Rendered, Renderer
-from chatgpt_telegram_bot.reply import format_imported_turn, format_navigation_page, format_reply
+from chatgpt_telegram_bot.reply import (
+    format_imported_turn,
+    format_linearize_listing,
+    format_navigation_page,
+    format_reply,
+)
 from chatgpt_telegram_bot.utils import (
     PendingReplyManager,
     Throttle,
@@ -44,12 +49,14 @@ from chatgpt_telegram_bot.utils import (
     decode_text_file,
     export_filename,
     format_export,
+    linearize_plan,
     load_photo,
     match_prefix,
     message_link,
     parse_import,
     parse_manipulation,
     parse_proxy,
+    plan_digest,
     preview_line,
     replace_text_part,
     replied_message_id,
@@ -83,9 +90,14 @@ BOT_COMMANDS = [
     ('abort', 'Stop whatever is generating in this chat'),
     ('navigate', 'List the turns of the replied-to thread'),
     ('export', 'Save the replied-to thread as JSON'),
+    ('linearize', 'Delete every branch except the line to the replied message'),
     ('manipulate', 'Rewrite the replied-to bot reply'),
     ('import', 'Replay a conversation from a JSON export'),
 ]
+
+LINEARIZE_USAGE = """[!] `/linearize` prunes a thread, so it has to reply to a message in one.
+
+It deletes every branch that grew from the same first message, keeping only the line down to the replied message — so anything after that message goes too. You confirm the list first."""
 
 EXPORT_USAGE = """[!] `/export` saves a thread as JSON, so it has to reply to a message in one.
 
@@ -210,11 +222,15 @@ class ChatGPTTelegramBot:
         # phone shows on one line, with a wide (CJK) character counting two
         self.NAVIGATE_PER_PAGE: int = 8
         self.NAVIGATE_PREVIEW_WIDTH: int = 36
+        # /linearize lists at most this many messages in its confirmation
+        self.LINEARIZE_LIST_LIMIT: int = 30
 
         self.pending_reply_manager: PendingReplyManager = PendingReplyManager()
         # prompts being answered right now, by (chat_id, msg_id). The flag turns True when
         # /abort asks that generation to stop, which it does at its next stream event.
         self.generating: dict[tuple[int, int], bool] = {}
+        # (chat_id, anchor) of a /linearize being carried out, so a second press cannot run it twice
+        self.linearizing: set[tuple[int, int]] = set()
 
         # db scheme:
         # msg_info_{chat_id}_{msg_id}: MsgInfo
@@ -294,11 +310,17 @@ class ChatGPTTelegramBot:
                 await self.abort_handler(event.message)
             elif text == '/navigate' or text == f'/navigate@{me.username}':
                 await self.navigate_handler(event.message)
+            elif text == '/linearize' or text == f'/linearize@{me.username}':
+                await self.linearize_handler(event.message)
             elif command in ('/export', f'/export@{me.username}'):
                 body = command_parts[1] if len(command_parts) > 1 else ''
                 await self.export_handler(event.message, body)
             else:
                 await self.reply_handler(event.message)
+
+        @self.bot.on(events.CallbackQuery(pattern=rb'^lin:'))
+        async def _linearize_confirm(event: events.CallbackQuery.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
+            await self.linearize_callback(event)
 
         @self.bot.on(events.CallbackQuery(pattern=rb'^nav:'))
         async def _navigate_page(event: events.CallbackQuery.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
@@ -484,6 +506,7 @@ class ChatGPTTelegramBot:
         lines.append('  <code>/abort</code> stops whatever is generating in this chat.')
         lines.append('  <code>/navigate</code> lists the turns of the replied-to thread.')
         lines.append('  <code>/export [title]</code> saves it as JSON that <code>/import</code> reads.')
+        lines.append('  <code>/linearize</code> deletes every other branch, after confirmation.')
         lines.append('')
         lines.append('<b>Manipulation</b>')
         lines.append('  Reply to a bot message with:')
@@ -955,6 +978,146 @@ class ChatGPTTelegramBot:
         caption = f'Exported "{title}" — {len(messages)} messages'
         _ = await self.send_document(chat_id, document, export_filename(title), caption, msg_id)
         logger.info(f'Exported {chat_id=}, {anchor_id=}, messages={len(messages)}, bytes={len(document)}')
+
+    def _chat_nodes(self, chat_id: int) -> dict[int, MsgInfo]:
+        """Every stored node of one chat, by id -- a scan, since MsgInfo links only backwards."""
+        prefix = f'msg_info_{chat_id}_'
+        nodes: dict[int, MsgInfo] = {}
+        for key in self.db:
+            if key.startswith(prefix):
+                try:
+                    nodes[int(key[len(prefix) :])] = self.db[key]
+                except ValueError:
+                    continue
+        return nodes
+
+    def _linearize_plan(self, chat_id: int, anchor_id: int) -> tuple[dict[int, MsgInfo], set[int]] | None:
+        """The chat's nodes and the ids a /linearize at *anchor_id* would delete; None if not stored."""
+        nodes = self._chat_nodes(chat_id)
+        plan = linearize_plan(nodes, anchor_id)
+        if plan is None:
+            return None
+        _, delete = plan
+        return nodes, delete
+
+    def _generating_in(self, chat_id: int, nodes: dict[int, MsgInfo], ids: set[int]) -> bool:
+        """Whether a generation is answering one of *ids*, or writing a reply into it."""
+        for gen_chat, prompt_id in self.generating:
+            if gen_chat == chat_id and (prompt_id in ids or prompt_id in nodes and nodes[prompt_id].reply_id in ids):
+                return True
+        return False
+
+    @only_allowed
+    async def linearize_handler(self, message: Any) -> None:
+        """Offer to delete every branch of a thread except the one leading to the replied message."""
+        chat_id = message.chat_id
+        msg_id = message.id
+        anchor_id = replied_message_id(message)
+        if anchor_id is None:
+            _ = await self.send_message(chat_id, LINEARIZE_USAGE, msg_id)
+            return
+        await self.pending_reply_manager.wait_for((chat_id, anchor_id))
+        planned = self._linearize_plan(chat_id, anchor_id)
+        if planned is None:
+            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
+            return
+        nodes, delete = planned
+        listing, count = format_linearize_listing(nodes, delete, self.NAVIGATE_PREVIEW_WIDTH, self.LINEARIZE_LIST_LIMIT)
+        if count == 0:
+            _ = await self.send_message(chat_id, 'Nothing to delete: that thread is already a single line.', msg_id)
+            return
+        if self._generating_in(chat_id, nodes, delete):
+            _ = await self.send_message(chat_id, '[!] Part of that thread is still generating; /abort it first', msg_id)
+            return
+        # the digest pins the confirmation to this exact plan, and the sender id to whoever asked
+        tag = f'lin:{anchor_id}:{plan_digest(delete)}:{message.sender_id}'
+        noun = 'message' if count == 1 else 'messages'
+        text = f'🧹 <b>Delete {count} {noun}?</b>\nEverything branching off this thread except the line to the replied message.\n\n{listing}'
+        buttons = [
+            [Button.inline(f'🗑 Delete {count}', f'{tag}:go'.encode()), Button.inline('Cancel', f'{tag}:no'.encode())]
+        ]
+        _ = await self.send_message_html(chat_id, text, msg_id, buttons=buttons)
+
+    @retry()
+    async def delete_messages(self, chat_id: int, message_ids: list[int]) -> None:
+        logger.debug(f'Deleting messages: {chat_id=}, count={len(message_ids)}')
+        _ = await self.bot.delete_messages(chat_id, message_ids, revoke=True)
+
+    async def _still_there(self, chat_id: int, message_ids: list[int]) -> set[int]:
+        """Which of *message_ids* still exist; on a failed lookup, all of them, to be safe."""
+        try:
+            found: Any = await self.bot.get_messages(chat_id, ids=message_ids)
+        except Exception:  # noqa: BLE001  # unknown means keep the rows, never orphan a live message
+            return set(message_ids)
+        return {m.id for m in found if m is not None}
+
+    async def linearize_callback(self, event: Any) -> None:
+        """Carry out, or call off, a confirmed /linearize."""
+        chat_id: int | None = event.chat_id
+        try:
+            _, anchor, digest, asker, action = event.data.decode().split(':')
+            anchor_id, asker_id = int(anchor), int(asker)
+        except ValueError:
+            await event.answer()
+            return
+        if chat_id is None or not self.is_allowed(chat_id):
+            await event.answer()
+            return
+        if event.sender_id != asker_id:
+            await event.answer('Only whoever asked can confirm this', alert=True)
+            return
+        if action == 'no':
+            await event.edit('🧹 Linearize cancelled.', buttons=None)
+            await event.answer()
+            return
+        if (chat_id, anchor_id) in self.linearizing:
+            await event.answer('Already deleting')
+            return
+
+        planned = self._linearize_plan(chat_id, anchor_id)
+        if planned is None or plan_digest(planned[1]) != digest:
+            await event.edit('🧹 That thread has changed since; run /linearize again.', buttons=None)
+            await event.answer()
+            return
+        nodes, delete = planned
+        if self._generating_in(chat_id, nodes, delete):
+            await event.answer('Part of that thread is still generating; /abort it first', alert=True)
+            return
+
+        self.linearizing.add((chat_id, anchor_id))
+        try:
+            await event.edit('🧹 Deleting…', buttons=None)
+            await event.answer()
+            targets = sorted(n for n in delete if n > 0)
+            for start in range(0, len(targets), 100):
+                batch = targets[start : start + 100]
+                try:
+                    await self.delete_messages(chat_id, batch)
+                except Exception:  # noqa: BLE001  # whatever failed is found by the check below
+                    logger.exception(f'Linearize could not delete a batch ({chat_id=}, {anchor_id=})')
+            # Telegram can decline part of a batch without saying which part, so the rows are
+            # dropped only for messages confirmed gone; a survivor keeps its history and stays
+            # replyable
+            remaining: set[int] = set()
+            for start in range(0, len(targets), 100):
+                remaining |= await self._still_there(chat_id, targets[start : start + 100])
+            gone = set(targets) - remaining
+            for mid in gone:
+                _ = self.db.pop(f'msg_info_{chat_id}_{mid}', None)
+            # an imported prompt has no message of its own; it goes with the turn that showed it
+            for mid in delete:
+                if mid < 0 and -mid in gone:
+                    _ = self.db.pop(f'msg_info_{chat_id}_{mid}', None)
+            summary = f'🧹 Deleted {len(gone)} {"message" if len(gone) == 1 else "messages"}.'
+            if remaining:
+                summary += (
+                    f'\n{len(remaining)} could not be deleted: a bot needs delete rights for other'
+                    " people's messages in a group, and Telegram refuses some older messages."
+                )
+            await event.edit(summary, buttons=None)
+            logger.info(f'Linearized {chat_id=}, {anchor_id=}, deleted={len(gone)}, kept={len(remaining)}')
+        finally:
+            self.linearizing.discard((chat_id, anchor_id))
 
     @only_allowed
     async def abort_handler(self, message: Any) -> None:

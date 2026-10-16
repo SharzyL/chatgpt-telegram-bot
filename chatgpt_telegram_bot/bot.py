@@ -40,6 +40,7 @@ from chatgpt_telegram_bot.utils import (
     EditThrottle,
     PendingReplyManager,
     apply_overrides,
+    decode_text_file,
     load_photo,
     match_prefix,
     parse_manipulation,
@@ -628,10 +629,8 @@ class ChatGPTTelegramBot:
                 _ = await self.send_message(chat_id, 'File too large', msg_id)
                 return
             document_blob = await document_message.download_media(bytes)
-            try:
-                document_text = document_blob.decode()
-                assert all(c != '\x00' for c in document_text)
-            except UnicodeDecodeError:
+            document_text = decode_text_file(document_blob)
+            if document_text is None:
                 _ = await self.send_message(chat_id, 'File is not text file or not valid UTF-8', msg_id)
                 return
 

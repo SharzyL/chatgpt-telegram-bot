@@ -205,6 +205,20 @@ def retry(max_retry: int = 30, interval: int = 10):
     return decorator
 
 
+def decode_text_file(blob: bytes) -> str | None:
+    """The contents of *blob* as text, or None if it is not UTF-8 text.
+
+    A NUL byte decodes cleanly but marks the file as binary, so it is rejected too.
+    """
+    try:
+        text = blob.decode()
+    except UnicodeDecodeError:
+        return None
+    if '\x00' in text:
+        return None
+    return text
+
+
 def telegram_len(s: str) -> int:
     """Length in UTF-16 code units, matching Telegram's counting."""
     return len(s.encode('utf-16-le')) // 2

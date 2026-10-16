@@ -7,19 +7,22 @@ admin_id = 114514
 # default_image_reply_prompt = "Continue"
 # image_cache_size = 52428800  # 50MB default
 
-api_endpoints = [
+endpoints = [
   { name = "openai", url = "https://api.openai.com/v1" },
   { name = "anthropic", url = "https://api.anthropic.com" },
 ]
-default_api_endpoint = "openai"
+default_endpoint = "openai"
 
 models = [
-  { prefix = "o1", name = "o1-mini", no_system_prompt = true },
+  { prefix = "g", name = "gpt-5", thinking = "medium" },
 
-  { prefix = "$", name = "claude-3-opus", endpoint = "anthropic", api_type = "anthropic" },
+  # search and server-side markdown rendering are per model, and overridable inline with ,s and ,r
+  { prefix = "gs", name = "gpt-5", thinking = "high", search = true, richtext = true },
 
-  { prefix = "t", name = "claude-3-7-sonnet-latest", endpoint = "anthropic", api_type = "anthropic", system_prompt = "The user will send you some text and optionally a language name. You need to translate it into Chinese. If the user sends a single word, you should also include some expanations and usages. Note that your answer should also in Chinese." },
+  { prefix = "$", name = "claude-opus-4-5", endpoint = "anthropic", api_type = "anthropic" },
 
-  # inline system prompt: om,[You are a helpful bot, current date {current_date}] hello
-  # escaped brackets: om,[Respond with JSON like \[1,2,3\]] hello
+  { prefix = "t", name = "claude-sonnet-4-5", endpoint = "anthropic", api_type = "anthropic", system_prompt = "The user will send you some text and optionally a language name. You need to translate it into Chinese. If the user sends a single word, you should also include some expanations and usages. Note that your answer should also in Chinese." },
+
+  # inline system prompt: g,[You are a helpful bot, current date {current_date}] hello
+  # escaped brackets: g,[Respond with JSON like \[1,2,3\]] hello
 ]

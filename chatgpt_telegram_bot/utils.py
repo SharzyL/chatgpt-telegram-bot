@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 from collections.abc import Awaitable, Callable
@@ -9,7 +10,7 @@ import diskcache
 from loguru import logger
 from telethon import errors
 
-from chatgpt_telegram_bot.models import OVERRIDE_ALIASES, Model
+from chatgpt_telegram_bot.models import OVERRIDE_ALIASES, ImportedChat, Model
 
 
 def split_respecting_brackets(s: str, delimiters: str = ',') -> list[str]:
@@ -205,6 +206,52 @@ def retry(max_retry: int = 30, interval: int = 10):
     return decorator
 
 
+def parse_import(text: str) -> ImportedChat:
+    """Read an exported conversation, or raise ValueError saying what is wrong with it.
+
+    The message list has to alternate user and assistant, starting with the user, because
+    that is the only shape the reply chain can store.
+    """
+    try:
+        data: Any = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f'File is not valid JSON: {e}') from e
+    if not isinstance(data, dict):
+        raise ValueError('Expected a JSON object with a "messages" array')  # noqa: TRY004  # a malformed file is bad input, not a type error
+    messages: Any = data.get('messages')
+    if not isinstance(messages, list) or not messages:
+        raise ValueError('File has no "messages" array')
+    raw_title: Any = data.get('title')
+    title = raw_title.strip() if isinstance(raw_title, str) and raw_title.strip() else 'Untitled'
+
+    turns: list[tuple[str, str]] = []
+    prompt: str | None = None
+    expected = 'user'
+    for i, message in enumerate(messages, start=1):
+        if not isinstance(message, dict):
+            raise ValueError(f'Message {i} is not an object')  # noqa: TRY004  # a malformed file is bad input, not a type error
+        role: Any = message.get('role')
+        content: Any = message.get('content')
+        if role not in ('user', 'assistant'):
+            raise ValueError(f'Message {i} has unsupported role {role!r}')
+        if not isinstance(content, str):
+            raise ValueError(f'Message {i} has no text content')  # noqa: TRY004  # a malformed file is bad input, not a type error
+        if role != expected:
+            raise ValueError(f'Message {i} is {role}, expected {expected}: roles must alternate, starting with user')
+        if role == 'user':
+            prompt = content
+            expected = 'assistant'
+        else:
+            assert prompt is not None  # the alternation check above guarantees it
+            turns.append((prompt, content))
+            prompt = None
+            expected = 'user'
+
+    if not turns:
+        raise ValueError('File has no complete prompt-and-response turn')
+    return ImportedChat(title=title.replace('\n', ' '), turns=turns, trailing_prompt=prompt)
+
+
 def decode_text_file(blob: bytes) -> str | None:
     """The contents of *blob* as text, or None if it is not UTF-8 text.
 
@@ -246,15 +293,19 @@ class PendingReplyManager:
         logger.info('PendingReplyManager waiting for %r finished', reply_id)
 
 
-class EditThrottle:
-    """Token bucket over streaming message edits.
+class Throttle:
+    """Token bucket over outgoing Telegram traffic — streamed edits, or a run of sends.
 
-    A reply that keeps streaming settles at one edit per *interval*, which is what
-    Telegram's own rate limit cares about. A short one may edit every *burst_interval*
-    instead, paid for out of a bucket that starts full and refills at ``1 / interval``.
-    The capacity is derived from *burst_window*: it is exactly the number of extra edits
-    a burst of that length spends over what refilling covers, so a flow shorter than the
-    window never leaves burst speed and a longer one decays to *interval* on its own.
+    A flow that keeps going settles at one message per *interval*, which is what Telegram's
+    own rate limit cares about. A short one may go every *burst_interval* instead, paid for
+    out of a bucket that starts full and refills at ``1 / interval``. The capacity is
+    derived from *burst_window*: it is exactly the number of extra messages a burst of that
+    length spends over what refilling covers, so a flow shorter than the window never leaves
+    burst speed and a longer one decays to *interval* on its own.
+
+    Callers come in two shapes. A stream of edits only ever shows the latest text, so it
+    uses `take()` and drops a tick that arrives too early. A run of sends has to deliver
+    every message, so it uses `reserve()` and waits its turn instead.
 
     Time is passed in rather than read, so the schedule is testable.
     """
@@ -268,19 +319,41 @@ class EditThrottle:
         self.refilled: float | None = None
         self.last_flush: float | None = None
 
-    def take(self, now: float) -> bool:
-        """Whether an edit may be sent now; consumes a token when it may."""
+    def _refill(self, now: float) -> None:
+        """Credit the tokens accrued up to *now*, which reserve() may put in the future."""
         if self.refilled is None:
             self.refilled = now
-        self.tokens = min(self.capacity, self.tokens + (now - self.refilled) / self.interval)
-        self.refilled = now
+        elapsed = max(0.0, now - self.refilled)
+        self.tokens = min(self.capacity, self.tokens + elapsed / self.interval)
+        self.refilled = max(self.refilled, now)
+
+    def take(self, now: float) -> bool:
+        """Whether a message may go out now; consumes a token when it may."""
+        self._refill(now)
         if self.tokens < 1.0 or (self.last_flush is not None and now - self.last_flush < self.burst_interval):
             return False
         self.tokens -= 1.0
         return True
 
+    def reserve(self, now: float) -> float:
+        """How long to wait before the next message may go out, taking its token now.
+
+        Where `take()` drops a message that comes too early, this one queues it: the caller
+        sleeps for the returned delay and then sends.
+        """
+        self._refill(now)
+        wait = (1.0 - self.tokens) * self.interval if self.tokens < 1.0 else 0.0
+        if self.last_flush is not None:
+            wait = max(wait, self.last_flush + self.burst_interval - now)
+        wait = max(wait, 0.0)
+        at = now + wait
+        self._refill(at)
+        self.tokens -= 1.0
+        self.last_flush = at
+        return wait
+
     def flushed(self, now: float) -> None:
-        """Record that an edit finished; spacing is measured from here, not from take()."""
+        """Record that a message landed; spacing is measured from here, not from take()."""
         self.last_flush = now
 
 

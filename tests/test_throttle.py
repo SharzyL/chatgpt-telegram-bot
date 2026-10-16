@@ -2,12 +2,12 @@ from itertools import pairwise
 
 import pytest
 
-from chatgpt_telegram_bot.utils import EditThrottle
+from chatgpt_telegram_bot.utils import Throttle
 
 
 def schedule(duration: float, tick: float = 0.05) -> list[float]:
     """Times at which a stream of `duration` seconds would flush, ticking every `tick`."""
-    throttle = EditThrottle(3.0, 1.0, 15.0)
+    throttle = Throttle(3.0, 1.0, 15.0)
     flushes: list[float] = []
     now = 0.0
     while now <= duration:
@@ -24,7 +24,7 @@ def gaps(flushes: list[float]) -> list[float]:
 
 def test_burst_capacity_matches_the_window():
     # 15s of 1s edits, refilled at one per 3s, costs 10 tokens over what refill covers
-    assert EditThrottle(3.0, 1.0, 15.0).capacity == pytest.approx(10.0)
+    assert Throttle(3.0, 1.0, 15.0).capacity == pytest.approx(10.0)
 
 
 def test_first_update_flushes_immediately():
@@ -51,7 +51,7 @@ def test_steady_rate_is_bounded_by_the_interval():
 
 
 def test_burst_recovers_while_idle():
-    throttle = EditThrottle(3.0, 1.0, 15.0)
+    throttle = Throttle(3.0, 1.0, 15.0)
     assert throttle.take(0.0)
     throttle.flushed(0.0)
     throttle.tokens = 0.0
@@ -63,6 +63,52 @@ def test_burst_recovers_while_idle():
 
 def test_degenerate_configuration_still_flushes():
     # burst_interval >= interval leaves no room for a burst; the bucket must not deadlock
-    throttle = EditThrottle(3.0, 3.0, 15.0)
+    throttle = Throttle(3.0, 3.0, 15.0)
     assert throttle.capacity == pytest.approx(1.0)
     assert throttle.take(0.0)
+
+
+def reserved(count: int, interval: float = 3.0, burst: float = 1.0, window: float = 10.0) -> list[float]:
+    """The times at which `count` queued sends would go out."""
+    throttle = Throttle(interval, burst, window)
+    now = 0.0
+    times: list[float] = []
+    for _ in range(count):
+        now += throttle.reserve(now)
+        times.append(round(now, 2))
+    return times
+
+
+def test_a_short_run_goes_out_at_burst_speed():
+    # six sends fit in the bucket, so they pace at 1s rather than 3s
+    assert reserved(6) == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+
+
+def test_a_long_run_settles_to_the_steady_interval():
+    times = reserved(20)
+    assert gaps(times)[-5:] == [3.0] * 5
+
+
+def test_a_queued_run_never_outpaces_the_bucket():
+    # the bucket's guarantee: n sends take at least (n - capacity) * interval
+    times = reserved(40)
+    assert times[-1] >= (40 - Throttle(3.0, 1.0, 10.0).capacity - 1) * 3.0
+
+
+def test_reserve_does_not_lose_tokens_to_a_clock_that_moved_on():
+    # reserve() credits refill up to a time in the future; a later call must not see
+    # negative elapsed time and dock the bucket for it
+    throttle = Throttle(3.0, 1.0, 10.0)
+    _ = throttle.reserve(0.0)
+    before = throttle.tokens
+    _ = throttle.reserve(0.5)  # earlier than the reservation it just made
+    assert throttle.tokens <= before
+    assert throttle.reserve(0.5) >= 0.0
+
+
+def test_waiting_longer_than_the_run_needs_restores_the_burst():
+    throttle = Throttle(3.0, 1.0, 10.0)
+    for _ in range(10):
+        _ = throttle.reserve(0.0)
+    assert throttle.reserve(0.0) > 0.0, 'the bucket should be empty by now'
+    assert throttle.reserve(120.0) == 0.0, 'two minutes idle should refill it'

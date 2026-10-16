@@ -77,6 +77,15 @@ class MsgInfo(NamedTuple):
     overrides: dict[str, str | None] | None = None
 
 
+class ImportedChat(NamedTuple):
+    """A conversation exported from elsewhere, as pairs of prompt and response."""
+
+    title: str
+    turns: list[tuple[str, str]]
+    # a prompt the export ends on with nothing answering it; there is no turn to show for it
+    trailing_prompt: str | None = None
+
+
 @dataclass
 class StreamEvent:
     pass

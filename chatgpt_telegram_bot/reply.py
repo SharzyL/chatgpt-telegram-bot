@@ -48,3 +48,13 @@ def format_reply(
             footer += '**Usage**\n' + ', '.join(f'{k}={v}' for k, v in usage.items())
         result = result + '\n\n' + _blockquote_markdown(footer)
     return result
+
+
+def format_imported_turn(prompt: str, response: str) -> str:
+    """One turn of an imported conversation: the prompt quoted above the response.
+
+    The quote is what visually separates someone else's prompt from the answer, the same
+    way a thinking block is set apart, and `balance_fences` keeps a fence inside the prompt
+    from swallowing the response below it.
+    """
+    return _blockquote_markdown(balance_fences(normalize_math(prompt))) + '\n\n' + normalize_math(response)

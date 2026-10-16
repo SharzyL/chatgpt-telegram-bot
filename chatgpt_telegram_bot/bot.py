@@ -35,14 +35,15 @@ from chatgpt_telegram_bot.models import (
     make_thinking_text_part,
 )
 from chatgpt_telegram_bot.render import ENTITY_RENDERER, SERVER_MARKDOWN_RENDERER, Rendered, Renderer
-from chatgpt_telegram_bot.reply import format_reply
+from chatgpt_telegram_bot.reply import format_imported_turn, format_reply
 from chatgpt_telegram_bot.utils import (
-    EditThrottle,
     PendingReplyManager,
+    Throttle,
     apply_overrides,
     decode_text_file,
     load_photo,
     match_prefix,
+    parse_import,
     parse_manipulation,
     parse_proxy,
     retry,
@@ -65,6 +66,13 @@ ENTITY_PROMPT_APPEND = (
 
 # /manipulate is deliberately not registered as a bot command: it needs both a reply target
 # and a body, so picking it from the command palette could only ever fail
+IMPORT_USAGE = """[!] `/import` needs an exported conversation as a JSON file, either attached to the command or replied to.
+
+`/import` — continue the imported chat with the first configured model
+`/import <prefix>` — continue it with that model, overrides allowed
+
+The file holds a `messages` array of `{role, content}` objects, alternating user and assistant."""
+
 MANIPULATE_USAGE = """[!] `/manipulate` rewrites a bot reply, so it has to reply to one:
 
 `/manipulate <text>`
@@ -150,6 +158,11 @@ class ChatGPTTelegramBot:
         self.TELEGRAM_MIN_INTERVAL: float = 3.0
         self.TELEGRAM_BURST_INTERVAL: float = 1.0
         self.TELEGRAM_BURST_WINDOW: float = 15.0
+        # an import sends a run of messages rather than editing one, and Telegram's guidance
+        # for a group is around 20 messages a minute; a short import still goes out at once
+        self.IMPORT_MIN_INTERVAL: float = 3.0
+        self.IMPORT_BURST_INTERVAL: float = 1.0
+        self.IMPORT_BURST_WINDOW: float = 10.0
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
         self.TEXT_FILE_SIZE_LIMIT: int = 900_000
@@ -224,6 +237,9 @@ class ChatGPTTelegramBot:
             elif command in ('/manipulate', f'/manipulate@{me.username}'):
                 body = command_parts[1] if len(command_parts) > 1 else ''
                 await self.manipulate_handler(event.message, body)
+            elif command in ('/import', f'/import@{me.username}'):
+                body = command_parts[1] if len(command_parts) > 1 else ''
+                await self.import_handler(event.message, body)
             else:
                 await self.reply_handler(event.message)
 
@@ -269,14 +285,27 @@ class ChatGPTTelegramBot:
         current_date = datetime.datetime.now(self.timezone).strftime('%Y-%m-%d')
         return template.format_map({'current_date': current_date, 'model': model})
 
+    def _system_prompt_for(self, model: Model | None) -> str | None:
+        """The prompt a message that named *model* records, or None if it named no model."""
+        if model is None:
+            return None
+        if model.system_prompt is not None:
+            prompt = self._format_system_prompt(model.system_prompt, model.name)
+        else:
+            prompt = self.get_prompt(model)
+        if model.system_prompt_append is not None:
+            prompt = prompt + '\n' + self._format_system_prompt(model.system_prompt_append, model.name)
+        return prompt
+
     def get_prompt(self, model: Model) -> str:
         """The default system prompt, with formatting guidance for this model's renderer."""
         append = RICHTEXT_PROMPT_APPEND if model.richtext else ENTITY_PROMPT_APPEND
         return self._format_system_prompt(self.system_prompt + '\n' + append, model.name)
 
     @staticmethod
-    def get_renderer(model: Model) -> Renderer:
-        return SERVER_MARKDOWN_RENDERER if model.richtext else ENTITY_RENDERER
+    def get_renderer(model: Model | None) -> Renderer:
+        """The renderer a model asks for; entities when no model has been chosen yet."""
+        return SERVER_MARKDOWN_RENDERER if model is not None and model.richtext else ENTITY_RENDERER
 
     def _reply_prefix(self, model: Model, manipulated: bool = False) -> str:
         prefix = f'🤖 `{model.name}`'
@@ -286,6 +315,10 @@ class ChatGPTTelegramBot:
         if manipulated:
             prefix += ' (manipulated)'
         return prefix + '\n\n'
+
+    def _import_prefix(self, model: Model | None, index: int, total: int) -> str:
+        name = f' `{model.name}`' if model is not None else ''
+        return f'📥{name} ({index}/{total})\n\n'
 
     def _model_flags(self, model: Model) -> list[str]:
         flags: list[str] = []
@@ -358,11 +391,12 @@ class ChatGPTTelegramBot:
         if len(history) % 2 != 1:
             raise RuntimeError(f'First message not from user ({chat_id=}, {msg_id=})')
 
-        assert model_of_history
+        if model_of_history is None:
+            # an imported chat starts without one; replying with a prefix is what picks it
+            raise RuntimeError('no model for this conversation, reply with a model prefix to choose one')
         if system_prompt is None:
             system_prompt = self.get_prompt(model_of_history)
 
-        assert model_of_history
         return history[::-1], model_of_history, system_prompt
 
     def _build_help_text(self, error: str | None = None) -> str:
@@ -386,6 +420,11 @@ class ChatGPTTelegramBot:
         lines.append('  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt')
         lines.append('  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt')
         lines.append('  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt')
+        lines.append('')
+        lines.append('<b>Import</b>')
+        lines.append('  Attach an exported conversation as JSON, or reply to one:')
+        lines.append('  <code>/import</code> or <code>/import &lt;prefix&gt;</code>')
+        lines.append('  Each turn becomes a message you can reply to to continue from there.')
         lines.append('')
         lines.append('<b>Manipulation</b>')
         lines.append('  Reply to a bot message with:')
@@ -561,6 +600,125 @@ class ChatGPTTelegramBot:
         await self.edit_message(chat_id, bodies[0], target_id)
         logger.info(f'Manipulated {chat_id=}, {target_id=}, has_thinking={thinking is not None}')
 
+    async def _import_document(self, message: Any) -> Any:
+        """The message holding the file to import: this one, or the one it replies to."""
+        if message.document is not None:
+            return message
+        if message.is_reply:
+            replied = await message.get_reply_message()
+            if replied is not None and replied.document is not None:
+                return replied
+        return None
+
+    def _import_model(self, spec: str) -> tuple[Model | None, dict[str, str | None]]:
+        """The model an `/import` argument names, or None when it names none.
+
+        An import with no prefix records no model, exactly as a reply that names none does;
+        the chat is continued by replying to a turn with one.
+        """
+        spec = spec.strip()
+        if not spec:
+            return None, {}
+        for m in self.models:
+            match = match_prefix(spec, m.prefix)
+            if match is not None:
+                _, overrides = match
+                return apply_overrides(m, overrides), overrides
+        raise ValueError(f'Unknown prefix: `{spec}`')
+
+    @only_allowed
+    async def import_handler(self, message: Any, body: str) -> None:
+        chat_id = message.chat_id
+        msg_id = message.id
+
+        document_message = await self._import_document(message)
+        if document_message is None:
+            _ = await self.send_message(chat_id, IMPORT_USAGE, msg_id)
+            return
+
+        try:
+            model, overrides = self._import_model(body)
+        except ValueError as e:  # an unknown prefix, or an override the model cannot take
+            _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+            return
+
+        if document_message.document.size > self.TEXT_FILE_SIZE_LIMIT:
+            _ = await self.send_message(chat_id, '[!] File too large', msg_id)
+            return
+        text = decode_text_file(await document_message.download_media(bytes))
+        if text is None:
+            _ = await self.send_message(chat_id, '[!] File is not text file or not valid UTF-8', msg_id)
+            return
+        try:
+            chat = parse_import(text)
+        except ValueError as e:
+            _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+            return
+
+        throttle = Throttle(self.IMPORT_MIN_INTERVAL, self.IMPORT_BURST_INTERVAL, self.IMPORT_BURST_WINDOW)
+        turns = f'{len(chat.turns)} turn' + ('s' if len(chat.turns) != 1 else '')
+        note = f'Importing a chat titled "{chat.title}" — {turns}, '
+        note += (
+            f'continuing with `{model.name}`'
+            if model is not None
+            else 'reply to a turn with a model prefix to continue it'
+        )
+        if chat.trailing_prompt is not None:
+            note += '\nThe last prompt has no response and was left out.'
+        # the pacing below makes a long export take minutes, which is worth saying up front
+        eta = (len(chat.turns) - throttle.capacity) * self.IMPORT_MIN_INTERVAL
+        if eta > 60:
+            note += f'\nSending is paced, so this takes about {round(eta / 60)} minutes.'
+        _ = await self.send_message(chat_id, note, msg_id)
+
+        # each turn is shown as one message but stored as two nodes, because the history has
+        # to alternate user and assistant; the user half is keyed by the negated id of the
+        # message that displays the turn, which no real message can collide with
+        renderer = self.get_renderer(model)
+        system_prompt = self._system_prompt_for(model)
+        reply_to = msg_id
+        previous_turn_id: int | None = None
+        for i, (prompt, response) in enumerate(chat.turns, start=1):
+            bodies = renderer.render(
+                format_imported_turn(prompt, response), self._import_prefix(model, i, len(chat.turns))
+            )
+            msg_ids: list[int] = []
+            for part in bodies:
+                # a long export is a burst of sends that would otherwise trip flood control,
+                # and a flood wait is a penalty that grows each time it is tripped, so the
+                # run is paced instead of being left for `retry` to absorb
+                await asyncio.sleep(throttle.reserve(time.time()))
+                reply_to = await self.send_message(chat_id, part, reply_to)
+                msg_ids.append(reply_to)
+            prompt_id = -msg_ids[0]
+            # only the first turn carries the model, as the head of the chain does elsewhere
+            self.set_msg_info(
+                chat_id,
+                prompt_id,
+                MsgInfo(
+                    sent_by_bot=False,
+                    message=[make_text_part(prompt)],
+                    reply_id=previous_turn_id,
+                    prefix=model.prefix if model is not None and i == 1 else None,
+                    system_prompt=system_prompt if i == 1 else None,
+                    overrides=(overrides or None) if i == 1 else None,
+                ),
+            )
+            response_info = MsgInfo(
+                sent_by_bot=True,
+                message=[make_text_part(response)],
+                reply_id=prompt_id,
+                prefix=None,
+                system_prompt=None,
+            )
+            # a turn too long for one message is stored under every part, so replying to any
+            # of them continues from the same point
+            for mid in msg_ids:
+                self.set_msg_info(chat_id, mid, response_info)
+            previous_turn_id = msg_ids[0]
+
+        logger.info(f'Imported {chat_id=}, {msg_id=}, title={chat.title!r}, turns={len(chat.turns)}')
+
     @only_allowed
     async def reply_handler(self, message: Any) -> None:
         chat_id = message.chat_id
@@ -650,17 +808,7 @@ class ChatGPTTelegramBot:
         else:
             new_message = [make_text_part(text)]
 
-        if model_by_prefix and model_by_prefix.system_prompt is not None:
-            system_prompt: str | None = self._format_system_prompt(model_by_prefix.system_prompt, model_by_prefix.name)
-        elif model_by_prefix:
-            system_prompt = self.get_prompt(model_by_prefix)
-        else:
-            system_prompt = None
-        if model_by_prefix and model_by_prefix.system_prompt_append is not None:
-            base = system_prompt if system_prompt is not None else self.get_prompt(model_by_prefix)
-            system_prompt = (
-                base + '\n' + self._format_system_prompt(model_by_prefix.system_prompt_append, model_by_prefix.name)
-            )
+        system_prompt = self._system_prompt_for(model_by_prefix)
 
         # prefix and system_prompt stay None on a reply that named no model, which is what
         # lets construct_chat_history fall back to the ones already in the chain
@@ -882,17 +1030,7 @@ class ChatGPTTelegramBot:
         for h in photo_hashes:
             new_message.append(make_image_part(h))
 
-        if model_by_prefix and model_by_prefix.system_prompt is not None:
-            system_prompt: str | None = self._format_system_prompt(model_by_prefix.system_prompt, model_by_prefix.name)
-        elif model_by_prefix:
-            system_prompt = self.get_prompt(model_by_prefix)
-        else:
-            system_prompt = None
-        if model_by_prefix and model_by_prefix.system_prompt_append is not None:
-            base = system_prompt if system_prompt is not None else self.get_prompt(model_by_prefix)
-            system_prompt = (
-                base + '\n' + self._format_system_prompt(model_by_prefix.system_prompt_append, model_by_prefix.name)
-            )
+        system_prompt = self._system_prompt_for(model_by_prefix)
 
         msg_info = MsgInfo(
             sent_by_bot=False,
@@ -932,7 +1070,7 @@ class BotReplyMessages:
         self.replied_msgs: list[tuple[int, Rendered]] = []
         self.text: str = ''
         self.collapse_first_quote: bool = False
-        self.throttle: EditThrottle = EditThrottle(
+        self.throttle: Throttle = Throttle(
             cbot.TELEGRAM_MIN_INTERVAL, cbot.TELEGRAM_BURST_INTERVAL, cbot.TELEGRAM_BURST_WINDOW
         )
 

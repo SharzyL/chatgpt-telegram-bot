@@ -73,7 +73,6 @@ def _bot() -> Any:
     bot.models = [Model(prefix='g', name='gpt-5'), Model(prefix='c', name='claude')]
     bot.system_prompt = 'be helpful'
     bot.timezone = ZoneInfo('UTC')
-    bot.TEXT_FILE_SIZE_LIMIT = 900_000
     # the real pacing would make these tests sleep for minutes; the schedule itself is
     # covered in test_throttle.py, so here the intervals are small enough to be invisible
     bot.IMPORT_MIN_INTERVAL = 0.001
@@ -224,3 +223,16 @@ def test_a_malformed_file_imports_nothing():
     bot = _import('{"messages": [{"role": "user", "content": "a"}, {"role": "user", "content": "b"}]}')
     assert len(bot.sent) == 1
     assert bot.sent[0][1].startswith('[!] Message 2 is user')
+
+
+def test_a_file_over_the_attachment_limit_still_imports():
+    # the attachment limit guards one prompt; an import is spread over many messages
+    long = 'x' * 4000
+    messages: list[dict[str, str]] = []
+    for _ in range(150):
+        messages += [{'role': 'user', 'content': long}, {'role': 'assistant', 'content': long}]
+    payload = {'title': 'Big', 'messages': messages}
+    blob_size = len(json.dumps(payload).encode())
+    assert blob_size > 900_000, 'the file should be over what an attachment may be'
+    bot = _import(payload, 'g')
+    assert bot.sent[0][1].startswith('Importing a chat titled "Big" — 150 turns')

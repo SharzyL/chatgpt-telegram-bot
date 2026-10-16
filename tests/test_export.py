@@ -90,7 +90,6 @@ def _bot(dates_fail: bool = False) -> Any:
     bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
     bot.allowed_chats = {CHAT}
     bot.pending_reply_manager = PendingReplyManager()
-    bot.TEXT_FILE_SIZE_LIMIT = 900_000
     sent: list[Any] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
 
@@ -205,14 +204,6 @@ def test_a_failed_date_lookup_still_exports():
     _ = _export(bot, _thread(bot, 1))
     doc, _, _ = _document(bot)
     assert all('timestamp' not in m for m in doc['messages'])
-
-
-def test_an_oversized_export_says_it_cannot_be_imported_back():
-    bot = _bot()
-    bot.TEXT_FILE_SIZE_LIMIT = 100
-    _ = _export(bot, _thread(bot, 3))
-    _, _, caption = _document(bot)
-    assert '/import limit' in caption
 
 
 def test_it_needs_a_reply():

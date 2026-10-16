@@ -719,9 +719,8 @@ class ChatGPTTelegramBot:
             _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
             return
 
-        if document_message.document.size > self.TEXT_FILE_SIZE_LIMIT:
-            _ = await self.send_message(chat_id, '[!] File too large', msg_id)
-            return
+        # no size limit here: TEXT_FILE_SIZE_LIMIT exists because an attached text file is inlined
+        # into one prompt, and an import never reaches a model whole -- each turn is its own message
         text = decode_text_file(await document_message.download_media(bytes))
         if text is None:
             _ = await self.send_message(chat_id, '[!] File is not text file or not valid UTF-8', msg_id)
@@ -954,10 +953,6 @@ class ChatGPTTelegramBot:
         document = format_export(title, messages, datetime.datetime.now(datetime.UTC)).encode()
 
         caption = f'Exported "{title}" — {len(messages)} messages'
-        if len(document) > self.TEXT_FILE_SIZE_LIMIT:
-            caption += (
-                f'\nAt {len(document) // 1000} KB it is over the {self.TEXT_FILE_SIZE_LIMIT // 1000} KB /import limit.'
-            )
         _ = await self.send_document(chat_id, document, export_filename(title), caption, msg_id)
         logger.info(f'Exported {chat_id=}, {anchor_id=}, messages={len(messages)}, bytes={len(document)}')
 

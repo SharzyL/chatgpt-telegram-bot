@@ -46,6 +46,7 @@ from chatgpt_telegram_bot.utils import (
     parse_import,
     parse_manipulation,
     parse_proxy,
+    replied_message_id,
     retry,
     save_photo,
 )
@@ -540,15 +541,14 @@ class ChatGPTTelegramBot:
         msg_id = message.id
         logger.info(f'Manipulate requested: {chat_id=}, {msg_id=}, {body=}')
 
-        if not message.is_reply:
+        target_id = replied_message_id(message)
+        if target_id is None:
             _ = await self.send_message(chat_id, MANIPULATE_USAGE, msg_id)
             return
         reply_to_message = await message.get_reply_message()
         if reply_to_message is None or reply_to_message.sender_id != self.bot_id:
             _ = await self.send_message(chat_id, MANIPULATE_USAGE, msg_id)
             return
-        target_id = message.reply_to.reply_to_msg_id
-        assert isinstance(target_id, int)
         # the reply may still be streaming, and its MsgInfo is only written once it finishes
         await self.pending_reply_manager.wait_for((chat_id, target_id))
 
@@ -604,7 +604,7 @@ class ChatGPTTelegramBot:
         """The message holding the file to import: this one, or the one it replies to."""
         if message.document is not None:
             return message
-        if message.is_reply:
+        if replied_message_id(message) is not None:
             replied = await message.get_reply_message()
             if replied is not None and replied.document is not None:
                 return replied
@@ -736,14 +736,19 @@ class ChatGPTTelegramBot:
         if not text and message.photo is None and message.document is None:
             logger.debug(f'Unknown media types {chat_id=}, {msg_id=}')
             return
-        if message.is_reply:
+        # a message sitting in a forum topic carries a reply header too, so what counts as a
+        # reply is decided by replied_message_id rather than by the header being present
+        replied_id = replied_message_id(message)
+        if replied_id is not None:
             if message.reply_to.quote_text is not None:
                 logger.debug(f'Reply contains quote text {chat_id=}, {msg_id=}')
                 return
             reply_to_message = await message.get_reply_message()
+            if reply_to_message is None:
+                logger.debug(f'Replied message is unavailable {chat_id=}, {msg_id=}')
+                return
             if reply_to_message.sender_id == self.bot_id:  # user reply to a bot message
-                reply_to_id = message.reply_to.reply_to_msg_id
-                assert isinstance(reply_to_id, int)
+                reply_to_id = replied_id
                 await self.pending_reply_manager.wait_for((chat_id, reply_to_id))
             elif reply_to_message.photo is not None:  # user reply to a photo
                 extra_photo_message = reply_to_message
@@ -755,7 +760,7 @@ class ChatGPTTelegramBot:
         # a message that opens a thread has no model unless its prefix names one, so a
         # missing prefix is an error there; on a reply the prefix is optional and switches
         # the model for this turn and the ones after it
-        opens_thread = not message.is_reply or extra_photo_message is not None or extra_document_message is not None
+        opens_thread = replied_id is None or extra_photo_message is not None or extra_document_message is not None
         overrides: dict[str, str | None] = {}
         for m in self.models:
             match = match_prefix(text, m.prefix)
@@ -980,15 +985,18 @@ class ChatGPTTelegramBot:
         reply_to_id: int | None = None
         model_by_prefix: Model | None = None
 
-        if event.is_reply:
+        replied_id = replied_message_id(event.messages[0])
+        if replied_id is not None:
             first_msg = event.messages[0]
-            if first_msg.reply_to and first_msg.reply_to.quote_text is not None:
+            if first_msg.reply_to.quote_text is not None:
                 logger.debug(f'Album reply contains quote text {chat_id=}, {msg_id=}')
                 return
             reply_to_message = await event.get_reply_message()
+            if reply_to_message is None:
+                logger.debug(f'Replied message is unavailable {chat_id=}, {msg_id=}')
+                return
             if reply_to_message.sender_id == self.bot_id:
-                reply_to_id = first_msg.reply_to.reply_to_msg_id
-                assert isinstance(reply_to_id, int)
+                reply_to_id = replied_id
                 await self.pending_reply_manager.wait_for((chat_id, reply_to_id))
             else:
                 return
@@ -1007,7 +1015,7 @@ class ChatGPTTelegramBot:
                     return
                 break
         else:
-            if not event.is_reply:
+            if replied_id is None:
                 if chat_id == sender_id:
                     _ = await self.send_message(
                         chat_id,

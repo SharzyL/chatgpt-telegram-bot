@@ -53,6 +53,10 @@ To use the bot in a group you must **disable privacy mode** via BotFather
 (`/setprivacy` → Disable). With privacy mode on, Telegram delivers only commands and replies
 to the bot, so ordinary prefixed messages never arrive and the bot looks dead.
 
+In a group the bot answers two things and stays silent otherwise: a message starting with a
+model prefix, and a reply to one of its own messages. Forum topics are supported, including
+topics other than General.
+
 ## Talking to the bot
 
 Start a conversation with a message beginning with a model's prefix, and continue it by

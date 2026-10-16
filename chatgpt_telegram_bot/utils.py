@@ -266,6 +266,26 @@ def decode_text_file(blob: bytes) -> str | None:
     return text
 
 
+def replied_message_id(message: Any) -> int | None:
+    """The id of the message *message* is a reply to, or None if it replies to nothing.
+
+    A message merely posted in a forum topic still carries a reply header, pointing at the
+    message that created the topic (`forum_topic` set, no `reply_to_top_id`) — it is not a
+    reply to anything. A real reply inside a topic names its target in `reply_to_msg_id` and
+    the topic in `reply_to_top_id`. Only the General topic carries no header at all, so
+    taking any header as a reply makes a bot answer in General and nowhere else.
+
+    A reply to a story has a header of its own shape, with no message id to return.
+    """
+    header: Any = getattr(message, 'reply_to', None)
+    if header is None:
+        return None
+    if getattr(header, 'forum_topic', False) and getattr(header, 'reply_to_top_id', None) is None:
+        return None
+    replied_id: Any = getattr(header, 'reply_to_msg_id', None)
+    return replied_id if isinstance(replied_id, int) else None
+
+
 def telegram_len(s: str) -> int:
     """Length in UTF-16 code units, matching Telegram's counting."""
     return len(s.encode('utf-16-le')) // 2

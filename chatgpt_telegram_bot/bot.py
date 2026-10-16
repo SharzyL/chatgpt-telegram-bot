@@ -16,7 +16,7 @@ import anthropic
 import diskcache
 import openai
 from loguru import logger
-from telethon import TelegramClient, errors, events, functions, types
+from telethon import Button, TelegramClient, errors, events, functions, types
 from telethon.tl.custom import Message
 
 from chatgpt_telegram_bot.completion import completion, reasoning_text_of
@@ -29,13 +29,14 @@ from chatgpt_telegram_bot.models import (
     StatusChange,
     StreamMeta,
     ThinkingDelta,
+    ThreadTurn,
     make_image_part,
     make_reasoning_part,
     make_text_part,
     make_thinking_text_part,
 )
 from chatgpt_telegram_bot.render import ENTITY_RENDERER, SERVER_MARKDOWN_RENDERER, Rendered, Renderer
-from chatgpt_telegram_bot.reply import format_imported_turn, format_reply
+from chatgpt_telegram_bot.reply import format_imported_turn, format_navigation_page, format_reply
 from chatgpt_telegram_bot.utils import (
     PendingReplyManager,
     Throttle,
@@ -43,6 +44,7 @@ from chatgpt_telegram_bot.utils import (
     decode_text_file,
     load_photo,
     match_prefix,
+    message_link,
     parse_import,
     parse_manipulation,
     parse_proxy,
@@ -76,9 +78,14 @@ BOT_COMMANDS = [
     ('help', 'Show available models and usage'),
     ('regenerate', 'Answer the replied-to prompt again'),
     ('abort', 'Stop whatever is generating in this chat'),
+    ('navigate', 'List the turns of the replied-to thread'),
     ('manipulate', 'Rewrite the replied-to bot reply'),
     ('import', 'Replay a conversation from a JSON export'),
 ]
+
+NAVIGATE_USAGE = """[!] `/navigate` lists the turns of a thread, so it has to reply to a message in one.
+
+Reply to a bot message to include its answer; the listing opens on the last page."""
 
 REGENERATE_USAGE = """[!] `/regenerate` answers a prompt again in place, so it has to reply to a bot message:
 
@@ -188,6 +195,10 @@ class ChatGPTTelegramBot:
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
         self.TEXT_FILE_SIZE_LIMIT: int = 900_000
+        # /navigate: turns per page, and the width of a preview line in columns -- about what a
+        # phone shows on one line, with a wide (CJK) character counting two
+        self.NAVIGATE_PER_PAGE: int = 8
+        self.NAVIGATE_PREVIEW_WIDTH: int = 36
 
         self.pending_reply_manager: PendingReplyManager = PendingReplyManager()
         # prompts being answered right now, by (chat_id, msg_id). The flag turns True when
@@ -270,8 +281,14 @@ class ChatGPTTelegramBot:
                 await self.regenerate_handler(event.message, body)
             elif text == '/abort' or text == f'/abort@{me.username}':
                 await self.abort_handler(event.message)
+            elif text == '/navigate' or text == f'/navigate@{me.username}':
+                await self.navigate_handler(event.message)
             else:
                 await self.reply_handler(event.message)
+
+        @self.bot.on(events.CallbackQuery(pattern=rb'^nav:'))
+        async def _navigate_page(event: events.CallbackQuery.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
+            await self.navigate_callback(event)
 
         @self.bot.on(events.Album)  # pyright: ignore[reportArgumentType]  # telethon accepts event class at runtime
         async def _process_album(event: events.Album.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
@@ -451,6 +468,7 @@ class ChatGPTTelegramBot:
         lines.append('  <code>/regenerate &lt;prefix&gt; &lt;new prompt&gt;</code>  — another prompt too')
         lines.append('  The reply is written over in place.')
         lines.append('  <code>/abort</code> stops whatever is generating in this chat.')
+        lines.append('  <code>/navigate</code> lists the turns of the replied-to thread.')
         lines.append('')
         lines.append('<b>Manipulation</b>')
         lines.append('  Reply to a bot message with:')
@@ -517,7 +535,7 @@ class ChatGPTTelegramBot:
         return msg_id
 
     @retry()
-    async def send_message_html(self, chat_id: int, text: str, reply_to_message_id: int) -> int:
+    async def send_message_html(self, chat_id: int, text: str, reply_to_message_id: int, buttons: Any = None) -> int:
         logger.debug(f'Sending message html: {chat_id=}, {reply_to_message_id=}, {text=}')
         msg = await self.bot.send_message(
             chat_id,
@@ -525,6 +543,7 @@ class ChatGPTTelegramBot:
             reply_to=reply_to_message_id,
             link_preview=False,
             parse_mode='html',
+            buttons=buttons,
         )
         logger.debug(f'Message sent: {chat_id=}, {reply_to_message_id=}, {msg.id=}')
         return msg.id
@@ -745,6 +764,106 @@ class ChatGPTTelegramBot:
             previous_turn_id = msg_ids[0]
 
         logger.info(f'Imported {chat_id=}, {msg_id=}, title={chat.title!r}, turns={len(chat.turns)}')
+
+    def _thread_turns(self, chat_id: int, anchor_id: int) -> list[ThreadTurn] | None:
+        """The turns of the thread ending at *anchor_id*, oldest first, or None if it is not stored.
+
+        The walk goes backwards through reply_id, so it sees only the branch that leads to the
+        anchor: anchored on a prompt, that prompt's own answer is not part of it.
+        """
+        chain: list[tuple[int, MsgInfo]] = []
+        seen: set[int] = set()
+        cur: int | None = anchor_id
+        while cur is not None:
+            info = self.get_msg_info(chat_id, cur)
+            if info is None or cur in seen:  # a missing link, or a loop in damaged data
+                return None if not chain else self._turns_of(chain[::-1])
+            seen.add(cur)
+            chain.append((cur, info))
+            cur = info.reply_id
+        return self._turns_of(chain[::-1])
+
+    @staticmethod
+    def _turns_of(chain: list[tuple[int, MsgInfo]]) -> list[ThreadTurn]:
+        """Pair a chain of nodes, oldest first, into prompts and their answers."""
+        turns: list[ThreadTurn] = []
+        for mid, info in chain:
+            text = next((p.text for p in info.message if p.type_ == 'text' and p.text), '')
+            if not info.sent_by_bot:
+                if any(p.type_ == 'image' for p in info.message):
+                    text = ('🖼 ' + text).strip()
+                turns.append(ThreadTurn(prompt=text, response=None, msg_id=mid))
+            elif turns and turns[-1].response is None:
+                # jump to the start of a split answer rather than whichever part the chain names
+                part_ids = getattr(info, 'part_ids', None)
+                turns[-1] = turns[-1]._replace(response=text, msg_id=part_ids[0] if part_ids else mid)
+        return turns
+
+    def _navigation(self, chat_id: int, anchor_id: int, page: int | None) -> tuple[str, Any] | None:
+        """A /navigate page and its buttons; None for a thread that is not stored. page=None is the last."""
+        turns = self._thread_turns(chat_id, anchor_id)
+        if not turns:
+            return None
+        per_page = self.NAVIGATE_PER_PAGE
+        if page is None:
+            page = (len(turns) - 1) // per_page
+        body, page, pages = format_navigation_page(
+            turns, page, per_page, self.NAVIGATE_PREVIEW_WIDTH, lambda mid: message_link(chat_id, mid)
+        )
+        noun = 'turn' if len(turns) == 1 else 'turns'
+        text = f'🧭 <b>Thread</b> · {len(turns)} {noun}\n\n{body}'
+        if pages == 1:
+            return text, None
+        # the anchor travels in the button, so a press re-reads the thread as it is now
+        row: list[Any] = []
+        if page > 0:
+            row.append(Button.inline('‹', f'nav:{anchor_id}:{page - 1}'.encode()))
+        row.append(Button.inline(f'{page + 1}/{pages}', b'nav:noop'))
+        if page < pages - 1:
+            row.append(Button.inline('›', f'nav:{anchor_id}:{page + 1}'.encode()))
+        return text, [row]
+
+    @only_allowed
+    async def navigate_handler(self, message: Any) -> None:
+        """List the turns of the replied-to thread, a page at a time."""
+        chat_id = message.chat_id
+        msg_id = message.id
+        anchor_id = replied_message_id(message)
+        if anchor_id is None:
+            _ = await self.send_message(chat_id, NAVIGATE_USAGE, msg_id)
+            return
+        # a reply still streaming has no MsgInfo yet
+        await self.pending_reply_manager.wait_for((chat_id, anchor_id))
+        rendered = self._navigation(chat_id, anchor_id, None)
+        if rendered is None:
+            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
+            return
+        text, buttons = rendered
+        _ = await self.send_message_html(chat_id, text, msg_id, buttons=buttons)
+
+    async def navigate_callback(self, event: Any) -> None:
+        """Turn the page of a /navigate listing."""
+        chat_id: int | None = event.chat_id
+        data: bytes = event.data
+        if chat_id is None or not self.is_allowed(chat_id) or data == b'nav:noop':
+            await event.answer()
+            return
+        try:
+            _, anchor, page = data.decode().split(':')
+            anchor_id, page_no = int(anchor), int(page)
+        except ValueError:
+            await event.answer()
+            return
+        rendered = self._navigation(chat_id, anchor_id, page_no)
+        if rendered is None:
+            await event.answer('That thread is no longer stored', alert=True)
+            return
+        text, buttons = rendered
+        try:
+            await event.edit(text, parse_mode='html', buttons=buttons, link_preview=False)
+        except errors.MessageNotModifiedError:
+            pass
+        await event.answer()
 
     @only_allowed
     async def abort_handler(self, message: Any) -> None:

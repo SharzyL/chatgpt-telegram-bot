@@ -80,6 +80,16 @@ class MsgInfo(NamedTuple):
     part_ids: list[int] | None = None
 
 
+class ThreadTurn(NamedTuple):
+    """One prompt of a thread and what answered it, for /navigate."""
+
+    prompt: str
+    # None for a prompt still waiting on its answer
+    response: str | None
+    # the message to jump to: the answer if there is one, else the prompt itself
+    msg_id: int
+
+
 class ImportedChat(NamedTuple):
     """A conversation exported from elsewhere, as pairs of prompt and response."""
 

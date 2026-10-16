@@ -95,6 +95,8 @@ Commands:
   message to answer its prompt again, writing over the reply in place
 - `/abort` — stop whatever is generating in this chat; the reply keeps what it had, marked
   `[!aborted]`, and can still be replied to
+- `/navigate` — reply to a message to list the turns of its thread, one line each, paged with
+  buttons; in a supergroup each answer links to its message
 
 Attach a photo or a UTF-8 text file to a message, with or without a caption; you can also
 reply to someone else's photo or file to feed it to a model.

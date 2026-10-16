@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlparse
@@ -270,6 +271,49 @@ def decode_text_file(blob: bytes) -> str | None:
     if '\x00' in text:
         return None
     return text
+
+
+# markdown punctuation that is noise in a one-line preview: emphasis and code markers anywhere,
+# and heading, quote and list markers at the start of a line
+_PREVIEW_INLINE_RE = re.compile(r'\*\*|__|`+|~~')
+_PREVIEW_LINE_START_RE = re.compile(r'^\s*(?:#{1,6}\s+|>+\s?|[-*+]\s+)', re.MULTILINE)
+
+
+def _column_width(ch: str) -> int:
+    """Columns *ch* takes on screen: two for wide (CJK, fullwidth) characters, else one."""
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
+
+def preview_line(text: str, width: int) -> str:
+    """*text* as a single line of at most *width* columns, with an ellipsis if it was cut.
+
+    Columns rather than characters, because a line of Chinese holds half as many characters
+    as a line of English; counting characters would make a CJK preview wrap onto a second line.
+    """
+    text = _PREVIEW_LINE_START_RE.sub('', text)
+    text = _PREVIEW_INLINE_RE.sub('', text)
+    text = ' '.join(text.split())
+    used = 0
+    for i, ch in enumerate(text):
+        w = _column_width(ch)
+        # leave a column for the ellipsis
+        if used + w > width - 1 and i < len(text) - 1 or used + w > width:
+            return text[:i].rstrip() + '…'
+        used += w
+    return text
+
+
+def message_link(chat_id: int, msg_id: int) -> str | None:
+    """A t.me link to a message, which exists only in a supergroup or channel.
+
+    Their chat ids are the internal id with a -100 prefix; a private chat or a basic group has
+    no linkable messages, and a negative id is a stored half of an imported turn that was never
+    sent as a message.
+    """
+    peer = str(chat_id)
+    if not peer.startswith('-100') or msg_id <= 0:
+        return None
+    return f'https://t.me/c/{peer[4:]}/{msg_id}'
 
 
 def replace_text_part(parts: list[MsgPartInHistory], text: str) -> list[MsgPartInHistory]:

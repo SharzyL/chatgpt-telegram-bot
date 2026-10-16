@@ -1,6 +1,9 @@
+from collections.abc import Callable
+from html import escape as html_escape
 from typing import Any
 
-from chatgpt_telegram_bot.utils import balance_fences, normalize_math
+from chatgpt_telegram_bot.models import ThreadTurn
+from chatgpt_telegram_bot.utils import balance_fences, normalize_math, preview_line
 
 
 def _blockquote_markdown(text: str) -> str:
@@ -58,3 +61,24 @@ def format_imported_turn(prompt: str, response: str) -> str:
     from swallowing the response below it.
     """
     return _blockquote_markdown(balance_fences(normalize_math(prompt))) + '\n\n' + normalize_math(response)
+
+
+def format_navigation_page(
+    turns: list[ThreadTurn], page: int, per_page: int, width: int, link: Callable[[int], str | None]
+) -> tuple[str, int, int]:
+    """One page of a thread's turns as HTML, with the page it settled on and the page count.
+
+    *page* is clamped, so a stale button on a thread that has since shrunk still lands somewhere.
+    Each turn is two preview lines; the answer is a link to its message where the chat has links.
+    """
+    pages = max(1, -(-len(turns) // per_page))
+    page = min(max(page, 0), pages - 1)
+    lines: list[str] = []
+    for number, turn in enumerate(turns[page * per_page : (page + 1) * per_page], start=page * per_page + 1):
+        lines.append(f'<b>{number}.</b> 👤 {html_escape(preview_line(turn.prompt, width))}')
+        answer = html_escape(preview_line(turn.response, width)) if turn.response is not None else '<i>…</i>'
+        url = link(turn.msg_id)
+        if url is not None:
+            answer = f'<a href="{html_escape(url)}">{answer}</a>'
+        lines.append(f'      🤖 {answer}')
+    return '\n'.join(lines), page, pages

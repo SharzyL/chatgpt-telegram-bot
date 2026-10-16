@@ -43,6 +43,7 @@ def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = Non
     bot.allowed_chats = {CHAT}
     bot.bot_id = BOT_ID
     bot.pending_reply_manager = PendingReplyManager()
+    bot.generating = {}
     sent: list[Any] = []
     runs: list[tuple[int, list[int] | None]] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
@@ -287,3 +288,11 @@ def test_a_shorter_answer_deletes_the_surplus_and_records_only_what_is_left(monk
     assert ('delete', REPLY_IDS[2]) in bot.calls
     assert rows[REPLY_IDS[0]].part_ids == [REPLY_IDS[0]]
     assert rows[REPLY_IDS[0]].message[-1].text == 'a short answer'
+
+
+def test_a_second_regenerate_of_the_same_reply_is_refused():
+    bot = _bot()
+    bot.generating[(CHAT, PROMPT_ID)] = False
+    _ = _regenerate(bot)
+    assert bot.runs == []
+    assert bot.sent[0] == '[!] That reply is already being generated'

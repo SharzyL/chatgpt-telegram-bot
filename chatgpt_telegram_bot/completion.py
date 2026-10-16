@@ -1,6 +1,6 @@
 import base64
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from typing import Any
 
 import anthropic
@@ -479,8 +479,12 @@ async def completion(
     chat_id: int,
     msg_id: int,
     load_image: LoadImage,
-) -> AsyncIterator[StreamEvent]:
-    """Dispatch to the appropriate completion backend based on model.api_type."""
+) -> AsyncGenerator[StreamEvent, None]:
+    """Dispatch to the appropriate completion backend based on model.api_type.
+
+    An AsyncGenerator rather than a plain iterator because the caller closes it to stop a
+    generation early, which unwinds the backend and releases the HTTP stream.
+    """
     assert len(chat_history) % 2 == 1
     chat_history = [merge_thinking_text(parts) for parts in chat_history]
     last_msg_parts = chat_history[-1]

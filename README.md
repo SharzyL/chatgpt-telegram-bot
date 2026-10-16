@@ -93,6 +93,8 @@ Commands:
   conversation into the chat
 - `/regenerate`, `/regenerate <prefix>`, `/regenerate <prefix> <new prompt>` — reply to a bot
   message to answer its prompt again, writing over the reply in place
+- `/abort` — stop whatever is generating in this chat; the reply keeps what it had, marked
+  `[!aborted]`, and can still be replied to
 
 Attach a photo or a UTF-8 text file to a message, with or without a caption; you can also
 reply to someone else's photo or file to feed it to a model.

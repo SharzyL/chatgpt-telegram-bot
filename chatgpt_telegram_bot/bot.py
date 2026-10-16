@@ -68,6 +68,18 @@ ENTITY_PROMPT_APPEND = (
 
 # /manipulate is deliberately not registered as a bot command: it needs both a reply target
 # and a body, so picking it from the command palette could only ever fail
+# Commands offered in the palette. BotCommand carries only a name and a description, with no
+# way to say that an argument is required, so picking one that needs a body sends it empty and
+# gets its usage text back -- which is a fair trade for being discoverable.
+BOT_COMMANDS = [
+    ('ping', 'Test bot connectivity'),
+    ('help', 'Show available models and usage'),
+    ('regenerate', 'Answer the replied-to prompt again'),
+    ('abort', 'Stop whatever is generating in this chat'),
+    ('manipulate', 'Rewrite the replied-to bot reply'),
+    ('import', 'Replay a conversation from a JSON export'),
+]
+
 REGENERATE_USAGE = """[!] `/regenerate` answers a prompt again in place, so it has to reply to a bot message:
 
 `/regenerate` — the same prompt and model
@@ -178,6 +190,9 @@ class ChatGPTTelegramBot:
         self.TEXT_FILE_SIZE_LIMIT: int = 900_000
 
         self.pending_reply_manager: PendingReplyManager = PendingReplyManager()
+        # prompts being answered right now, by (chat_id, msg_id). The flag turns True when
+        # /abort asks that generation to stop, which it does at its next stream event.
+        self.generating: dict[tuple[int, int], bool] = {}
 
         # db scheme:
         # msg_info_{chat_id}_{msg_id}: MsgInfo
@@ -253,6 +268,8 @@ class ChatGPTTelegramBot:
             elif command in ('/regenerate', f'/regenerate@{me.username}'):
                 body = command_parts[1] if len(command_parts) > 1 else ''
                 await self.regenerate_handler(event.message, body)
+            elif text == '/abort' or text == f'/abort@{me.username}':
+                await self.abort_handler(event.message)
             else:
                 await self.reply_handler(event.message)
 
@@ -267,13 +284,7 @@ class ChatGPTTelegramBot:
             functions.bots.SetBotCommandsRequest(
                 scope=types.BotCommandScopePeer(admin_input_peer),
                 lang_code='',
-                commands=[
-                    types.BotCommand(command, description)
-                    for command, description in [
-                        ('ping', 'Test bot connectivity'),
-                        ('help', 'Show available models and usage'),
-                    ]
-                ],
+                commands=[types.BotCommand(command, description) for command, description in BOT_COMMANDS],
             )
         )
 
@@ -281,13 +292,7 @@ class ChatGPTTelegramBot:
             functions.bots.SetBotCommandsRequest(
                 scope=types.BotCommandScopeDefault(),
                 lang_code='',
-                commands=[
-                    types.BotCommand(command, description)
-                    for command, description in [
-                        ('ping', 'Test bot connectivity'),
-                        ('help', 'Show available models and usage'),
-                    ]
-                ],
+                commands=[types.BotCommand(command, description) for command, description in BOT_COMMANDS],
             )
         )
         logger.info('Bot commands registered')
@@ -445,6 +450,7 @@ class ChatGPTTelegramBot:
         lines.append('  <code>/regenerate &lt;prefix&gt;</code>  — another model')
         lines.append('  <code>/regenerate &lt;prefix&gt; &lt;new prompt&gt;</code>  — another prompt too')
         lines.append('  The reply is written over in place.')
+        lines.append('  <code>/abort</code> stops whatever is generating in this chat.')
         lines.append('')
         lines.append('<b>Manipulation</b>')
         lines.append('  Reply to a bot message with:')
@@ -741,6 +747,20 @@ class ChatGPTTelegramBot:
         logger.info(f'Imported {chat_id=}, {msg_id=}, title={chat.title!r}, turns={len(chat.turns)}')
 
     @only_allowed
+    async def abort_handler(self, message: Any) -> None:
+        """Ask whatever is generating in this chat to stop."""
+        chat_id = message.chat_id
+        msg_id = message.id
+        running = [key for key in self.generating if key[0] == chat_id]
+        logger.info(f'Abort requested: {chat_id=}, {msg_id=}, running={len(running)}')
+        if not running:
+            _ = await self.send_message(chat_id, '[!] Nothing is generating in this chat', msg_id)
+            return
+        for key in running:
+            self.generating[key] = True
+        # no confirmation: each reply marks itself `[!aborted]` as it stops, which is the receipt
+
+    @only_allowed
     async def regenerate_handler(self, message: Any, body: str) -> None:
         """Answer a prompt again, writing over the reply that is there."""
         chat_id = message.chat_id
@@ -766,6 +786,12 @@ class ChatGPTTelegramBot:
         prompt_info = self.get_msg_info(chat_id, prompt_id)
         if prompt_info is None or prompt_info.sent_by_bot:
             _ = await self.send_message(chat_id, '[!] No stored prompt for that message', msg_id)
+            return
+        # wait_for above only covers a generation that has already claimed its messages; two
+        # /regenerate arriving together would both get past it and the second would collide
+        # on claiming them
+        if (chat_id, prompt_id) in self.generating:
+            _ = await self.send_message(chat_id, '[!] That reply is already being generated', msg_id)
             return
 
         # the argument parses exactly as a message prefix does, so the text left over after
@@ -925,7 +951,15 @@ class ChatGPTTelegramBot:
 
         await self._run_completion(chat_id, msg_id)
 
-    async def _run_completion(self, chat_id: int, msg_id: int, adopt: list[int] | None = None):
+    async def _run_completion(self, chat_id: int, msg_id: int, adopt: list[int] | None = None) -> None:
+        """Answer *msg_id*, recorded as in flight so /abort can reach it."""
+        self.generating[(chat_id, msg_id)] = False
+        try:
+            await self._generate(chat_id, msg_id, adopt)
+        finally:
+            _ = self.generating.pop((chat_id, msg_id), None)
+
+    async def _generate(self, chat_id: int, msg_id: int, adopt: list[int] | None = None):
         try:
             chat_history, model, system_prompt = self.construct_chat_history(chat_id, msg_id)
         except RuntimeError as e:
@@ -965,7 +999,15 @@ class ChatGPTTelegramBot:
                     stream = completion(client, chat_history, model, system_prompt, chat_id, msg_id, load_image)
                     stream_start = time.time()
                     first_token_time: float | None = None
+                    aborted = False
                     async for event in stream:
+                        if self.generating.get((chat_id, msg_id)):
+                            # closing the generator unwinds the backend and drops the HTTP
+                            # stream, rather than leaving it to be collected later
+                            logger.info(f'Aborting generation ({chat_id=}, {msg_id=})')
+                            await stream.aclose()
+                            aborted = True
+                            break
                         if isinstance(event, ThinkingDelta):
                             if first_token_time is None:
                                 first_token_time = time.time()
@@ -997,6 +1039,7 @@ class ChatGPTTelegramBot:
                             thinking,
                             reply,
                             True,
+                            status='aborted' if aborted else None,
                             tool_calls=stream_meta.tool_calls or None,
                             usage=usage or None,
                         ),

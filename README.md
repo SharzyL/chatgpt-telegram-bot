@@ -25,6 +25,8 @@ A fork of [zzh1996/chatgpt-telegram-bot](https://github.com/zzh1996/chatgpt-tele
   from that point on.
 - **Output manipulation** — `/manipulate` rewrites what the bot is recorded as having said, so
   later turns build on your version.
+- **Regeneration** — `/regenerate` answers a prompt again in place, optionally on another
+  model or with the prompt reworded.
 - **Conversation import** — `/import` replays a conversation exported from elsewhere into the
   chat, one message per turn, each of them replyable.
 - **Long replies** — output over Telegram's per-message limit is split across several messages.
@@ -89,6 +91,8 @@ Commands:
   message with this to rewrite what it is recorded as having said
 - `/import`, or `/import <prefix>` — attach a JSON export (or reply to one) to replay a
   conversation into the chat
+- `/regenerate`, `/regenerate <prefix>`, `/regenerate <prefix> <new prompt>` — reply to a bot
+  message to answer its prompt again, writing over the reply in place
 
 Attach a photo or a UTF-8 text file to a message, with or without a caption; you can also
 reply to someone else's photo or file to feed it to a model.

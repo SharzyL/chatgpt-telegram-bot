@@ -84,7 +84,8 @@ def _bot() -> Any:
         sent.append(body)
         return 999
 
-    async def run_completion(chat_id: int, msg_id: int) -> None:
+    async def run_completion(chat_id: int, msg_id: int, adopt: list[int] | None = None) -> None:
+        assert adopt is None
         completions.append((chat_id, msg_id))
 
     bot.send_message = send_message  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub

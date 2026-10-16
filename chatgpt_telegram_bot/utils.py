@@ -10,7 +10,13 @@ import diskcache
 from loguru import logger
 from telethon import errors
 
-from chatgpt_telegram_bot.models import OVERRIDE_ALIASES, ImportedChat, Model
+from chatgpt_telegram_bot.models import (
+    OVERRIDE_ALIASES,
+    ImportedChat,
+    Model,
+    MsgPartInHistory,
+    make_text_part,
+)
 
 
 def split_respecting_brackets(s: str, delimiters: str = ',') -> list[str]:
@@ -264,6 +270,21 @@ def decode_text_file(blob: bytes) -> str | None:
     if '\x00' in text:
         return None
     return text
+
+
+def replace_text_part(parts: list[MsgPartInHistory], text: str) -> list[MsgPartInHistory]:
+    """*parts* with its text replaced, keeping an attached image where it was."""
+    replaced = False
+    result: list[MsgPartInHistory] = []
+    for part in parts:
+        if part.type_ == 'text' and not replaced:
+            result.append(make_text_part(text))
+            replaced = True
+        else:
+            result.append(part)
+    if not replaced:
+        result.insert(0, make_text_part(text))
+    return result
 
 
 def replied_message_id(message: Any) -> int | None:

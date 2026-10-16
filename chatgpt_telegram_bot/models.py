@@ -76,6 +76,9 @@ class MsgInfo(NamedTuple):
     """only present for head of conversation, stores inline parameter overrides"""
     overrides: dict[str, str | None] | None = None
 
+    """every message id this reply occupies, so a regeneration can reuse all of them"""
+    part_ids: list[int] | None = None
+
 
 class ImportedChat(NamedTuple):
     """A conversation exported from elsewhere, as pairs of prompt and response."""

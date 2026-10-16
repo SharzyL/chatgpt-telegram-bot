@@ -46,6 +46,7 @@ from chatgpt_telegram_bot.utils import (
     parse_import,
     parse_manipulation,
     parse_proxy,
+    replace_text_part,
     replied_message_id,
     retry,
     save_photo,
@@ -67,6 +68,14 @@ ENTITY_PROMPT_APPEND = (
 
 # /manipulate is deliberately not registered as a bot command: it needs both a reply target
 # and a body, so picking it from the command palette could only ever fail
+REGENERATE_USAGE = """[!] `/regenerate` answers a prompt again in place, so it has to reply to a bot message:
+
+`/regenerate` — the same prompt and model
+`/regenerate <prefix>` — the same prompt, another model
+`/regenerate <prefix> <new prompt>` — both
+
+The first word is always a model prefix, so changing only the prompt means naming the model it is already on."""
+
 IMPORT_USAGE = """[!] `/import` needs an exported conversation as a JSON file, either attached to the command or replied to.
 
 `/import` — continue the imported chat with the first configured model
@@ -241,6 +250,9 @@ class ChatGPTTelegramBot:
             elif command in ('/import', f'/import@{me.username}'):
                 body = command_parts[1] if len(command_parts) > 1 else ''
                 await self.import_handler(event.message, body)
+            elif command in ('/regenerate', f'/regenerate@{me.username}'):
+                body = command_parts[1] if len(command_parts) > 1 else ''
+                await self.regenerate_handler(event.message, body)
             else:
                 await self.reply_handler(event.message)
 
@@ -427,6 +439,13 @@ class ChatGPTTelegramBot:
         lines.append('  <code>/import</code> or <code>/import &lt;prefix&gt;</code>')
         lines.append('  Each turn becomes a message you can reply to to continue from there.')
         lines.append('')
+        lines.append('<b>Regeneration</b>')
+        lines.append('  Reply to a bot message with:')
+        lines.append('  <code>/regenerate</code>  — same prompt and model')
+        lines.append('  <code>/regenerate &lt;prefix&gt;</code>  — another model')
+        lines.append('  <code>/regenerate &lt;prefix&gt; &lt;new prompt&gt;</code>  — another prompt too')
+        lines.append('  The reply is written over in place.')
+        lines.append('')
         lines.append('<b>Manipulation</b>')
         lines.append('  Reply to a bot message with:')
         lines.append('  <code>/manipulate &lt;text&gt;</code>')
@@ -595,6 +614,7 @@ class ChatGPTTelegramBot:
                 prefix=target_info.prefix,
                 system_prompt=target_info.system_prompt,
                 overrides=target_info.overrides,
+                part_ids=getattr(target_info, 'part_ids', None),
             ),
         )
         await self.edit_message(chat_id, bodies[0], target_id)
@@ -710,6 +730,7 @@ class ChatGPTTelegramBot:
                 reply_id=prompt_id,
                 prefix=None,
                 system_prompt=None,
+                part_ids=list(msg_ids),
             )
             # a turn too long for one message is stored under every part, so replying to any
             # of them continues from the same point
@@ -718,6 +739,78 @@ class ChatGPTTelegramBot:
             previous_turn_id = msg_ids[0]
 
         logger.info(f'Imported {chat_id=}, {msg_id=}, title={chat.title!r}, turns={len(chat.turns)}')
+
+    @only_allowed
+    async def regenerate_handler(self, message: Any, body: str) -> None:
+        """Answer a prompt again, writing over the reply that is there."""
+        chat_id = message.chat_id
+        msg_id = message.id
+        logger.info(f'Regenerate requested: {chat_id=}, {msg_id=}, {body=}')
+
+        target_id = replied_message_id(message)
+        if target_id is None:
+            _ = await self.send_message(chat_id, REGENERATE_USAGE, msg_id)
+            return
+        reply_to_message = await message.get_reply_message()
+        if reply_to_message is None or reply_to_message.sender_id != self.bot_id:
+            _ = await self.send_message(chat_id, REGENERATE_USAGE, msg_id)
+            return
+        # the reply may still be streaming, and its MsgInfo is only written once it finishes
+        await self.pending_reply_manager.wait_for((chat_id, target_id))
+
+        target_info = self.get_msg_info(chat_id, target_id)
+        if target_info is None or not target_info.sent_by_bot or target_info.reply_id is None:
+            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
+            return
+        prompt_id = target_info.reply_id
+        prompt_info = self.get_msg_info(chat_id, prompt_id)
+        if prompt_info is None or prompt_info.sent_by_bot:
+            _ = await self.send_message(chat_id, '[!] No stored prompt for that message', msg_id)
+            return
+
+        # the argument parses exactly as a message prefix does, so the text left over after
+        # the prefix and its overrides is the new prompt
+        model: Model | None = None
+        overrides: dict[str, str | None] = {}
+        new_prompt = ''
+        if body.strip():
+            for m in self.models:
+                match = match_prefix(body, m.prefix)
+                if match is not None:
+                    new_prompt, overrides = match
+                    try:
+                        model = apply_overrides(m, overrides)
+                    except ValueError as e:
+                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+                        return
+                    break
+            else:
+                _ = await self.send_message(chat_id, REGENERATE_USAGE, msg_id)
+                return
+
+        # a named model and a new prompt both belong to the turn being answered, so they are
+        # recorded on its prompt exactly as sending it afresh with that prefix would
+        if model is not None or new_prompt:
+            parts = list(prompt_info.message)
+            if new_prompt:
+                parts = replace_text_part(parts, new_prompt)
+            self.set_msg_info(
+                chat_id,
+                prompt_id,
+                MsgInfo(
+                    sent_by_bot=False,
+                    message=parts,
+                    reply_id=prompt_info.reply_id,
+                    prefix=model.prefix if model is not None else prompt_info.prefix,
+                    system_prompt=self._system_prompt_for(model) if model is not None else prompt_info.system_prompt,
+                    overrides=(overrides or None) if model is not None else prompt_info.overrides,
+                ),
+            )
+
+        # every part of the old reply is written over, and a shorter one deletes the rest
+        adopt = list(getattr(target_info, 'part_ids', None) or [target_id])
+        logger.info(f'Regenerating {chat_id=}, {prompt_id=}, {adopt=}, reprompted={bool(new_prompt)}')
+        await self._run_completion(chat_id, prompt_id, adopt=adopt)
 
     @only_allowed
     async def reply_handler(self, message: Any) -> None:
@@ -832,7 +925,7 @@ class ChatGPTTelegramBot:
 
         await self._run_completion(chat_id, msg_id)
 
-    async def _run_completion(self, chat_id: int, msg_id: int):
+    async def _run_completion(self, chat_id: int, msg_id: int, adopt: list[int] | None = None):
         try:
             chat_history, model, system_prompt = self.construct_chat_history(chat_id, msg_id)
         except RuntimeError as e:
@@ -847,7 +940,7 @@ class ChatGPTTelegramBot:
             thinking_done = False
             stream_meta = StreamMeta()
             prefix = self._reply_prefix(model)
-            async with BotReplyMessages(self, chat_id, msg_id, prefix, self.get_renderer(model)) as replymsgs:
+            async with BotReplyMessages(self, chat_id, msg_id, prefix, self.get_renderer(model), adopt) as replymsgs:
                 try:
                     endpoint = model.endpoint or self.default_endpoint
                     status: str | None = 'Generating...'
@@ -927,7 +1020,8 @@ class ChatGPTTelegramBot:
                         else:
                             reply_parts.append(make_reasoning_part(model.name, item))
                     reply_parts.append(make_text_part(full_reply))
-                    for bot_msg_id, _ in replymsgs.replied_msgs:
+                    part_ids = [bot_msg_id for bot_msg_id, _ in replymsgs.replied_msgs]
+                    for bot_msg_id in part_ids:
                         self.set_msg_info(
                             chat_id,
                             bot_msg_id,
@@ -937,6 +1031,7 @@ class ChatGPTTelegramBot:
                                 reply_id=msg_id,
                                 prefix=None,
                                 system_prompt=None,
+                                part_ids=list(part_ids),
                             ),
                         )
                     return
@@ -1068,14 +1163,25 @@ is_allowed={self.is_allowed(message.chat_id)}
 
 class BotReplyMessages:
     def __init__(
-        self, cbot: ChatGPTTelegramBot, chat_id: int, orig_msg_id: int, prefix: str, renderer: Renderer
+        self,
+        cbot: ChatGPTTelegramBot,
+        chat_id: int,
+        orig_msg_id: int,
+        prefix: str,
+        renderer: Renderer,
+        adopt: list[int] | None = None,
     ) -> None:
         self.cbot: ChatGPTTelegramBot = cbot
         self.prefix: str = prefix
         self.renderer: Renderer = renderer
         self.chat_id: int = chat_id
         self.orig_msg_id: int = orig_msg_id
-        self.replied_msgs: list[tuple[int, Rendered]] = []
+        # messages a regeneration writes over: seeding them as already-sent parts makes
+        # `_apply` edit them, and delete the ones a shorter reply no longer needs. Their
+        # recorded text is empty so the first flush always counts as a change.
+        self.replied_msgs: list[tuple[int, Rendered]] = [(mid, Rendered(text='')) for mid in adopt or []]
+        for mid in adopt or []:
+            cbot.pending_reply_manager.add((chat_id, mid))
         self.text: str = ''
         self.collapse_first_quote: bool = False
         self.throttle: Throttle = Throttle(

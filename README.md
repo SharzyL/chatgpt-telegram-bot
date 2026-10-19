@@ -91,8 +91,9 @@ Commands:
   message with this to rewrite what it is recorded as having said
 - `/import`, or `/import <prefix>` — attach a JSON export (or reply to one) to replay a
   conversation into the chat
-- `/regenerate`, `/regenerate <prefix>`, `/regenerate <prefix> <new prompt>` — reply to a bot
-  message to answer its prompt again, writing over the reply in place
+- `/regenerate`, `/regenerate <prefix>`, `/regenerate <new prompt>`,
+  `/regenerate <prefix> <new prompt>` — reply to a bot message to answer its prompt again,
+  writing over the reply in place. A first word that is a model prefix is read as one
 - `/abort` — stop whatever is generating in this chat; the reply keeps what it had, marked
   `[!aborted]`, and can still be replied to
 - `/navigate` — reply to a message to list the turns of its thread, one line each, paged with

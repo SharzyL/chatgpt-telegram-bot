@@ -114,9 +114,10 @@ REGENERATE_USAGE = """[!] `/regenerate` answers a prompt again in place, so it h
 
 `/regenerate` — the same prompt and model
 `/regenerate <prefix>` — the same prompt, another model
+`/regenerate <new prompt>` — another prompt, the same model
 `/regenerate <prefix> <new prompt>` — both
 
-The first word is always a model prefix, so changing only the prompt means naming the model it is already on."""
+A first word that is a model prefix is read as one, so a new prompt that happens to start with a prefix needs the model named in front of it."""
 
 IMPORT_USAGE = """[!] `/import` needs an exported conversation as a JSON file, either attached to the command or replied to.
 
@@ -501,6 +502,7 @@ class ChatGPTTelegramBot:
         lines.append('  Reply to a bot message with:')
         lines.append('  <code>/regenerate</code>  — same prompt and model')
         lines.append('  <code>/regenerate &lt;prefix&gt;</code>  — another model')
+        lines.append('  <code>/regenerate &lt;new prompt&gt;</code>  — another prompt')
         lines.append('  <code>/regenerate &lt;prefix&gt; &lt;new prompt&gt;</code>  — another prompt too')
         lines.append('  The reply is written over in place.')
         lines.append('  <code>/abort</code> stops whatever is generating in this chat.')
@@ -1168,11 +1170,12 @@ class ChatGPTTelegramBot:
             return
 
         # the argument parses exactly as a message prefix does, so the text left over after
-        # the prefix and its overrides is the new prompt
+        # the prefix and its overrides is the new prompt; an argument that opens with no
+        # prefix is all prompt, and keeps the model the turn was on
         model: Model | None = None
         overrides: dict[str, str | None] = {}
-        new_prompt = ''
-        if body.strip():
+        new_prompt = body.strip()
+        if new_prompt:
             for m in self.models:
                 match = match_prefix(body, m.prefix)
                 if match is not None:
@@ -1183,9 +1186,6 @@ class ChatGPTTelegramBot:
                         _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
                         return
                     break
-            else:
-                _ = await self.send_message(chat_id, REGENERATE_USAGE, msg_id)
-                return
 
         # a named model and a new prompt both belong to the turn being answered, so they are
         # recorded on its prompt exactly as sending it afresh with that prefix would

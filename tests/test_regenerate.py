@@ -131,10 +131,31 @@ def test_every_part_of_a_split_reply_is_written_over():
     assert bot.runs == [(PROMPT_ID, REPLY_IDS)], 'replying to any part regenerates all of them'
 
 
-def test_an_unknown_prefix_shows_the_usage():
+def test_text_without_a_prefix_replaces_only_the_prompt():
+    before = _prompt(_bot())
     bot = _regenerate(_bot(), 'nonsense words')
-    assert bot.runs == []
-    assert bot.sent[0].startswith('[!] `/regenerate`')
+    assert bot.runs == [(PROMPT_ID, [REPLY_IDS[0]])]
+    info = _prompt(bot)
+    assert info.message[0].text == 'nonsense words'
+    # the model, its overrides and its prompt are those the turn was already on
+    assert info.prefix == 'g'
+    assert info.overrides == {'t': 'high'}
+    assert info.system_prompt == before.system_prompt
+
+
+def test_a_bare_prompt_keeps_the_image():
+    bot = _bot([make_text_part('look'), make_image_part('deadbeef')])
+    _ = _regenerate(bot, '  what is this\n')
+    parts = _prompt(bot).message
+    assert [p.type_ for p in parts] == ['text', 'image']
+    assert parts[0].text == 'what is this'
+
+
+def test_a_word_that_is_a_prefix_is_read_as_one():
+    bot = _regenerate(_bot(), 'c is a letter')
+    info = _prompt(bot)
+    assert info.prefix == 'c'
+    assert info.message[0].text == 'is a letter'
 
 
 def test_a_bad_override_is_reported():

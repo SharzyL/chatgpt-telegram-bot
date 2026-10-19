@@ -1,4 +1,4 @@
-from chatgpt_telegram_bot.completion import merge_thinking_text
+from chatgpt_telegram_bot.completion import drop_thinking_text, thinking_text_of
 from chatgpt_telegram_bot.models import (
     MsgPartInHistory,
     make_image_part,
@@ -45,36 +45,20 @@ def test_unclosed_think_block_is_text():
     assert parse_manipulation('<think>cot') == (None, '<think>cot')
 
 
-def test_merge_wraps_thinking_into_the_text_part():
-    parts = [make_thinking_text_part('cot'), make_text_part('answer')]
-    assert merge_thinking_text(parts) == [make_text_part('<think>\ncot\n</think>\n\nanswer')]
-
-
-def test_merge_is_a_noop_without_thinking_text():
-    parts = [make_text_part('answer'), make_image_part('deadbeef')]
-    assert merge_thinking_text(parts) == parts
-
-
-def test_merge_keeps_other_part_types():
+def test_drop_removes_only_thinking_text():
     item = {'type': 'reasoning', 'id': 'rs_1', 'encrypted_content': 'blob'}
     parts = [make_reasoning_part('m', item), make_thinking_text_part('cot'), make_text_part('answer')]
-    merged = merge_thinking_text(parts)
-    assert [p.type_ for p in merged] == ['reasoning', 'text']
-    assert merged[1].text == '<think>\ncot\n</think>\n\nanswer'
+    assert [p.type_ for p in drop_thinking_text(parts)] == ['reasoning', 'text']
+    assert drop_thinking_text(parts)[1] == make_text_part('answer'), 'the text is left as it was, no <think> block'
 
 
-def test_merge_without_a_text_part_emits_one():
-    merged = merge_thinking_text([make_thinking_text_part('cot')])
-    assert merged == [make_text_part('<think>\ncot\n</think>')]
+def test_drop_is_a_noop_without_thinking_text():
+    parts = [make_text_part('answer'), make_image_part('deadbeef')]
+    assert drop_thinking_text(parts) == parts
 
 
-def test_merge_only_touches_the_first_text_part():
-    parts = [make_thinking_text_part('cot'), make_text_part('a'), make_text_part('b')]
-    merged = merge_thinking_text(parts)
-    assert merged == [make_text_part('<think>\ncot\n</think>\n\na'), make_text_part('b')]
-
-
-def test_merge_handles_a_blank_thinking_part():
+def test_thinking_text_of_joins_and_skips_blanks():
     blank = MsgPartInHistory(type_='thinking_text', hash=None, text=None)
-    parts = [blank, make_text_part('answer')]
-    assert merge_thinking_text(parts) == parts
+    parts = [make_thinking_text_part('one'), blank, make_text_part('answer'), make_thinking_text_part('two')]
+    assert thinking_text_of(parts) == 'one\n\ntwo'
+    assert thinking_text_of([make_text_part('answer')]) == ''

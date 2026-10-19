@@ -177,6 +177,8 @@ class ChatGPTTelegramBot:
         for model in self.models:
             if ' ' in model.prefix or ',' in model.prefix:
                 raise ValueError(f'prefix must not contain space or ",": "{model.prefix}"')
+            if model.dummy_tool and model.api_type != 'openai':
+                raise ValueError(f'dummy_tool needs api_type openai, got model "{model.prefix}"')
             if model.thinking == 'adaptive' and model.api_type != 'anthropic':
                 raise ValueError(
                     'thinking="adaptive" is only supported for api_type="anthropic",'
@@ -416,6 +418,8 @@ class ChatGPTTelegramBot:
             flags.append('search')
         if model.richtext:
             flags.append('richtext')
+        if model.dummy_tool:
+            flags.append('dummy_tool')
         return flags
 
     @staticmethod
@@ -505,6 +509,7 @@ class ChatGPTTelegramBot:
             '  <code>&lt;prefix&gt;,s &lt;message&gt;</code>  — enable search',
             '  <code>&lt;prefix&gt;,r &lt;message&gt;</code>  — let Telegram render the markdown',
             '  <code>&lt;prefix&gt;,r= &lt;message&gt;</code>  — render to entities instead',
+            '  <code>&lt;prefix&gt;,dt &lt;message&gt;</code>  — dummy tool: pass earlier thinking back (DeepSeek)',
             '  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt',
             '  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt',
             '  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt',
@@ -530,7 +535,7 @@ class ChatGPTTelegramBot:
             + ' a first word that is a prefix is read as one.',
             '  <code>/manipulate &lt;text&gt;</code>, or <code>/mani</code>',
             '    Reply to a bot message to rewrite what it said; later turns build on yours.'
-            + ' Lead with <code>&lt;think&gt;…&lt;/think&gt;</code> to supply its reasoning.',
+            + ' Lead with <code>&lt;think&gt;…&lt;/think&gt;</code> to supply its reasoning, sent under dt.',
             '  <code>/import [prefix]</code>',
             '    Attach an exported JSON file, or reply to one, to replay it as messages to reply to.'
             + ' Without a prefix, the first reply chooses the model.',

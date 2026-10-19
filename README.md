@@ -77,12 +77,22 @@ Overrides go between the prefix and the message, separated by commas:
 | `gpt,s hello` | enable web search (`openai` and `anthropic` backends) |
 | `gpt,r hello` | let Telegram render the markdown server-side |
 | `gpt,r= hello` | render to message entities on the client instead |
+| `gpt,dt hello` | dummy tool: pass earlier chains of thought back, the way DeepSeek needs (see below) |
+| `gpt,dt= hello` | no dummy tool, and earlier chains of thought dropped (the default) |
 | `gpt,[be terse] hello` | replace the system prompt for this conversation |
 | `gpt,+[be terse] hello` | append to the default system prompt |
 | `gpt,[] hello` | send no system prompt at all |
 
 Several can be combined (`gpt,t=high,s hello`), and brackets may contain spaces and escaped
 brackets (`\[`, `\]`).
+
+A model's chain of thought is shown with each reply, but by default earlier ones are not sent
+back. With `dt` (dummy tool) they are, as reasoning: DeepSeek keeps a passed-back chain of
+thought only in a request that offers a tool, so `dt` adds one that does nothing (about 230
+extra prompt tokens a request, almost all of them DeepSeek's own tool prompt) and sends the earlier chains of thought with it. It is meant
+for DeepSeek models on the Responses API (`api_type = "openai"`, the default) and refused for
+other backends; OpenAI models carry their own encrypted reasoning without it. A chain of thought supplied
+with `/manipulate` also reaches the model only under `dt`.
 
 Commands (picking one from Telegram's command menu sends it at once, so the menu holds only
 those safe to send bare; type `/regenerate`, `/manipulate` and `/import`, and see `/help` for
@@ -170,6 +180,7 @@ Each entry in `models`:
 | `thinking` | `null` | effort level, token budget, or `"adaptive"` (Anthropic only) |
 | `search` | `false` | enable web search |
 | `richtext` | `false` | let Telegram render the markdown rather than sending entities |
+| `dummy_tool` | `false` | offer a do-nothing tool and pass earlier chains of thought back (`,dt`); `api_type = "openai"` only |
 | `system_prompt` | `null` | replaces the default prompt for this model |
 | `system_prompt_append` | `null` | appended to the default prompt |
 | `no_system_prompt` | `false` | send no system prompt |

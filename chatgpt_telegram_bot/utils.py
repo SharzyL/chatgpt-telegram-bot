@@ -155,6 +155,12 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
         elif field == 'richtext':
             # bare key (|r) enables, explicit empty (|r=) disables
             replacements['richtext'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
+        elif field == 'dummy_tool':
+            # bare key (|dt) enables, explicit empty (|dt=) disables
+            enabled = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
+            if enabled and model.api_type != 'openai':
+                raise ValueError('dt needs api_type openai')
+            replacements['dummy_tool'] = enabled
         elif field == 'system_prompt':
             replacements['system_prompt'] = value
         elif field == 'system_prompt_append':

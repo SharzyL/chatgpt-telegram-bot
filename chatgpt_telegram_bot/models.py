@@ -15,6 +15,9 @@ class Model(NamedTuple):
     thinking: int | str | None = None  # None = disabled, int = budget, str = effort level or 'adaptive'
     search: bool = False
     richtext: bool = False  # True = let Telegram render the markdown, False = client-side entities
+    # True = offer a tool that does nothing, which is what makes DeepSeek keep passed-back
+    # chains of thought, and pass the stored ones back as reasoning; False = drop them
+    dummy_tool: bool = False
 
 
 class EndPoint(NamedTuple):
@@ -128,4 +131,4 @@ class StreamMeta(StreamEvent):
     carry_items: list[dict[str, Any]] = field(default_factory=list)
 
 
-OVERRIDE_ALIASES: dict[str, str] = {'t': 'thinking', 's': 'search', 'r': 'richtext'}
+OVERRIDE_ALIASES: dict[str, str] = {'t': 'thinking', 's': 'search', 'r': 'richtext', 'dt': 'dummy_tool'}

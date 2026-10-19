@@ -95,6 +95,12 @@ class MsgInfo(NamedTuple):
     configured prefix; `prefix` is None then"""
     model_spec: str | None = None
 
+    """optional fields the model's input does not depend on, as a JSON object, so adding one
+    needs no schema change. Writing a turn merges this into what is stored, a None value
+    removing that key, so a key a newer version wrote survives an older one rewriting the turn.
+    Read each field through one helper that supplies its default and type."""
+    extra_metadata: dict[str, Any] | None = None
+
 
 class ThreadTurn(NamedTuple):
     """One prompt of a thread and what answered it, for /navigate."""

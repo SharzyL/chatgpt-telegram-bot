@@ -2,7 +2,9 @@
 
 import os
 import shelve
+import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -13,7 +15,16 @@ from chatgpt_telegram_bot.models import (
     make_text_part,
     make_thinking_text_part,
 )
-from chatgpt_telegram_bot.store import CODEC_JSON, CODEC_ZSTD, Store, migrate_shelf, zstd
+from chatgpt_telegram_bot.store import (
+    CODEC_JSON,
+    CODEC_ZSTD,
+    MIGRATIONS,
+    SCHEMA_VERSION,
+    Store,
+    decode_parts,
+    migrate_shelf,
+    zstd,
+)
 
 CHAT = -100
 OTHER = -200
@@ -230,3 +241,138 @@ def test_a_failed_check_leaves_no_store_behind(tmp_path: Path, monkeypatch: pyte
     assert not os.path.exists(store_path)
     with shelve.open(shelf_path, flag='r') as shelf:
         assert len(shelf) == len(_shelf_rows()) + 1
+
+
+# --- extra_metadata -----------------------------------------------------------------------------
+
+
+def test_extra_metadata_reads_back_and_empty_is_none():
+    store = Store(':memory:')
+    store.put_turn(CHAT, [1], _user('q', None, 'g')._replace(extra_metadata={'pinned': True, 'n': 2}))
+    store.put_turn(CHAT, [2], _bot('a', 1)._replace(extra_metadata={}))
+    one, two = store.get(CHAT, 1), store.get(CHAT, 2)
+    assert one is not None and one.extra_metadata == {'pinned': True, 'n': 2}
+    assert two is not None and two.extra_metadata is None
+
+
+def test_a_rewrite_merges_extra_metadata_and_keeps_keys_it_does_not_name():
+    store = Store(':memory:')
+    store.put_turn(CHAT, [11, 12], _bot('answer', 10)._replace(extra_metadata={'from_newer': 'kept', 'a': 1}))
+    # a rewrite that knows nothing of the extras, as an older version's /regenerate would be
+    store.put_turn(CHAT, [11], _bot('regenerated', 10))
+    got = store.get(CHAT, 12)
+    assert got is not None and got.extra_metadata == {'from_newer': 'kept', 'a': 1}
+    store.update(CHAT, 11, _bot('manipulated', 10)._replace(extra_metadata={'a': None, 'b': 2}))
+    got = store.get(CHAT, 11)
+    assert got is not None and got.extra_metadata == {'from_newer': 'kept', 'b': 2}
+
+
+def test_extra_metadata_has_to_be_a_json_object():
+    store = Store(':memory:')
+    store.put_turn(CHAT, [1], _user('q', None, 'g'))
+    with pytest.raises(sqlite3.IntegrityError):
+        _ = store.conn.execute("UPDATE turn SET extra_metadata = '[1, 2]'")
+
+
+def test_parts_from_another_version_still_decode():
+    # one written before a field existed would be shorter; one from a newer version is longer
+    parts = decode_parts(CODEC_JSON, b'[["text", null, "hi", "a field from later"]]')
+    assert parts == [make_text_part('hi')]
+
+
+# --- schema versions ----------------------------------------------------------------------------
+
+# the schema version 1 shipped with, frozen: an upgrade from it must end where a new store starts
+V1_SCHEMA = """
+CREATE TABLE turn (
+    id            INTEGER PRIMARY KEY,
+    chat_id       INTEGER NOT NULL,
+    sent_by_bot   BOOLEAN NOT NULL CHECK (sent_by_bot IN (0, 1)),
+    -- the message this turn replies to, by message id as MsgInfo.reply_id has it
+    reply_id      INTEGER,
+    prefix        TEXT,
+    model_spec    TEXT,
+    system_prompt TEXT,
+    overrides     TEXT,
+    codec         INTEGER NOT NULL CHECK (codec IN (0, 1)),
+    parts         BLOB NOT NULL,
+    -- optional fields as a JSON object, so adding one needs no migration; see MsgInfo
+    extra_metadata TEXT CHECK (extra_metadata IS NULL OR json_type(extra_metadata) = 'object')
+);
+CREATE TABLE message (
+    chat_id INTEGER NOT NULL,
+    msg_id  INTEGER NOT NULL,
+    turn_id INTEGER NOT NULL REFERENCES turn (id),
+    seq     INTEGER,
+    PRIMARY KEY (chat_id, msg_id)
+) WITHOUT ROWID;
+CREATE INDEX message_turn ON message (turn_id, seq);
+"""
+
+
+def _shape(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Every table's columns and every index, which is what an upgrade has to reproduce."""
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+    columns = {t: [tuple(c[1:]) for c in conn.execute(f'PRAGMA table_info({t})')] for t in tables}
+    indexes = sorted(
+        r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")
+    )
+    return {'columns': columns, 'indexes': indexes}
+
+
+def _v1_store(path: str) -> None:
+    conn = sqlite3.connect(path)
+    _ = conn.executescript(V1_SCHEMA)
+    _ = conn.execute('PRAGMA user_version = 1')
+    conn.commit()
+    conn.close()
+
+
+def test_every_version_after_the_first_has_an_upgrade_step():
+    assert set(MIGRATIONS) == set(range(2, SCHEMA_VERSION + 1))
+
+
+def test_an_upgraded_v1_store_matches_a_new_one(tmp_path: Path):
+    old, new = str(tmp_path / 'old.sqlite3'), str(tmp_path / 'new.sqlite3')
+    _v1_store(old)
+    assert _shape(Store(old).conn) == _shape(Store(new).conn)
+    assert Store(old).conn.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
+
+
+def test_an_upgrade_step_runs_once_and_keeps_the_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = str(tmp_path / 'db.sqlite3')
+    Store(path).put_turn(CHAT, [1], _user('q', None, 'g'))
+    monkeypatch.setattr('chatgpt_telegram_bot.store.SCHEMA_VERSION', SCHEMA_VERSION + 1)
+    monkeypatch.setattr(
+        'chatgpt_telegram_bot.store.MIGRATIONS', {SCHEMA_VERSION + 1: ['ALTER TABLE turn ADD COLUMN probe TEXT']}
+    )
+    store = Store(path)
+    assert store.conn.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION + 1
+    assert 'probe' in [c[1] for c in store.conn.execute('PRAGMA table_info(turn)')]
+    assert store.get(CHAT, 1) is not None
+    _ = Store(path)  # already there: nothing to run, so the ALTER is not repeated
+
+
+def test_a_failed_upgrade_step_leaves_the_store_as_it_was(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = str(tmp_path / 'db.sqlite3')
+    Store(path).put_turn(CHAT, [1], _user('q', None, 'g'))
+    monkeypatch.setattr('chatgpt_telegram_bot.store.SCHEMA_VERSION', SCHEMA_VERSION + 1)
+    monkeypatch.setattr(
+        'chatgpt_telegram_bot.store.MIGRATIONS',
+        {SCHEMA_VERSION + 1: ['ALTER TABLE turn ADD COLUMN probe TEXT', 'NOT VALID SQL']},
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        _ = Store(path)
+    conn = sqlite3.connect(path)
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
+    assert 'probe' not in [c[1] for c in conn.execute('PRAGMA table_info(turn)')]
+
+
+def test_a_store_from_a_newer_version_is_refused(tmp_path: Path):
+    path = str(tmp_path / 'db.sqlite3')
+    _ = Store(path)
+    conn = sqlite3.connect(path)
+    _ = conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION + 1}')
+    conn.commit()
+    with pytest.raises(RuntimeError, match='newer than this bot knows'):
+        _ = Store(path)

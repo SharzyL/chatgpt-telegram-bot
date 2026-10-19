@@ -9,6 +9,10 @@ part that no longer shows the turn (a shorter regeneration deleted it) keeps its
 The handlers still see `MsgInfo`, with `part_ids` derived from the live parts rather than
 stored. Content is JSON, compressed with zstd when the interpreter has it (Python 3.14+);
 `codec` says which, so compressed and plain rows can sit side by side.
+
+Schema changes go in two ways. A field the model's input does not depend on goes in
+`extra_metadata`, a JSON object, and needs no schema change at all. Anything else is a column,
+added to `SCHEMA` for new stores and as a step in `MIGRATIONS` for existing ones.
 """
 
 import json
@@ -32,6 +36,9 @@ CODEC_ZSTD = 1
 ZSTD_LEVEL = 3
 
 SCHEMA_VERSION = 1
+# the statements taking a store from the version before each key to that version, applied in
+# order on open; a new store is made from SCHEMA, which already has every column
+MIGRATIONS: dict[int, list[str]] = {}
 SCHEMA = """
 CREATE TABLE turn (
     id            INTEGER PRIMARY KEY,
@@ -44,7 +51,9 @@ CREATE TABLE turn (
     system_prompt TEXT,
     overrides     TEXT,
     codec         INTEGER NOT NULL CHECK (codec IN (0, 1)),
-    parts         BLOB NOT NULL
+    parts         BLOB NOT NULL,
+    -- optional fields as a JSON object, so adding one needs no migration; see MsgInfo
+    extra_metadata TEXT CHECK (extra_metadata IS NULL OR json_type(extra_metadata) = 'object')
 );
 CREATE TABLE message (
     chat_id INTEGER NOT NULL,
@@ -57,12 +66,14 @@ CREATE INDEX message_turn ON message (turn_id, seq);
 """
 
 _TURN_COLUMNS = (
-    't.id, t.sent_by_bot, t.reply_id, t.prefix, t.system_prompt, t.overrides, t.model_spec, t.codec, t.parts'
+    't.id, t.sent_by_bot, t.reply_id, t.prefix, t.system_prompt, t.overrides, t.model_spec, t.codec, t.parts,'
+    + ' t.extra_metadata'
 )
 
 
 def encode_parts(parts: list[MsgPartInHistory], compress: bool) -> tuple[int, bytes]:
-    data = json.dumps([[p.type_, p.hash, p.text] for p in parts], ensure_ascii=False, separators=(',', ':')).encode()
+    # every field, in order: a field MsgPartInHistory gains later is written without a change here
+    data = json.dumps([list(p) for p in parts], ensure_ascii=False, separators=(',', ':')).encode()
     if compress and zstd is not None:
         return CODEC_ZSTD, zstd.compress(data, ZSTD_LEVEL)
     return CODEC_JSON, data
@@ -73,7 +84,16 @@ def decode_parts(codec: int, blob: bytes) -> list[MsgPartInHistory]:
         if zstd is None:
             raise RuntimeError('this row is zstd-compressed, which needs Python 3.14 or later')
         blob = zstd.decompress(blob)
-    return [MsgPartInHistory(type_, hash_, text) for type_, hash_, text in json.loads(blob)]
+    # a row from before a field was added has fewer values, which that field's default fills;
+    # one from a newer version has more, which this version does not know and leaves out
+    width = len(MsgPartInHistory._fields)
+    return [MsgPartInHistory(*values[:width]) for values in json.loads(blob)]
+
+
+def merge_extra(stored: dict[str, Any] | None, new: dict[str, Any] | None) -> dict[str, Any] | None:
+    """*new* written over *stored*, a None value removing that key; None when nothing is left."""
+    merged = {**(stored or {}), **(new or {})}
+    return {k: v for k, v in merged.items() if v is not None} or None
 
 
 class Store:
@@ -91,14 +111,34 @@ class Store:
             _ = self.conn.executescript(SCHEMA)
             _ = self.conn.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
             self.conn.commit()
-        elif version != SCHEMA_VERSION:
-            raise RuntimeError(f'{path} has schema version {version}, this bot knows {SCHEMA_VERSION}')
+        elif version < SCHEMA_VERSION:
+            self._upgrade(path, version)
+        elif version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f'{path} has schema version {version}, newer than this bot knows ({SCHEMA_VERSION}); upgrade the bot'
+            )
         if path != ':memory:':
             _ = self.conn.execute('PRAGMA journal_mode = WAL')
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
+
+    def _upgrade(self, path: str, version: int) -> None:
+        """Bring an older store up to SCHEMA_VERSION, one transaction per version."""
+        for target in range(version + 1, SCHEMA_VERSION + 1):
+            # DDL opens no transaction of its own here, so one is begun explicitly; SQLite's
+            # schema changes are transactional, so a failing step leaves the file as it was
+            _ = self.conn.execute('BEGIN')
+            try:
+                for statement in MIGRATIONS[target]:
+                    _ = self.conn.execute(statement)
+                _ = self.conn.execute(f'PRAGMA user_version = {target}')
+            except BaseException:
+                self.conn.rollback()
+                raise
+            self.conn.commit()
+            logger.info(f'Upgraded {path} to schema version {target}')
 
     def _turn_of(self, chat_id: int, msg_id: int) -> int | None:
         row = self.conn.execute('SELECT turn_id FROM message WHERE chat_id = ? AND msg_id = ?', (chat_id, msg_id))
@@ -113,7 +153,7 @@ class Store:
 
     @staticmethod
     def _info(row: Any, part_ids: list[int]) -> MsgInfo:
-        _, sent_by_bot, reply_id, prefix, system_prompt, overrides, model_spec, codec, parts = row
+        _, sent_by_bot, reply_id, prefix, system_prompt, overrides, model_spec, codec, parts, extra = row
         return MsgInfo(
             sent_by_bot=bool(sent_by_bot),
             message=decode_parts(codec, parts),
@@ -123,9 +163,10 @@ class Store:
             overrides=json.loads(overrides) if overrides is not None else None,
             part_ids=part_ids,
             model_spec=model_spec,
+            extra_metadata=json.loads(extra) if extra is not None else None,
         )
 
-    def _turn_values(self, info: MsgInfo) -> tuple[Any, ...]:
+    def _turn_values(self, info: MsgInfo, extra: dict[str, Any] | None) -> tuple[Any, ...]:
         codec, parts = encode_parts(info.message, self.compress)
         overrides = json.dumps(info.overrides, ensure_ascii=False) if info.overrides else None
         return (
@@ -137,21 +178,25 @@ class Store:
             overrides,
             codec,
             parts,
+            json.dumps(extra, ensure_ascii=False) if extra else None,
         )
 
     def _write_turn(self, turn_id: int | None, chat_id: int, info: MsgInfo) -> int:
-        values = self._turn_values(info)
         if turn_id is not None:
+            # merged rather than replaced, so a key this version does not know -- one a newer
+            # version wrote before a rollback -- survives it rewriting the turn
+            stored = self.conn.execute('SELECT extra_metadata FROM turn WHERE id = ?', (turn_id,)).fetchone()[0]
+            extra = merge_extra(json.loads(stored) if stored is not None else None, info.extra_metadata)
             _ = self.conn.execute(
                 'UPDATE turn SET sent_by_bot = ?, reply_id = ?, prefix = ?, model_spec = ?, system_prompt = ?,'
-                + ' overrides = ?, codec = ?, parts = ? WHERE id = ?',
-                (*values, turn_id),
+                + ' overrides = ?, codec = ?, parts = ?, extra_metadata = ? WHERE id = ?',
+                (*self._turn_values(info, extra), turn_id),
             )
             return turn_id
         cursor = self.conn.execute(
-            'INSERT INTO turn (chat_id, sent_by_bot, reply_id, prefix, model_spec, system_prompt, overrides, codec, parts)'
-            + ' VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (chat_id, *values),
+            'INSERT INTO turn (chat_id, sent_by_bot, reply_id, prefix, model_spec, system_prompt, overrides, codec, parts,'
+            + ' extra_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (chat_id, *self._turn_values(info, merge_extra(None, info.extra_metadata))),
         )
         assert cursor.lastrowid is not None
         return cursor.lastrowid

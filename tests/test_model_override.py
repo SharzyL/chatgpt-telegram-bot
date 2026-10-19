@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.models import Model, MsgInfo, make_text_part
+from chatgpt_telegram_bot.store import Store
 
 FAST = Model(prefix='f', name='fast-model')
 SLOW = Model(prefix='s', name='slow-model', richtext=True)
@@ -13,7 +14,7 @@ SLOW = Model(prefix='s', name='slow-model', richtext=True)
 def _bot() -> ChatGPTTelegramBot:
     """A bot with just the state construct_chat_history reads."""
     bot = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
+    bot.store = Store(':memory:')
     bot.models = [FAST, SLOW]
     bot.system_prompt = 'be helpful'
     bot.timezone = ZoneInfo('UTC')

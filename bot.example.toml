@@ -6,6 +6,7 @@ admin_id = 114514
 # default_image_prompt = "Describe the image"
 # default_image_reply_prompt = "Continue"
 # image_cache_size = 52428800  # 50MB default
+# db_compression = true  # zstd for stored turns (needs Python 3.14+); default: true
 
 endpoints = [
   { name = "openai", url = "https://api.openai.com/v1" },

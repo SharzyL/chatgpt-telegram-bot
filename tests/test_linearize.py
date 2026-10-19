@@ -9,6 +9,7 @@ from telethon.tl.types import MessageReplyHeader
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.models import MsgInfo, make_text_part
 from chatgpt_telegram_bot.reply import format_linearize_listing
+from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.utils import PendingReplyManager, linearize_plan, plan_digest
 
 CHAT = -1001234567890
@@ -135,15 +136,19 @@ def test_a_long_listing_is_capped():
 
 def _bot(missing_after_delete: set[int] | None = None, delete_raises: bool = False) -> Any:
     bot = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
+    bot.store = Store(':memory:')
     bot.allowed_chats = {CHAT}
     bot.pending_reply_manager = PendingReplyManager()
     bot.generating = {}
     bot.linearizing = set()
     bot.NAVIGATE_PREVIEW_WIDTH = 36
     bot.LINEARIZE_LIST_LIMIT = 30
-    for mid, info in _tree().items():
-        bot.set_msg_info(CHAT, mid, info)
+    tree = _tree()
+    for mid, info in tree.items():
+        if mid != 3:
+            bot.set_msg_info(CHAT, mid, info)
+    # the split first answer is one turn shown by both of its messages, as the bot stores it
+    bot.store.put_turn(CHAT, [2, 3], tree[2])
     sent: list[Any] = []
     deleted: list[list[int]] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
@@ -232,8 +237,7 @@ def test_the_confirmation_lists_what_will_go():
 
 def test_nothing_to_delete_says_so():
     bot = _bot()
-    for mid in (8, 9, 10, 11):
-        del bot.db[f'msg_info_{CHAT}_{mid}']
+    bot.store.delete(CHAT, [8, 9, 10, 11])
     assert _ask(bot, 7)[0][1] == 'Nothing to delete: that thread is already a single line.'
 
 
@@ -260,7 +264,7 @@ def test_confirming_deletes_the_messages_and_their_history():
     press = _confirm(bot)
     assert sorted(i for batch in bot.deleted for i in batch) == [6, 7, 8, 9, 10, 11]
     assert press.edits[-1] == '🧹 Deleted 6 messages.'
-    stored = {int(k.rsplit('_', 1)[1]) for k in bot.db}
+    stored = set(bot.store.chat_nodes(CHAT))
     assert stored == {1, 2, 3, 4, 5, 20, 21}
 
 
@@ -268,8 +272,8 @@ def test_a_message_telegram_refused_keeps_its_history():
     # a survivor can still be replied to, so its row must stay
     bot = _bot(missing_after_delete={8})
     press = _confirm(bot)
-    assert f'msg_info_{CHAT}_8' in bot.db
-    assert f'msg_info_{CHAT}_9' not in bot.db
+    assert 8 in bot.store.chat_nodes(CHAT)
+    assert 9 not in bot.store.chat_nodes(CHAT)
     assert 'Deleted 5 messages.' in press.edits[-1]
     assert '1 could not be deleted' in press.edits[-1]
 
@@ -277,7 +281,7 @@ def test_a_message_telegram_refused_keeps_its_history():
 def test_a_failed_delete_call_deletes_no_history():
     bot = _bot(delete_raises=True)
     press = _confirm(bot)
-    assert len(bot.db) == len(_tree())
+    assert len(bot.store.chat_nodes(CHAT)) == len(_tree())
     assert '6 could not be deleted' in press.edits[-1]
 
 

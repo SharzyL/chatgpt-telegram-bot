@@ -17,6 +17,7 @@ from chatgpt_telegram_bot.models import (
     make_text_part,
     make_thinking_text_part,
 )
+from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.transfer import export_filename, format_export, parse_import
 from chatgpt_telegram_bot.utils import PendingReplyManager
 
@@ -88,7 +89,7 @@ class FakeMessage:
 
 def _bot(dates_fail: bool = False) -> Any:
     bot = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
+    bot.store = Store(':memory:')
     bot.allowed_chats = {CHAT}
     bot.pending_reply_manager = PendingReplyManager()
     sent: list[Any] = []

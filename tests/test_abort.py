@@ -9,6 +9,7 @@ import pytest
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.models import Model, MsgInfo, ResponseDelta, StreamEvent, make_text_part
+from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.utils import PendingReplyManager
 
 CHAT = -100
@@ -26,7 +27,7 @@ class FakeMessage:
 
 def _bot() -> Any:
     bot = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
+    bot.store = Store(':memory:')
     bot.models = [Model(prefix='g', name='gpt-5')]
     bot.system_prompt = 'be helpful'
     bot.timezone = ZoneInfo('UTC')
@@ -111,7 +112,7 @@ def test_an_aborted_generation_stops_early_and_is_marked(monkeypatch: pytest.Mon
 def test_the_partial_reply_stays_in_the_history(monkeypatch: pytest.MonkeyPatch):
     bot = _bot()
     _ = _run_with_stream(bot, monkeypatch, DELTAS, abort_after=2)
-    stored = [v for k, v in bot.db.items() if k != f'msg_info_{CHAT}_{PROMPT_ID}']
+    stored = [v for k, v in bot.store.chat_nodes(CHAT).items() if k != PROMPT_ID]
     assert stored, 'the aborted reply is still a turn that can be replied to'
     info = stored[0]
     assert info.sent_by_bot

@@ -12,6 +12,7 @@ from telethon.tl.types import MessageReplyHeader
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.commands import apply_overrides, parse_chat_spec, parse_command
 from chatgpt_telegram_bot.models import EndPoint, Model, MsgInfo, make_text_part
+from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.utils import PendingReplyManager, image_media_type
 
 CHAT = -100
@@ -65,7 +66,7 @@ class FakeMessage:
 
 def _bot(*neighbours: FakeMessage) -> Any:
     bot: Any = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}
+    bot.store = Store(':memory:')
     bot.models = [Model(prefix='g', name='gpt-5')]
     bot.endpoints = [EndPoint(name='main', url='https://main.test'), EndPoint(name='alt', url='https://alt.test')]
     bot.endpoint_by_name = {e.name: e for e in bot.endpoints}

@@ -1,8 +1,8 @@
 import asyncio
 import atexit
 import datetime
+import dbm
 import os
-import shelve
 import time
 import tomllib
 import traceback
@@ -60,6 +60,7 @@ from chatgpt_telegram_bot.reply import (
     format_reply,
 )
 from chatgpt_telegram_bot.reply_messages import BotReplyMessages
+from chatgpt_telegram_bot.store import Store, migrate_shelf
 from chatgpt_telegram_bot.texts import (
     BOT_COMMANDS,
     CHAT_USAGE,
@@ -215,8 +216,16 @@ class ChatGPTTelegramBot:
         # (chat_id, anchor) of a /linearize being carried out, so a second press cannot run it twice
         self.linearizing: set[tuple[int, int]] = set()
 
-        # the shelf lives for the whole process and is closed via atexit below
-        self.db: shelve.Shelf[Any] = shelve.open(os.path.join(data_dir, 'db'))  # noqa: SIM115
+        db_compression = _config.get('db_compression', True)
+        if not isinstance(db_compression, bool):
+            raise TypeError(f'db_compression must be true or false, got {type(db_compression).__name__}')
+        # the store lives for the whole process and is closed via atexit below; a data dir
+        # still holding the `shelve` database of earlier versions is migrated on first start
+        store_path = os.path.join(data_dir, 'db.sqlite3')
+        shelf_path = os.path.join(data_dir, 'db')
+        if not os.path.exists(store_path) and dbm.whichdb(shelf_path):
+            migrate_shelf(shelf_path, store_path, db_compression)
+        self.store: Store = Store(store_path, db_compression)
         image_cache_size = _config.get('image_cache_size', 50 * 1024 * 1024)
         if not isinstance(image_cache_size, int):
             raise TypeError(f'image_cache_size must be an integer, got {type(image_cache_size).__name__}')
@@ -224,7 +233,7 @@ class ChatGPTTelegramBot:
             os.path.join(data_dir, 'image_cache'), size_limit=image_cache_size
         )
 
-        _ = atexit.register(self.db.close)
+        _ = atexit.register(self.store.close)
         _ = atexit.register(self.image_cache.close)
 
         self.bot_id: int = int(self.TELEGRAM_BOT_TOKEN.split(':')[0])
@@ -309,19 +318,12 @@ class ChatGPTTelegramBot:
         _ = self.get_client(model)
         return model, spec
 
-    # db scheme: msg_info_{chat_id}_{msg_id} -> MsgInfo
-    @staticmethod
-    def _db_key(chat_id: int, msg_id: int) -> str:
-        return f'msg_info_{chat_id}_{msg_id}'
-
     def get_msg_info(self, chat_id: int, msg_id: int) -> MsgInfo | None:
-        return self.db.get(self._db_key(chat_id, msg_id))
+        return self.store.get(chat_id, msg_id)
 
     def set_msg_info(self, chat_id: int, msg_id: int, msg_info: MsgInfo) -> None:
-        self.db[self._db_key(chat_id, msg_id)] = msg_info
-
-    def del_msg_info(self, chat_id: int, msg_id: int) -> None:
-        _ = self.db.pop(self._db_key(chat_id, msg_id), None)
+        """Rewrite the turn *msg_id* shows -- every part of it -- or store a new one-message turn."""
+        self.store.update(chat_id, msg_id, msg_info)
 
     def is_allowed(self, chat_id: int) -> bool:
         return chat_id in self.allowed_chats
@@ -823,17 +825,11 @@ class ChatGPTTelegramBot:
             response_parts = [make_thinking_text_part(reasoning)] if reasoning else []
             response_parts.append(make_text_part(response))
             response_info = MsgInfo(
-                sent_by_bot=True,
-                message=response_parts,
-                reply_id=prompt_id,
-                prefix=None,
-                system_prompt=None,
-                part_ids=list(msg_ids),
+                sent_by_bot=True, message=response_parts, reply_id=prompt_id, prefix=None, system_prompt=None
             )
-            # a turn too long for one message is stored under every part, so replying to any
-            # of them continues from the same point
-            for mid in msg_ids:
-                self.set_msg_info(chat_id, mid, response_info)
+            # a turn too long for one message is one turn shown by every part, so replying to
+            # any of them continues from the same point
+            self.store.put_turn(chat_id, msg_ids, response_info)
             previous_turn_id = msg_ids[0]
 
         logger.info(f'Imported {chat_id=}, {msg_id=}, title={chat.title!r}, turns={len(chat.turns)}')
@@ -1001,16 +997,8 @@ class ChatGPTTelegramBot:
         logger.info(f'Exported {chat_id=}, {anchor_id=}, messages={len(messages)}, bytes={len(document)}')
 
     def _chat_nodes(self, chat_id: int) -> dict[int, MsgInfo]:
-        """Every stored node of one chat, by id -- a scan, since MsgInfo links only backwards."""
-        prefix = self._db_key(chat_id, 0)[:-1]
-        nodes: dict[int, MsgInfo] = {}
-        for key in self.db:
-            if key.startswith(prefix):
-                try:
-                    nodes[int(key[len(prefix) :])] = self.db[key]
-                except ValueError:
-                    continue
-        return nodes
+        """Every stored node of one chat, by message id; MsgInfo links only backwards."""
+        return self.store.chat_nodes(chat_id)
 
     def _linearize_plan(self, chat_id: int, anchor_id: int) -> tuple[dict[int, MsgInfo], set[int]] | None:
         """The chat's nodes and the ids a /linearize at *anchor_id* would delete; None if not stored."""
@@ -1122,9 +1110,7 @@ class ChatGPTTelegramBot:
                 remaining |= await self._still_there(chat_id, targets[start : start + 100])
             gone = set(targets) - remaining
             # an imported prompt has no message of its own; it goes with the turn that showed it
-            for mid in delete:
-                if mid in gone or mid < 0 and -mid in gone:
-                    self.del_msg_info(chat_id, mid)
+            self.store.delete(chat_id, [mid for mid in delete if mid in gone or mid < 0 and -mid in gone])
             summary = f'🧹 Deleted {len(gone)} {"message" if len(gone) == 1 else "messages"}.'
             if remaining:
                 summary += (
@@ -1396,8 +1382,8 @@ class ChatGPTTelegramBot:
             overrides=overrides or None,
             model_spec=model_spec,
         )
-        for mid in msg_ids:
-            self.set_msg_info(chat_id, mid, msg_info)
+        # an album is one turn, so a reply to any of its messages continues it
+        self.store.put_turn(chat_id, msg_ids, msg_info)
 
         await self._run_completion(chat_id, msg_id)
 
@@ -1449,13 +1435,12 @@ class ChatGPTTelegramBot:
         part_ids: list[int],
         reply: str,
         carry: list[dict[str, Any]],
-        dropped: list[int],
     ) -> None:
-        """Record a finished reply under every message it occupies, with what it carries forward.
+        """Record a finished reply as the turn its messages show, with what it carries forward.
 
-        *dropped* are the parts of the reply it replaced that it no longer needs. Their messages
-        are gone, but a later turn may have replied to one of them, and its history passes
-        through that row, so it is written over too rather than left holding the old answer.
+        A regeneration keeps the first part of the reply it replaces, so the same turn is
+        rewritten; parts it no longer needs stay mapped to it, so a later turn that replied to
+        one of them goes on from the new answer.
         """
         # reasoning first: replaying it requires the order the provider emitted
         parts: list[MsgPartInHistory] = []
@@ -1472,11 +1457,8 @@ class ChatGPTTelegramBot:
             else:
                 parts.append(make_reasoning_part(model.name, item))
         parts.append(make_text_part(reply))
-        info = MsgInfo(
-            sent_by_bot=True, message=parts, reply_id=prompt_id, prefix=None, system_prompt=None, part_ids=part_ids
-        )
-        for mid in (*part_ids, *dropped):
-            self.set_msg_info(chat_id, mid, info)
+        info = MsgInfo(sent_by_bot=True, message=parts, reply_id=prompt_id, prefix=None, system_prompt=None)
+        self.store.put_turn(chat_id, part_ids, info)
 
     async def _generate(self, chat_id: int, msg_id: int, adopt: list[int] | None, error_reply_to: int) -> None:
         try:
@@ -1536,8 +1518,7 @@ class ChatGPTTelegramBot:
                     await replymsgs.update(final, bool(thinking))
                     await replymsgs.finalize()
                     part_ids = [bot_msg_id for bot_msg_id, _ in replymsgs.replied_msgs]
-                    dropped = [mid for mid in adopt or [] if mid not in part_ids]
-                    self._store_reply(chat_id, msg_id, model, part_ids, reply, stream_meta.carry_items, dropped)
+                    self._store_reply(chat_id, msg_id, model, part_ids, reply, stream_meta.carry_items)
                     return
 
                 # handling completion errors

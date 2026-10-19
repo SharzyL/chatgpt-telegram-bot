@@ -191,6 +191,7 @@ instead, and then a plain reply is enough.
 | `default_image_prompt` | `"Describe the image"` | used when a photo arrives with no caption |
 | `default_image_reply_prompt` | `"Continue"` | the same, mid-conversation |
 | `image_cache_size` | 50 MB | on-disk cache for photos, in bytes |
+| `db_compression` | `true` | compress stored conversations with zstd (needs Python 3.14+) |
 
 Each entry in `models`:
 
@@ -212,6 +213,11 @@ Each entry in `models`:
 Persistent state — the conversation database, the photo cache and the Telethon session — goes
 to `$XDG_STATE_HOME/chatgpt-telegram-bot` (`~/.local/state/…` by default), or wherever
 `--data-dir` points.
+
+The conversation database is `db.sqlite3`. Versions before it kept conversations in a `shelve`
+file named `db`; on the first start with that file and no `db.sqlite3`, the bot copies every
+conversation across, checks that each one reads back unchanged, and only then starts. The old
+`db` is left in place as a backup and can be deleted once you are satisfied.
 
 ## Running
 

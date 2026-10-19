@@ -10,6 +10,7 @@ from telethon.tl.types import MessageReplyHeader
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.models import EndPoint, Model, MsgInfo, ResponseDelta, make_image_part, make_text_part
+from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.utils import PendingReplyManager
 
 BOT_ID = 7
@@ -37,7 +38,7 @@ class FakeMessage:
 
 def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = None) -> Any:
     bot = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
+    bot.store = Store(':memory:')
     bot.models = [Model(prefix='g', name='gpt-5'), Model(prefix='c', name='claude')]
     bot.endpoints = [EndPoint(name='main', url='https://main.test'), EndPoint(name='alt', url='https://alt.test')]
     bot.endpoint_by_name = {e.name: e for e in bot.endpoints}
@@ -79,8 +80,7 @@ def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = Non
         MsgInfo(False, prompt_parts or [make_text_part('the original prompt')], None, 'g', 'rooted', {'t': 'high'}),
     )
     reply = MsgInfo(True, [make_text_part('the old answer')], PROMPT_ID, None, None, None, part_ids)
-    for mid in part_ids or [REPLY_IDS[0]]:
-        bot.set_msg_info(CHAT, mid, reply)
+    bot.store.put_turn(CHAT, part_ids or [REPLY_IDS[0]], reply)
     return bot
 
 
@@ -321,15 +321,14 @@ def _regenerate_for_real(
 ) -> tuple[Any, dict[int, MsgInfo]]:
     bot = _recording_bot()
     old = MsgInfo(True, [make_text_part('the old answer')], PROMPT_ID, None, None, None, old_parts)
-    for mid in old_parts:
-        bot.set_msg_info(CHAT, mid, old)
+    bot.store.put_turn(CHAT, old_parts, old)
 
     async def fake(*_args: Any, **_kwargs: Any) -> Any:
         yield ResponseDelta(text=answer)
 
     monkeypatch.setattr('chatgpt_telegram_bot.bot.completion', fake)
     asyncio.run(ChatGPTTelegramBot._run_completion(bot, CHAT, PROMPT_ID, adopt=old_parts))  # pyright: ignore[reportPrivateUsage]  # exercising the real path
-    rows = {int(key.rsplit('_', 1)[1]): value for key, value in bot.db.items() if key != f'msg_info_{CHAT}_{PROMPT_ID}'}
+    rows = {mid: info for mid, info in bot.store.chat_nodes(CHAT).items() if mid != PROMPT_ID}
     return bot, rows
 
 
@@ -375,7 +374,7 @@ def test_a_second_regenerate_of_the_same_reply_is_refused():
 def test_an_imported_turn_with_no_model_reports_to_the_command():
     # an import without a prefix records no model, and its prompt lives under a negative id
     bot = _recording_bot()
-    bot.db.clear()
+    bot.store = Store(':memory:')
     bot.set_msg_info(CHAT, -50, MsgInfo(False, [make_text_part('imported prompt')], None, None, None))
     bot.set_msg_info(CHAT, 50, MsgInfo(True, [make_text_part('imported answer')], -50, None, None, None, [50]))
     replies: list[int] = []

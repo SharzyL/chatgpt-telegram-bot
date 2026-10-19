@@ -87,7 +87,8 @@ class MsgInfo(NamedTuple):
     """inline parameter overrides given with the prefix"""
     overrides: dict[str, str | None] | None = None
 
-    """every message id this reply occupies, so a regeneration can reuse all of them"""
+    """every message id that shows this turn, in order, so a regeneration can reuse all of them;
+    the store derives it on read and ignores it on write"""
     part_ids: list[int] | None = None
 
     """a model named as ``<endpoint>/<name>`` (by /chat or /regenerate) rather than by a

@@ -8,6 +8,7 @@ from telethon.tl.types import MessageReplyHeader, MessageReplyStoryHeader, PeerU
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.models import Model, MsgInfo
+from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.utils import PendingReplyManager, replied_message_id
 
 BOT_ID = 7
@@ -68,7 +69,7 @@ def test_a_story_reply_has_no_message_to_reply_to():
 
 def _bot() -> Any:
     bot = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
+    bot.store = Store(':memory:')
     bot.models = [Model(prefix='g', name='gpt-5')]
     bot.system_prompt = 'be helpful'
     bot.timezone = ZoneInfo('UTC')

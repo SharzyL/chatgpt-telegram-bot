@@ -10,6 +10,7 @@ import pytest
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.models import Model, MsgInfo, make_text_part
+from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.transfer import parse_import
 
 TWO_TURNS: dict[str, Any] = {
@@ -85,7 +86,7 @@ def test_a_malformed_file_says_what_is_wrong(payload: str, message: str):
 def _bot() -> Any:
     """A bot with just the state import_handler and construct_chat_history read."""
     bot = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
+    bot.store = Store(':memory:')
     bot.models = [Model(prefix='g', name='gpt-5'), Model(prefix='c', name='claude')]
     bot.system_prompt = 'be helpful'
     bot.timezone = ZoneInfo('UTC')

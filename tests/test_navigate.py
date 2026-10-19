@@ -11,6 +11,7 @@ from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.markdown import preview_line
 from chatgpt_telegram_bot.models import MsgInfo, ThreadTurn, make_image_part, make_text_part
 from chatgpt_telegram_bot.reply import format_navigation_page
+from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.utils import PendingReplyManager, message_link
 
 GROUP = -1001234567890
@@ -109,7 +110,7 @@ def test_content_is_escaped():
 
 def _bot(chat: int = GROUP) -> Any:
     bot = object.__new__(ChatGPTTelegramBot)
-    bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
+    bot.store = Store(':memory:')
     bot.allowed_chats = {chat}
     bot.pending_reply_manager = PendingReplyManager()
     bot.NAVIGATE_PER_PAGE = 8
@@ -166,8 +167,7 @@ def test_a_split_answer_links_to_its_first_part():
     bot = _bot()
     bot.set_msg_info(GROUP, 1, MsgInfo(False, [make_text_part('q')], None, 'g', None))
     answer = MsgInfo(True, [make_text_part('long')], 1, None, None, None, [10, 11, 12])
-    for mid in (10, 11, 12):
-        bot.set_msg_info(GROUP, mid, answer)
+    bot.store.put_turn(GROUP, [10, 11, 12], answer)
     assert bot._thread_turns(GROUP, 12) == [ThreadTurn(prompt='q', response='long', msg_id=10)]
 
 

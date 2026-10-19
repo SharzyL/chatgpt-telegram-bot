@@ -219,9 +219,10 @@ class ChatGPTTelegramBot:
         db_compression = _config.get('db_compression', True)
         if not isinstance(db_compression, bool):
             raise TypeError(f'db_compression must be true or false, got {type(db_compression).__name__}')
-        # the store lives for the whole process and is closed via atexit below; a data dir
-        # still holding the `shelve` database of earlier versions is migrated on first start
-        store_path = os.path.join(data_dir, 'db.sqlite3')
+        # the store lives for the whole process and is closed via atexit below. A data dir still
+        # holding the `shelve` database of earlier versions, `db`, is migrated on first start and
+        # the shelf kept beside it, so the store is named v2 to tell the two apart
+        store_path = os.path.join(data_dir, 'db-v2.sqlite3')
         shelf_path = os.path.join(data_dir, 'db')
         if not os.path.exists(store_path) and dbm.whichdb(shelf_path):
             migrate_shelf(shelf_path, store_path, db_compression)

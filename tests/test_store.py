@@ -125,7 +125,7 @@ def test_chat_nodes_covers_one_chat_and_shares_a_turn_between_parts():
 
 @pytest.mark.skipif(zstd is None, reason='zstd is in the standard library from Python 3.14')
 def test_compression_is_on_by_default_and_rows_of_either_codec_read_back(tmp_path: Path):
-    path = str(tmp_path / 'db.sqlite3')
+    path = str(tmp_path / 'db-v2.sqlite3')
     text = 'the same sentence again. ' * 400
     store = Store(path)
     store.put_turn(CHAT, [1], _user(text, None, 'g'))
@@ -182,11 +182,11 @@ def _write_shelf(path: str, rows: dict[tuple[int, int], MsgInfo]) -> None:
 
 
 def test_migration_keeps_every_row_and_stores_each_answer_once(tmp_path: Path):
-    shelf_path, store_path = str(tmp_path / 'db'), str(tmp_path / 'db.sqlite3')
+    shelf_path, store_path = str(tmp_path / 'db'), str(tmp_path / 'db-v2.sqlite3')
     rows = _shelf_rows()
     _write_shelf(shelf_path, rows)
     migrate_shelf(shelf_path, store_path)
-    assert sorted(os.listdir(tmp_path)) == ['db', 'db.sqlite3']
+    assert sorted(os.listdir(tmp_path)) == ['db', 'db-v2.sqlite3']
     store = Store(store_path)
 
     expected_parts = {
@@ -218,7 +218,7 @@ def test_migration_keeps_every_row_and_stores_each_answer_once(tmp_path: Path):
 
 
 def test_a_failed_check_leaves_no_store_behind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    shelf_path, store_path = str(tmp_path / 'db'), str(tmp_path / 'db.sqlite3')
+    shelf_path, store_path = str(tmp_path / 'db'), str(tmp_path / 'db-v2.sqlite3')
     _write_shelf(shelf_path, _shelf_rows())
 
     def no_row(_self: Store, _chat_id: int, _msg_id: int) -> MsgInfo | None:

@@ -214,8 +214,8 @@ Persistent state — the conversation database, the photo cache and the Telethon
 to `$XDG_STATE_HOME/chatgpt-telegram-bot` (`~/.local/state/…` by default), or wherever
 `--data-dir` points.
 
-The conversation database is `db.sqlite3`. Versions before it kept conversations in a `shelve`
-file named `db`; on the first start with that file and no `db.sqlite3`, the bot copies every
+The conversation database is `db-v2.sqlite3`. Versions before it kept conversations in a `shelve`
+file named `db`; on the first start with that file and no `db-v2.sqlite3`, the bot copies every
 conversation across, checks that each one reads back unchanged, and only then starts. The old
 `db` is left in place as a backup and can be deleted once you are satisfied.
 

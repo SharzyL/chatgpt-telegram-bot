@@ -307,6 +307,8 @@ CREATE TABLE message (
     PRIMARY KEY (chat_id, msg_id)
 ) WITHOUT ROWID;
 CREATE INDEX message_turn ON message (turn_id, seq);
+-- finding the answer to a prompt, for a live thread's edits
+CREATE INDEX turn_reply ON turn (chat_id, reply_id);
 """
 
 

@@ -35,13 +35,10 @@ CODEC_JSON = 0
 CODEC_ZSTD = 1
 ZSTD_LEVEL = 3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 1
 # the statements taking a store from the version before each key to that version, applied in
 # order on open; a new store is made from SCHEMA, which already has every column
-MIGRATIONS: dict[int, list[str]] = {
-    # finding the answer to a prompt, for a live thread's edits
-    2: ['CREATE INDEX turn_reply ON turn (chat_id, reply_id)'],
-}
+MIGRATIONS: dict[int, list[str]] = {}
 SCHEMA = """
 CREATE TABLE turn (
     id            INTEGER PRIMARY KEY,
@@ -66,6 +63,7 @@ CREATE TABLE message (
     PRIMARY KEY (chat_id, msg_id)
 ) WITHOUT ROWID;
 CREATE INDEX message_turn ON message (turn_id, seq);
+-- finding the answer to a prompt, for a live thread's edits
 CREATE INDEX turn_reply ON turn (chat_id, reply_id);
 """
 

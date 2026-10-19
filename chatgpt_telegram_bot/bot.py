@@ -57,6 +57,7 @@ from chatgpt_telegram_bot.render import (
     Renderer,
 )
 from chatgpt_telegram_bot.reply import (
+    format_imported_prompt,
     format_imported_turn,
     format_linearize_listing,
     format_navigation_page,
@@ -706,15 +707,17 @@ class ChatGPTTelegramBot:
 
         # the model may have been switched part-way down the chain, so resolve it there
         try:
-            _, model, _ = self.construct_chat_history(chat_id, prompt_id)
+            history, model, _ = self.construct_chat_history(chat_id, prompt_id)
         except RuntimeError as e:
             logger.exception(e)
             _ = await self.send_message(chat_id, f'[!] Error on resolving conversation: {e}', msg_id)
             return
 
+        # the first message of an imported turn shows its prompt too, keyed by its negated id
+        lead = format_imported_prompt(text_of(history[-1])) if prompt_id == -target_id else ''
         # only the message replied to is rewritten, so a body that no longer fits is refused
         bodies = self.get_renderer(model).render(
-            format_reply(thinking or '', text, True),
+            lead + format_reply(thinking or '', text, True),
             self._reply_prefix(model, manipulated=True, edition=regeneration_edition(target_info)),
             thinking is not None,
         )
@@ -1603,6 +1606,11 @@ class ChatGPTTelegramBot:
             _ = await self.send_message(chat_id, f'[!] Error on resolving conversation: {e}', error_reply_to)
             return
 
+        # an imported turn is shown by one message holding its prompt above the answer, the
+        # prompt having no message of its own (it is stored under a negative id, which only an
+        # import writes); an answer written over that message keeps the prompt on top
+        lead = format_imported_prompt(text_of(chat_history[-1])) if msg_id < 0 else ''
+
         error_cnt = 0
         while True:
             thinking = ''
@@ -1613,7 +1621,7 @@ class ChatGPTTelegramBot:
             async with BotReplyMessages(self, chat_id, msg_id, prefix, self.get_renderer(model), adopt) as replymsgs:
                 try:
                     status: str | None = 'Generating...'
-                    await replymsgs.update(f'[{status}]')
+                    await replymsgs.update(lead + f'[{status}]')
                     client = self.get_client(model)
                     stream = completion(client, chat_history, model, system_prompt, chat_id, msg_id, self._load_image)
                     stream_start = time.time()
@@ -1639,7 +1647,9 @@ class ChatGPTTelegramBot:
                         elif isinstance(event, StreamMeta):
                             stream_meta = event
                             continue
-                        await replymsgs.update(format_reply(thinking, reply, thinking_done, status), bool(thinking))
+                        await replymsgs.update(
+                            lead + format_reply(thinking, reply, thinking_done, status), bool(thinking)
+                        )
                     usage = stream_meta.usage
                     self._add_timing(usage, stream_start, first_token_time, time.time())
                     final = format_reply(
@@ -1650,7 +1660,7 @@ class ChatGPTTelegramBot:
                         tool_calls=stream_meta.tool_calls or None,
                         usage=usage or None,
                     )
-                    await replymsgs.update(final, bool(thinking))
+                    await replymsgs.update(lead + final, bool(thinking))
                     await replymsgs.finalize()
                     part_ids = [bot_msg_id for bot_msg_id, _ in replymsgs.replied_msgs]
                     self._store_reply(chat_id, msg_id, model, part_ids, reply, stream_meta.carry_items, edition)
@@ -1668,7 +1678,7 @@ class ChatGPTTelegramBot:
                         error_msg += f'\nRetrying in {delay:.0f}s ({error_cnt}/{self.OPENAI_MAX_RETRY})...'
                     if reply:
                         error_msg = reply + '\n\n' + error_msg
-                    await replymsgs.update(error_msg)
+                    await replymsgs.update(lead + error_msg)
                     if delay is None:
                         break
                     await asyncio.sleep(delay)

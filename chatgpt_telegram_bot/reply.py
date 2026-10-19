@@ -65,8 +65,12 @@ def format_imported_turn(prompt: str, response: str, reasoning: str | None = Non
     is the first one in the message and the renderer folds it. `balance_fences` keeps a fence
     left open in the prompt or the reasoning from swallowing what follows.
     """
-    answer = format_reply(reasoning or '', response, True)
-    return balance_fences(normalize_math(prompt)) + '\n\n' + IMPORT_SEPARATOR + '\n\n' + answer
+    return format_imported_prompt(prompt) + format_reply(reasoning or '', response, True)
+
+
+def format_imported_prompt(prompt: str) -> str:
+    """What an imported turn shows above its answer: the prompt and the `-----` line under it."""
+    return balance_fences(normalize_math(prompt)) + '\n\n' + IMPORT_SEPARATOR + '\n\n'
 
 
 def format_navigation_page(

@@ -404,6 +404,55 @@ def test_an_imported_turn_with_no_model_reports_to_the_command():
     assert replies == [COMMAND_ID]
 
 
+def test_a_regenerated_imported_turn_keeps_its_prompt_on_top(monkeypatch: pytest.MonkeyPatch):
+    # the one message showing an imported turn held its prompt too, which has no message of its own
+    bot = _recording_bot()
+    bot.store = Store(':memory:')
+    bot.set_msg_info(CHAT, -50, MsgInfo(False, [make_text_part('imported prompt')], None, 'g', None))
+    bot.set_msg_info(CHAT, 50, MsgInfo(True, [make_text_part('imported answer')], -50, None, None))
+
+    async def fake(*_args: Any, **_kwargs: Any) -> Any:
+        yield ResponseDelta(text='a new answer')
+
+    monkeypatch.setattr('chatgpt_telegram_bot.bot.completion', fake)
+    asyncio.run(ChatGPTTelegramBot._run_completion(bot, CHAT, -50, adopt=[50], edition=2))  # pyright: ignore[reportPrivateUsage]  # exercising the real path
+    assert bot.bodies, 'the message was written over'
+    for text in bot.bodies:
+        assert text.split('\n')[2:5] == ['imported prompt', '', '-----'], text
+    assert bot.bodies[-1].endswith('a new answer')
+    # only the answer is stored as the answer; the prompt stays its own turn
+    assert bot.get_msg_info(CHAT, 50).message[-1].text == 'a new answer'
+    assert bot.get_msg_info(CHAT, -50).message[0].text == 'imported prompt'
+
+
+def test_an_ordinary_regenerated_reply_shows_no_prompt(monkeypatch: pytest.MonkeyPatch):
+    bot, _ = _regenerate_for_real(monkeypatch, [REPLY_IDS[0]], 'again')
+    assert all('-----' not in text and 'the original prompt' not in text for text in bot.bodies)
+
+
+def _manipulate_imported(target: int) -> Any:
+    # a split imported turn: the prompt shows on the first part only
+    bot = _recording_bot()
+    bot.store = Store(':memory:')
+    bot.set_msg_info(CHAT, -50, MsgInfo(False, [make_text_part('imported prompt')], None, 'g', None))
+    bot.store.put_turn(CHAT, [50, 51], MsgInfo(True, [make_text_part('imported answer')], -50, None, None))
+    asyncio.run(bot.manipulate_handler(FakeMessage(replied=FakeMessage(sender_id=BOT_ID), target=target), 'mine'))
+    assert bot.get_msg_info(CHAT, 50).message[-1].text == 'mine'
+    return bot
+
+
+def test_manipulating_an_imported_turn_keeps_its_prompt_on_top():
+    bot = _manipulate_imported(50)
+    assert bot.calls == [('edit', 50)]
+    assert bot.bodies[0].split('\n')[2:5] == ['imported prompt', '', '-----']
+
+
+def test_a_later_part_of_an_imported_turn_never_showed_the_prompt():
+    bot = _manipulate_imported(51)
+    assert bot.calls == [('edit', 51)]
+    assert 'imported prompt' not in bot.bodies[0]
+
+
 def test_each_regeneration_counts_one_more_edition():
     bot = _regenerate(_bot())
     assert bot.editions == [2], 'the original answer is the first edition'

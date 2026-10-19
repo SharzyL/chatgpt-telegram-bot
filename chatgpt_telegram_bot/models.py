@@ -55,6 +55,11 @@ def make_thinking_text_part(text: str) -> MsgPartInHistory:
     return MsgPartInHistory(type_='thinking_text', hash=None, text=text)
 
 
+def text_of(parts: list[MsgPartInHistory]) -> str:
+    """The text a stored message shows: its first non-empty text part."""
+    return next((p.text for p in parts if p.type_ == 'text' and p.text), '')
+
+
 def make_reasoning_part(model_name: str, item: dict[str, Any]) -> MsgPartInHistory:
     """
     Store a provider reasoning item verbatim so the next turn can replay it.

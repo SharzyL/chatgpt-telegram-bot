@@ -164,9 +164,9 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
         if field == 'api_type':
             if value is None:
                 raise ValueError('api_type needs a value')
-        elif field == 'suffix':
-            # bare key (|suffix) takes the endpoint's default, explicit empty (|suffix=) none
-            replacements['suffix'] = value
+        elif field in ('suffix', 'system_prompt', 'system_prompt_append'):
+            # a bare `suffix` takes the endpoint's default, an explicit empty one (`suffix=`) none
+            replacements[field] = value
         elif field == 'thinking':
             if value is None:
                 # bare key (e.g. |t) — use api_type default
@@ -179,19 +179,9 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
                     replacements['thinking'] = int(value)
                 except ValueError:
                     replacements['thinking'] = value
-        elif field == 'search':
-            # bare key (|s) enables, explicit empty (|s=) disables
-            replacements['search'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
-        elif field == 'richtext':
-            # bare key (|r) enables, explicit empty (|r=) disables
-            replacements['richtext'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
-        elif field == 'dummy_tool':
-            # bare key (|dt) enables, explicit empty (|dt=) disables
-            replacements['dummy_tool'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
-        elif field == 'system_prompt':
-            replacements['system_prompt'] = value
-        elif field == 'system_prompt_append':
-            replacements['system_prompt_append'] = value
+        elif field in ('search', 'richtext', 'dummy_tool'):
+            # bare key (`s`) enables, explicit empty (`s=`) or a false word disables
+            replacements[field] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
         else:
             raise ValueError(f'Unknown override key: {key}')
     model = model._replace(**replacements)

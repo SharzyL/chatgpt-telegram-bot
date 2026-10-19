@@ -34,6 +34,7 @@ from chatgpt_telegram_bot.models import (
     make_reasoning_part,
     make_text_part,
     make_thinking_text_part,
+    text_of,
 )
 from chatgpt_telegram_bot.render import (
     ENTITY_RENDERER,
@@ -148,6 +149,8 @@ or, to supply a chain of thought too:
 `/mani` is short for `/manipulate`."""
 
 
+NO_STORED_TEXT = '[!] No stored conversation for that message'
+
 CHAT_USAGE = """[!] `/chat` starts a new conversation with the model you name:
 
 `/chat <prefix>[,flags] <message>`
@@ -240,8 +243,6 @@ class ChatGPTTelegramBot:
         # (chat_id, anchor) of a /linearize being carried out, so a second press cannot run it twice
         self.linearizing: set[tuple[int, int]] = set()
 
-        # db scheme:
-        # msg_info_{chat_id}_{msg_id}: MsgInfo
         # the shelf lives for the whole process and is closed via atexit below
         self.db: shelve.Shelf[Any] = shelve.open(os.path.join(data_dir, 'db'))  # noqa: SIM115
         image_cache_size = _config.get('image_cache_size', 50 * 1024 * 1024)
@@ -284,6 +285,19 @@ class ChatGPTTelegramBot:
     def _configured_model(self, prefix: str) -> Model | None:
         return next((m for m in self.models if m.prefix == prefix), None)
 
+    def _match_model(self, text: str) -> tuple[Model, dict[str, str | None], str] | None:
+        """The configured model *text* opens with, its overrides, and the text after them.
+
+        None when *text* opens with no prefix. Raises ValueError, for the user, on an override
+        the model cannot take.
+        """
+        for m in self.models:
+            match = match_prefix(text, m.prefix)
+            if match is not None:
+                rest, overrides = match
+                return apply_overrides(m, overrides), overrides, rest
+        return None
+
     def _spec_model(self, spec: str) -> Model:
         """The model behind an ``<endpoint>/<name>`` spec. Raises ValueError, for the user."""
         endpoint, sep, name = spec.partition('/')
@@ -322,16 +336,19 @@ class ChatGPTTelegramBot:
         _ = self.get_client(model.endpoint or self.default_endpoint, model)
         return model, spec
 
-    def get_msg_info(self, chat_id: int, msg_id: int) -> MsgInfo | None:
-        key = f'msg_info_{chat_id}_{msg_id}'
-        if key in self.db:
-            return self.db[key]
-        else:
-            return None
+    # db scheme: msg_info_{chat_id}_{msg_id} -> MsgInfo
+    @staticmethod
+    def _db_key(chat_id: int, msg_id: int) -> str:
+        return f'msg_info_{chat_id}_{msg_id}'
 
-    def set_msg_info(self, chat_id: int, msg_id: int, msg_info: MsgInfo):
-        key = f'msg_info_{chat_id}_{msg_id}'
-        self.db[key] = msg_info
+    def get_msg_info(self, chat_id: int, msg_id: int) -> MsgInfo | None:
+        return self.db.get(self._db_key(chat_id, msg_id))
+
+    def set_msg_info(self, chat_id: int, msg_id: int, msg_info: MsgInfo) -> None:
+        self.db[self._db_key(chat_id, msg_id)] = msg_info
+
+    def del_msg_info(self, chat_id: int, msg_id: int) -> None:
+        _ = self.db.pop(self._db_key(chat_id, msg_id), None)
 
     def is_allowed(self, chat_id: int) -> bool:
         return chat_id in self.allowed_chats
@@ -708,6 +725,35 @@ class ChatGPTTelegramBot:
         )
         logger.debug(f'Message deleted: {chat_id=}, {message_id=}')
 
+    async def _replied_bot_turn(self, message: Any, usage: str) -> tuple[int, MsgInfo, int] | None:
+        """The bot reply *message* answers, its stored turn and the prompt it answered.
+
+        None, having told the user why, when *message* replies to no stored bot reply.
+        """
+        chat_id = message.chat_id
+        target_id = replied_message_id(message)
+        replied = await message.get_reply_message() if target_id is not None else None
+        if target_id is None or replied is None or replied.sender_id != self.bot_id:
+            _ = await self.send_message(chat_id, usage, message.id)
+            return None
+        # the reply may still be streaming, and its MsgInfo is only written once it finishes
+        await self.pending_reply_manager.wait_for((chat_id, target_id))
+        info = self.get_msg_info(chat_id, target_id)
+        if info is None or not info.sent_by_bot or info.reply_id is None:
+            _ = await self.send_message(chat_id, NO_STORED_TEXT, message.id)
+            return None
+        return target_id, info, info.reply_id
+
+    async def _replied_anchor(self, message: Any, usage: str) -> int | None:
+        """The message *message* replies to, once any reply streaming into it is done; None, having said why, if none."""
+        anchor_id = replied_message_id(message)
+        if anchor_id is None:
+            _ = await self.send_message(message.chat_id, usage, message.id)
+            return None
+        # a reply still streaming has no MsgInfo yet
+        await self.pending_reply_manager.wait_for((message.chat_id, anchor_id))
+        return anchor_id
+
     @only_allowed
     async def manipulate_handler(self, message: Any, body: str) -> None:
         """Replace a stored bot reply with user-supplied text (and optionally a chain of thought)."""
@@ -715,21 +761,10 @@ class ChatGPTTelegramBot:
         msg_id = message.id
         logger.info(f'Manipulate requested: {chat_id=}, {msg_id=}, {body=}')
 
-        target_id = replied_message_id(message)
-        if target_id is None:
-            _ = await self.send_message(chat_id, MANIPULATE_USAGE, msg_id)
+        target = await self._replied_bot_turn(message, MANIPULATE_USAGE)
+        if target is None:
             return
-        reply_to_message = await message.get_reply_message()
-        if reply_to_message is None or reply_to_message.sender_id != self.bot_id:
-            _ = await self.send_message(chat_id, MANIPULATE_USAGE, msg_id)
-            return
-        # the reply may still be streaming, and its MsgInfo is only written once it finishes
-        await self.pending_reply_manager.wait_for((chat_id, target_id))
-
-        target_info = self.get_msg_info(chat_id, target_id)
-        if target_info is None or not target_info.sent_by_bot or target_info.reply_id is None:
-            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
-            return
+        target_id, target_info, prompt_id = target
 
         thinking, text = parse_manipulation(body)
         if not text:
@@ -738,7 +773,7 @@ class ChatGPTTelegramBot:
 
         # the model may have been switched part-way down the chain, so resolve it there
         try:
-            _, model, _ = self.construct_chat_history(chat_id, target_info.reply_id)
+            _, model, _ = self.construct_chat_history(chat_id, prompt_id)
         except RuntimeError as e:
             logger.exception(e)
             _ = await self.send_message(chat_id, f'[!] Error on resolving conversation: {e}', msg_id)
@@ -786,12 +821,11 @@ class ChatGPTTelegramBot:
         spec = spec.strip()
         if not spec:
             return None, {}
-        for m in self.models:
-            match = match_prefix(spec, m.prefix)
-            if match is not None:
-                _, overrides = match
-                return apply_overrides(m, overrides), overrides
-        raise ValueError(f'Unknown prefix: `{spec}`')
+        matched = self._match_model(spec)
+        if matched is None:
+            raise ValueError(f'Unknown prefix: `{spec}`')
+        model, overrides, _ = matched
+        return model, overrides
 
     @only_allowed
     async def import_handler(self, message: Any, body: str) -> None:
@@ -921,7 +955,7 @@ class ChatGPTTelegramBot:
         """Pair a chain of nodes, oldest first, into prompts and their answers."""
         turns: list[ThreadTurn] = []
         for mid, info in chain:
-            text = next((p.text for p in info.message if p.type_ == 'text' and p.text), '')
+            text = text_of(info.message)
             if not info.sent_by_bot:
                 if any(p.type_ == 'image' for p in info.message):
                     text = ('🖼 ' + text).strip()
@@ -960,15 +994,12 @@ class ChatGPTTelegramBot:
         """List the turns of the replied-to thread, a page at a time."""
         chat_id = message.chat_id
         msg_id = message.id
-        anchor_id = replied_message_id(message)
+        anchor_id = await self._replied_anchor(message, NAVIGATE_USAGE)
         if anchor_id is None:
-            _ = await self.send_message(chat_id, NAVIGATE_USAGE, msg_id)
             return
-        # a reply still streaming has no MsgInfo yet
-        await self.pending_reply_manager.wait_for((chat_id, anchor_id))
         rendered = self._navigation(chat_id, anchor_id, None)
         if rendered is None:
-            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
+            _ = await self.send_message(chat_id, NO_STORED_TEXT, msg_id)
             return
         text, buttons = rendered
         _ = await self.send_message_html(chat_id, text, msg_id, buttons=buttons)
@@ -1004,7 +1035,7 @@ class ChatGPTTelegramBot:
         A reply's plain chain of thought goes in the entry's `reasoning` field beside this;
         an encrypted reasoning item means nothing outside this bot and is left behind.
         """
-        text = next((p.text for p in info.message if p.type_ == 'text' and p.text), '')
+        text = text_of(info.message)
         if not info.sent_by_bot and any(p.type_ == 'image' for p in info.message):
             return '[image]' + ('\n\n' + text if text else '')
         return text
@@ -1025,15 +1056,12 @@ class ChatGPTTelegramBot:
         """Send the replied-to thread as a JSON file that /import can read back."""
         chat_id = message.chat_id
         msg_id = message.id
-        anchor_id = replied_message_id(message)
+        anchor_id = await self._replied_anchor(message, EXPORT_USAGE)
         if anchor_id is None:
-            _ = await self.send_message(chat_id, EXPORT_USAGE, msg_id)
             return
-        # a reply still streaming has no MsgInfo yet
-        await self.pending_reply_manager.wait_for((chat_id, anchor_id))
         chain = self._thread_chain(chat_id, anchor_id)
         if chain is None:
-            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
+            _ = await self.send_message(chat_id, NO_STORED_TEXT, msg_id)
             return
         first = chain[0][1]
         if first.reply_id is not None or first.sent_by_bot:
@@ -1061,7 +1089,7 @@ class ChatGPTTelegramBot:
 
     def _chat_nodes(self, chat_id: int) -> dict[int, MsgInfo]:
         """Every stored node of one chat, by id -- a scan, since MsgInfo links only backwards."""
-        prefix = f'msg_info_{chat_id}_'
+        prefix = self._db_key(chat_id, 0)[:-1]
         nodes: dict[int, MsgInfo] = {}
         for key in self.db:
             if key.startswith(prefix):
@@ -1092,14 +1120,12 @@ class ChatGPTTelegramBot:
         """Offer to delete every branch of a thread except the one leading to the replied message."""
         chat_id = message.chat_id
         msg_id = message.id
-        anchor_id = replied_message_id(message)
+        anchor_id = await self._replied_anchor(message, LINEARIZE_USAGE)
         if anchor_id is None:
-            _ = await self.send_message(chat_id, LINEARIZE_USAGE, msg_id)
             return
-        await self.pending_reply_manager.wait_for((chat_id, anchor_id))
         planned = self._linearize_plan(chat_id, anchor_id)
         if planned is None:
-            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
+            _ = await self.send_message(chat_id, NO_STORED_TEXT, msg_id)
             return
         nodes, delete = planned
         listing, count = format_linearize_listing(nodes, delete, self.NAVIGATE_PREVIEW_WIDTH, self.LINEARIZE_LIST_LIMIT)
@@ -1182,12 +1208,10 @@ class ChatGPTTelegramBot:
             for start in range(0, len(targets), 100):
                 remaining |= await self._still_there(chat_id, targets[start : start + 100])
             gone = set(targets) - remaining
-            for mid in gone:
-                _ = self.db.pop(f'msg_info_{chat_id}_{mid}', None)
             # an imported prompt has no message of its own; it goes with the turn that showed it
             for mid in delete:
-                if mid < 0 and -mid in gone:
-                    _ = self.db.pop(f'msg_info_{chat_id}_{mid}', None)
+                if mid in gone or mid < 0 and -mid in gone:
+                    self.del_msg_info(chat_id, mid)
             summary = f'🧹 Deleted {len(gone)} {"message" if len(gone) == 1 else "messages"}.'
             if remaining:
                 summary += (
@@ -1220,22 +1244,10 @@ class ChatGPTTelegramBot:
         msg_id = message.id
         logger.info(f'Regenerate requested: {chat_id=}, {msg_id=}, {body=}')
 
-        target_id = replied_message_id(message)
-        if target_id is None:
-            _ = await self.send_message(chat_id, REGENERATE_USAGE, msg_id)
+        target = await self._replied_bot_turn(message, REGENERATE_USAGE)
+        if target is None:
             return
-        reply_to_message = await message.get_reply_message()
-        if reply_to_message is None or reply_to_message.sender_id != self.bot_id:
-            _ = await self.send_message(chat_id, REGENERATE_USAGE, msg_id)
-            return
-        # the reply may still be streaming, and its MsgInfo is only written once it finishes
-        await self.pending_reply_manager.wait_for((chat_id, target_id))
-
-        target_info = self.get_msg_info(chat_id, target_id)
-        if target_info is None or not target_info.sent_by_bot or target_info.reply_id is None:
-            _ = await self.send_message(chat_id, '[!] No stored conversation for that message', msg_id)
-            return
-        prompt_id = target_info.reply_id
+        target_id, target_info, prompt_id = target
         prompt_info = self.get_msg_info(chat_id, prompt_id)
         if prompt_info is None or prompt_info.sent_by_bot:
             _ = await self.send_message(chat_id, '[!] No stored prompt for that message', msg_id)
@@ -1255,27 +1267,18 @@ class ChatGPTTelegramBot:
         model_spec: str | None = None
         overrides: dict[str, str | None] = {}
         new_prompt = body.strip()
-        if new_prompt:
-            for m in self.models:
-                match = match_prefix(body, m.prefix)
-                if match is not None:
-                    new_prompt, overrides = match
-                    try:
-                        model = apply_overrides(m, overrides)
-                    except ValueError as e:
-                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
-                        return
-                    break
-            else:
+        try:
+            if new_prompt and (matched := self._match_model(body)) is not None:
+                model, overrides, new_prompt = matched
+            elif new_prompt:
                 head, spec_overrides, rest = parse_chat_spec(new_prompt)
                 endpoint, sep, _ = head.partition('/')
                 if sep and endpoint in self.endpoint_by_name:
-                    try:
-                        model, model_spec = self._chat_model(head, spec_overrides)
-                    except ValueError as e:
-                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
-                        return
+                    model, model_spec = self._chat_model(head, spec_overrides)
                     overrides, new_prompt = spec_overrides, rest
+        except ValueError as e:
+            _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+            return
 
         # a named model and a new prompt both belong to the turn being answered, so they are
         # recorded on its prompt exactly as sending it afresh with that prefix would
@@ -1427,30 +1430,20 @@ class ChatGPTTelegramBot:
         # missing prefix is an error there; on a reply the prefix is optional and switches
         # the model for this turn and the ones after it
         overrides: dict[str, str | None] = {}
-        if chat:
-            head, overrides, text = parse_chat_spec(text)
-            try:
+        try:
+            if chat:
+                head, overrides, text = parse_chat_spec(text)
                 model_by_prefix, model_spec = self._chat_model(head, overrides)
-            except ValueError as e:
-                _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
-                return
-        else:
-            for m in self.models:
-                match = match_prefix(text, m.prefix)
-                if match is not None:
-                    text, overrides = match
-                    try:
-                        model_by_prefix = apply_overrides(m, overrides)
-                    except ValueError as e:
-                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
-                        return
-                    break
-            else:  # no matching prefix
-                if reply_to_id is None:
-                    if chat_id == sender_id:  # in private chat, point at /models and /help
-                        _ = await self.send_message(chat_id, self._no_prefix_text(), msg_id)
-                    return
-                # continuing a thread: model and prompt carry over from the message replied to
+            elif (matched := self._match_model(text)) is not None:
+                model_by_prefix, overrides, text = matched
+        except ValueError as e:
+            _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+            return
+        # with no prefix, a reply carries over the model and prompt of the message replied to
+        if model_by_prefix is None and reply_to_id is None:
+            if chat_id == sender_id:  # in private chat, point at /models and /help
+                _ = await self.send_message(chat_id, self._no_prefix_text(), msg_id)
+            return
 
         try:
             replied_images, replied_files = await self._read_media(chat_id, replied_media)

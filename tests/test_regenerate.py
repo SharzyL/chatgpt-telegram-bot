@@ -306,7 +306,7 @@ def _recording_bot() -> Any:
     bot.edit_message = edit_message
     bot.delete_message = delete_message
 
-    def get_client(_endpoint: str, _model: Model) -> None:
+    def get_client(_model: Model) -> None:
         return None
 
     bot.get_client = get_client

@@ -55,7 +55,7 @@ def _bot() -> Any:
     bot.send_message = send_message  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub
     bot.edit_message = edit_message  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub
     bot.delete_message = delete_message  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub
-    bot.get_client = lambda _endpoint, _model: None  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub
+    bot.get_client = lambda _model: None  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub
     bot.set_msg_info(CHAT, PROMPT_ID, MsgInfo(False, [make_text_part('go')], None, 'g', 'be helpful'))
     return bot
 

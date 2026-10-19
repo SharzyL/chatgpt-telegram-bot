@@ -212,7 +212,7 @@ class ChatGPTTelegramBot:
             ep = model.endpoint or self.default_endpoint
             if ep not in self.endpoint_by_name:
                 raise ValueError(f'Unknown endpoint "{ep}" for model "{model.prefix}"')
-            _ = self.get_client(ep, model)
+            _ = self.get_client(model)
 
         # a streaming reply settles at one edit per TELEGRAM_MIN_INTERVAL; the first
         # TELEGRAM_BURST_WINDOW seconds may go at TELEGRAM_BURST_INTERVAL instead
@@ -274,8 +274,9 @@ class ChatGPTTelegramBot:
             return anthropic.AsyncAnthropic(api_key=api_key, base_url=url, max_retries=0, timeout=300)
         raise ValueError(f'Unknown api_type: {api_type}')
 
-    def get_client(self, endpoint: str, model: Model) -> Any:
+    def get_client(self, model: Model) -> Any:
         """The SDK client for *model*, made on first use for a combination no configured model has."""
+        endpoint = model.endpoint or self.default_endpoint
         suffix = model.suffix if model.suffix is not None else self.endpoint_by_name[endpoint].default_suffix
         key = (endpoint, model.api_type, suffix)
         if key not in self.clients:
@@ -333,7 +334,7 @@ class ChatGPTTelegramBot:
             model, spec = self._spec_model(head), head
         model = apply_overrides(model, overrides)
         # made now, so a missing API key is reported here rather than as a failed generation
-        _ = self.get_client(model.endpoint or self.default_endpoint, model)
+        _ = self.get_client(model)
         return model, spec
 
     # db scheme: msg_info_{chat_id}_{msg_id} -> MsgInfo
@@ -1371,6 +1372,45 @@ class ChatGPTTelegramBot:
         own_media = [message] if self._media_kind(message) is not None else []
         await self._user_turn(message, [message.id], message.message or '', own_media)
 
+    async def _reply_context(self, first: Any, chat: bool) -> tuple[int | None, list[Any]] | None:
+        """What *first* replies to: the turn it continues, and the messages whose media it takes.
+
+        None for a reply the bot leaves alone. With *chat* nothing is continued, and a replied
+        message only lends its media.
+        """
+        # a message sitting in a forum topic carries a reply header too, so what counts as a
+        # reply is decided by replied_message_id rather than by the header being present
+        replied_id = replied_message_id(first)
+        if replied_id is None:
+            return None, []
+        chat_id = first.chat_id
+        if chat:
+            # a bot turn with media included, which is what /chat is for: replying normally
+            # would continue that turn's thread
+            replied = await first.get_reply_message()
+            if replied is not None and self._media_kind(replied) is not None:
+                return None, await self._album_of(replied)
+            return None, []
+        if first.reply_to.quote_text is not None:
+            logger.debug(f'Reply contains quote text {chat_id=}, {first.id=}')
+            return None
+        replied = await first.get_reply_message()
+        if replied is None:
+            logger.debug(f'Replied message is unavailable {chat_id=}, {first.id=}')
+            return None
+        has_media = self._media_kind(replied) is not None
+        # a bot message continues its thread when it is a stored turn, whatever it carries;
+        # one with media and no turn behind it is a file the bot sent for keeping, such as an
+        # /export, and is talked about like anyone else's. A turn still streaming has no
+        # MsgInfo until it finishes, hence the wait before looking.
+        if replied.sender_id == self.bot_id:
+            await self.pending_reply_manager.wait_for((chat_id, replied_id))
+            if self.get_msg_info(chat_id, replied_id) is not None or not has_media:
+                return replied_id, []
+        if has_media:
+            return None, await self._album_of(replied)
+        return None
+
     async def _user_turn(
         self, first: Any, msg_ids: list[int], text: str, own_media: list[Any], chat: bool = False
     ) -> None:
@@ -1386,45 +1426,13 @@ class ChatGPTTelegramBot:
         a thread whatever it replies to; a replied message only lends its media.
         """
         chat_id = first.chat_id
-        sender_id = first.sender_id
         msg_id = msg_ids[0]
-        reply_to_id: int | None = None
+        context = await self._reply_context(first, chat)
+        if context is None:
+            return
+        reply_to_id, replied_media = context
         model_by_prefix: Model | None = None
         model_spec: str | None = None
-        replied_media: list[Any] = []
-
-        # a message sitting in a forum topic carries a reply header too, so what counts as a
-        # reply is decided by replied_message_id rather than by the header being present
-        replied_id = replied_message_id(first)
-        if replied_id is not None and chat:
-            # a bot turn with media included, which is what /chat is for: replying normally
-            # would continue that turn's thread
-            reply_to_message = await first.get_reply_message()
-            if reply_to_message is not None and self._media_kind(reply_to_message) is not None:
-                replied_media = await self._album_of(reply_to_message)
-        elif replied_id is not None:
-            if first.reply_to.quote_text is not None:
-                logger.debug(f'Reply contains quote text {chat_id=}, {msg_id=}')
-                return
-            reply_to_message = await first.get_reply_message()
-            if reply_to_message is None:
-                logger.debug(f'Replied message is unavailable {chat_id=}, {msg_id=}')
-                return
-            # a bot message continues its thread when it is a stored turn, whatever it carries;
-            # one with media and no turn behind it is a file the bot sent for keeping, such as
-            # an /export, and is talked about like anyone else's. A turn still streaming has
-            # no MsgInfo until it finishes, hence the wait before looking.
-            continues_thread = False
-            if reply_to_message.sender_id == self.bot_id:
-                await self.pending_reply_manager.wait_for((chat_id, replied_id))
-                stored = self.get_msg_info(chat_id, replied_id)
-                continues_thread = stored is not None or self._media_kind(reply_to_message) is None
-            if continues_thread:  # user reply to a bot message
-                reply_to_id = replied_id
-            elif self._media_kind(reply_to_message) is not None:
-                replied_media = await self._album_of(reply_to_message)
-            else:
-                return
 
         # a message that opens a thread has no model unless its prefix names one, so a
         # missing prefix is an error there; on a reply the prefix is optional and switches
@@ -1441,7 +1449,7 @@ class ChatGPTTelegramBot:
             return
         # with no prefix, a reply carries over the model and prompt of the message replied to
         if model_by_prefix is None and reply_to_id is None:
-            if chat_id == sender_id:  # in private chat, point at /models and /help
+            if chat_id == first.sender_id:  # in private chat, point at /models and /help
                 _ = await self.send_message(chat_id, self._no_prefix_text(), msg_id)
             return
 
@@ -1487,7 +1495,59 @@ class ChatGPTTelegramBot:
         finally:
             _ = self.generating.pop((chat_id, msg_id), None)
 
-    async def _generate(self, chat_id: int, msg_id: int, adopt: list[int] | None = None):
+    async def _fetch_image(self, chat_id: int, msg_id: int) -> bytes:
+        """Download an image again from its message, for one evicted from the cache."""
+        msg = await self.bot.get_messages(chat_id, ids=msg_id)
+        # ids=int returns a single Message at runtime, or None if it no longer exists
+        if not isinstance(msg, Message):
+            # a vanished message is a lookup failure, not a type error
+            raise ValueError(f'cannot fetch message {msg_id} in chat {chat_id}')  # noqa: TRY004
+        blob = await msg.download_media(bytes)
+        if not isinstance(blob, bytes):
+            # absent media is a lookup failure, not a type error
+            raise ValueError(f'message {msg_id} in chat {chat_id} has no downloadable media')  # noqa: TRY004
+        return blob
+
+    async def _load_image(self, key: str) -> bytes | None:
+        return await load_photo(self.image_cache, key, self._fetch_image)
+
+    @staticmethod
+    def _add_timing(usage: dict[str, Any], start: float, first_token: float | None, end: float) -> None:
+        """Add time to first token and tokens per second to a reply's usage, if it has any."""
+        if not usage:
+            return
+        usage['TTFT'] = f'{(first_token or end) - start:.1f}s'
+        # reasoning tokens are a breakdown of the output total, not an addition to it
+        out_tokens = usage.get('out') or 0
+        if out_tokens and first_token and end > first_token:
+            usage['TPS'] = f'{out_tokens / (end - first_token):.1f}'
+
+    def _store_reply(
+        self, chat_id: int, prompt_id: int, model: Model, part_ids: list[int], reply: str, carry: list[dict[str, Any]]
+    ) -> None:
+        """Record a finished reply under every message it occupies, with what it carries forward."""
+        # reasoning first: replaying it requires the order the provider emitted
+        parts: list[MsgPartInHistory] = []
+        for item in carry:
+            chain_of_thought = reasoning_text_of(item)
+            if chain_of_thought:
+                # A chain of thought we can read is carried as text rather than as a reasoning
+                # item. DeepSeek returns the text beside a handle into a response `store=false`
+                # never kept, and drops the item on replay whichever way it is sent -- observed
+                # by the reasoning tokens never reaching the next turn's input, and by the model
+                # reinventing numbers it had picked. As text it goes back as a plain reasoning
+                # item under dt, and is dropped otherwise.
+                parts.append(make_thinking_text_part(chain_of_thought))
+            else:
+                parts.append(make_reasoning_part(model.name, item))
+        parts.append(make_text_part(reply))
+        info = MsgInfo(
+            sent_by_bot=True, message=parts, reply_id=prompt_id, prefix=None, system_prompt=None, part_ids=part_ids
+        )
+        for mid in part_ids:
+            self.set_msg_info(chat_id, mid, info)
+
+    async def _generate(self, chat_id: int, msg_id: int, adopt: list[int] | None = None) -> None:
         try:
             chat_history, model, system_prompt = self.construct_chat_history(chat_id, msg_id)
         except RuntimeError as e:
@@ -1504,27 +1564,10 @@ class ChatGPTTelegramBot:
             prefix = self._reply_prefix(model)
             async with BotReplyMessages(self, chat_id, msg_id, prefix, self.get_renderer(model), adopt) as replymsgs:
                 try:
-                    endpoint = model.endpoint or self.default_endpoint
                     status: str | None = 'Generating...'
                     await replymsgs.update(f'[{status}]')
-                    client = self.get_client(endpoint, model)
-
-                    async def fetch_image(cid: int, mid: int) -> bytes:
-                        msg = await self.bot.get_messages(cid, ids=mid)
-                        # ids=int returns a single Message at runtime, or None if it no longer exists
-                        if not isinstance(msg, Message):
-                            # a vanished message is a lookup failure, not a type error
-                            raise ValueError(f'cannot fetch message {mid} in chat {cid}')  # noqa: TRY004
-                        blob = await msg.download_media(bytes)
-                        if not isinstance(blob, bytes):
-                            # absent media is a lookup failure, not a type error
-                            raise ValueError(f'message {mid} in chat {cid} has no downloadable media')  # noqa: TRY004
-                        return blob
-
-                    async def load_image(key: str) -> bytes | None:
-                        return await load_photo(self.image_cache, key, fetch_image)
-
-                    stream = completion(client, chat_history, model, system_prompt, chat_id, msg_id, load_image)
+                    client = self.get_client(model)
+                    stream = completion(client, chat_history, model, system_prompt, chat_id, msg_id, self._load_image)
                     stream_start = time.time()
                     first_token_time: float | None = None
                     aborted = False
@@ -1537,12 +1580,10 @@ class ChatGPTTelegramBot:
                             aborted = True
                             break
                         if isinstance(event, ThinkingDelta):
-                            if first_token_time is None:
-                                first_token_time = time.time()
+                            first_token_time = first_token_time or time.time()
                             thinking += event.text
                         elif isinstance(event, ResponseDelta):
-                            if first_token_time is None:
-                                first_token_time = time.time()
+                            first_token_time = first_token_time or time.time()
                             thinking_done = True
                             reply += event.text
                         elif isinstance(event, StatusChange):
@@ -1551,60 +1592,20 @@ class ChatGPTTelegramBot:
                             stream_meta = event
                             continue
                         await replymsgs.update(format_reply(thinking, reply, thinking_done, status), bool(thinking))
-                    stream_end = time.time()
                     usage = stream_meta.usage
-                    if usage:
-                        ttft = (first_token_time or stream_end) - stream_start
-                        usage['TTFT'] = f'{ttft:.1f}s'
-                        # reasoning tokens are a breakdown of the output total, not an addition to it
-                        out_tokens = usage.get('out') or 0
-                        if out_tokens and first_token_time:
-                            gen_duration = stream_end - first_token_time
-                            if gen_duration > 0:
-                                usage['TPS'] = f'{out_tokens / gen_duration:.1f}'
-                    await replymsgs.update(
-                        format_reply(
-                            thinking,
-                            reply,
-                            True,
-                            status='aborted' if aborted else None,
-                            tool_calls=stream_meta.tool_calls or None,
-                            usage=usage or None,
-                        ),
-                        bool(thinking),
+                    self._add_timing(usage, stream_start, first_token_time, time.time())
+                    final = format_reply(
+                        thinking,
+                        reply,
+                        True,
+                        status='aborted' if aborted else None,
+                        tool_calls=stream_meta.tool_calls or None,
+                        usage=usage or None,
                     )
+                    await replymsgs.update(final, bool(thinking))
                     await replymsgs.finalize()
-                    full_reply = reply
-                    # reasoning first: replaying it requires the order the provider emitted
-                    reply_parts: list[MsgPartInHistory] = []
-                    for item in stream_meta.carry_items:
-                        chain_of_thought = reasoning_text_of(item)
-                        if chain_of_thought:
-                            # A chain of thought we can read is carried as text rather than
-                            # as a reasoning item. DeepSeek returns the text beside a handle
-                            # into a response `store=false` never kept, and drops the item on
-                            # replay whichever way it is sent -- observed by the reasoning
-                            # tokens never reaching the next turn's input, and by the model
-                            # reinventing numbers it had picked. As text it goes back as a
-                            # plain reasoning item under dt, and is dropped otherwise.
-                            reply_parts.append(make_thinking_text_part(chain_of_thought))
-                        else:
-                            reply_parts.append(make_reasoning_part(model.name, item))
-                    reply_parts.append(make_text_part(full_reply))
                     part_ids = [bot_msg_id for bot_msg_id, _ in replymsgs.replied_msgs]
-                    for bot_msg_id in part_ids:
-                        self.set_msg_info(
-                            chat_id,
-                            bot_msg_id,
-                            MsgInfo(
-                                sent_by_bot=True,
-                                message=list(reply_parts),
-                                reply_id=msg_id,
-                                prefix=None,
-                                system_prompt=None,
-                                part_ids=list(part_ids),
-                            ),
-                        )
+                    self._store_reply(chat_id, msg_id, model, part_ids, reply, stream_meta.carry_items)
                     return
 
                 # handling completion errors

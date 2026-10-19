@@ -19,7 +19,7 @@ from loguru import logger
 from telethon import Button, TelegramClient, errors, events, functions, types
 from telethon.tl.custom import Message
 
-from chatgpt_telegram_bot.completion import completion, reasoning_text_of
+from chatgpt_telegram_bot.completion import completion, reasoning_text_of, thinking_text_of
 from chatgpt_telegram_bot.models import (
     EndPoint,
     Model,
@@ -817,9 +817,11 @@ class ChatGPTTelegramBot:
         system_prompt = self._system_prompt_for(model)
         reply_to = msg_id
         previous_turn_id: int | None = None
-        for i, (prompt, response) in enumerate(chat.turns, start=1):
+        for i, (prompt, response, reasoning) in enumerate(chat.turns, start=1):
             bodies = renderer.render(
-                format_imported_turn(prompt, response), self._import_prefix(model, i, len(chat.turns))
+                format_imported_turn(prompt, response, reasoning),
+                self._import_prefix(model, i, len(chat.turns)),
+                collapse_first_quote=bool(reasoning),
             )
             msg_ids: list[int] = []
             for part in bodies:
@@ -843,9 +845,12 @@ class ChatGPTTelegramBot:
                     overrides=(overrides or None) if i == 1 else None,
                 ),
             )
+            # the chain of thought is stored as a reply's would be, so dt can send it back
+            response_parts = [make_thinking_text_part(reasoning)] if reasoning else []
+            response_parts.append(make_text_part(response))
             response_info = MsgInfo(
                 sent_by_bot=True,
-                message=[make_text_part(response)],
+                message=response_parts,
                 reply_id=prompt_id,
                 prefix=None,
                 system_prompt=None,
@@ -968,7 +973,11 @@ class ChatGPTTelegramBot:
 
     @staticmethod
     def _export_content(info: MsgInfo) -> str:
-        """A node's text as an export carries it: the answer only, and a marker for an image."""
+        """A node's text as an export carries it: the answer, and a marker for an image.
+
+        A reply's plain chain of thought goes in the entry's `reasoning` field beside this;
+        an encrypted reasoning item means nothing outside this bot and is left behind.
+        """
         text = next((p.text for p in info.message if p.type_ == 'text' and p.text), '')
         if not info.sent_by_bot and any(p.type_ == 'image' for p in info.message):
             return '[image]' + ('\n\n' + text if text else '')
@@ -1009,7 +1018,12 @@ class ChatGPTTelegramBot:
         # an imported prompt lives under a negative id and was never a message, so it has no date
         dates = await self._message_dates(chat_id, [mid for mid, _ in chain if mid > 0])
         messages = [
-            ('assistant' if info.sent_by_bot else 'user', self._export_content(info), dates.get(mid))
+            (
+                'assistant' if info.sent_by_bot else 'user',
+                self._export_content(info),
+                dates.get(mid),
+                thinking_text_of(info.message) if info.sent_by_bot else None,
+            )
             for mid, info in chain
         ]
         title = body.strip() or preview_line(messages[0][1], 40) or 'Untitled'

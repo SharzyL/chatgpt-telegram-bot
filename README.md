@@ -134,14 +134,17 @@ replies to.
   "title": "Reading list",
   "messages": [
     { "role": "user", "content": "what should I read?" },
-    { "role": "assistant", "content": "start with ..." }
+    { "role": "assistant", "content": "start with ...", "reasoning": "optional chain of thought" }
   ]
 }
 ```
 
-Roles must alternate, starting with the user. The bot confirms the title and then posts one
-message per turn, showing the prompt above the response; reply to any of them to continue the
-conversation from that point.
+Roles must alternate, starting with the user. An answer may carry its chain of thought in an
+optional `reasoning` field, which `/export` writes for answers that have one. The bot confirms
+the title and then posts one message per turn: the prompt, a `-----` line, then the answer,
+with its chain of thought folded above it like a live reply's. Reply to any of them to continue
+the conversation from that point; under `dt`, the imported chains of thought go back to the
+model too.
 
 Sending is paced to stay inside Telegram's rate limits, so a short import appears at once
 while a very long one trickles in over several minutes; the confirmation says so when it will

@@ -27,7 +27,7 @@ WHEN = datetime.datetime(2026, 1, 2, 3, 4, 5, 678000, tzinfo=datetime.UTC)
 
 
 def test_the_export_has_the_import_shape():
-    out = json.loads(format_export('T', [('user', 'q', WHEN), ('assistant', 'a', WHEN)], WHEN))
+    out = json.loads(format_export('T', [('user', 'q', WHEN, None), ('assistant', 'a', WHEN, None)], WHEN))
     assert out == {
         'title': 'T',
         'exportedAt': '2026-01-02T03:04:05.678Z',
@@ -39,17 +39,17 @@ def test_the_export_has_the_import_shape():
 
 
 def test_a_message_with_no_known_time_has_no_timestamp():
-    out = json.loads(format_export('T', [('user', 'q', None), ('assistant', 'a', WHEN)], WHEN))
+    out = json.loads(format_export('T', [('user', 'q', None, None), ('assistant', 'a', WHEN, None)], WHEN))
     assert 'timestamp' not in out['messages'][0]
 
 
 def test_non_ascii_is_written_as_is():
-    assert '标题' in format_export('标题', [('user', 'q', None), ('assistant', 'a', None)], WHEN)
+    assert '标题' in format_export('标题', [('user', 'q', None, None), ('assistant', 'a', None, None)], WHEN)
 
 
 def test_a_timestamp_in_another_zone_is_written_in_utc():
     tokyo = datetime.datetime(2026, 1, 2, 12, 4, 5, tzinfo=datetime.timezone(datetime.timedelta(hours=9)))
-    out = json.loads(format_export('T', [('user', 'q', tokyo), ('assistant', 'a', None)], WHEN))
+    out = json.loads(format_export('T', [('user', 'q', tokyo, None), ('assistant', 'a', None, None)], WHEN))
     assert out['messages'][0]['timestamp'] == '2026-01-02T03:04:05.000Z'
 
 
@@ -158,7 +158,7 @@ def test_the_export_imports_back_to_the_same_turns():
     _, data, _, _ = bot.sent[0]
     chat = parse_import(data.decode())
     assert chat.title == 'Round trip'
-    assert chat.turns == [(f'prompt {i}', f'answer {i}') for i in range(1, 4)]
+    assert chat.turns == [(f'prompt {i}', f'answer {i}', None) for i in range(1, 4)]
 
 
 def test_without_a_title_the_first_prompt_names_it():
@@ -168,7 +168,7 @@ def test_without_a_title_the_first_prompt_names_it():
     assert doc['title'] == 'prompt 1'
 
 
-def test_only_the_answer_is_exported_not_reasoning_or_thinking():
+def test_a_plain_chain_of_thought_is_exported_as_reasoning_and_ciphertext_is_not():
     bot = _bot()
     bot.set_msg_info(CHAT, 1, MsgInfo(False, [make_text_part('q')], None, 'g', None))
     item = {'type': 'reasoning', 'id': 'rs_1', 'encrypted_content': 'opaque'}
@@ -177,6 +177,23 @@ def test_only_the_answer_is_exported_not_reasoning_or_thinking():
     _ = _export(bot, 2)
     doc, _, _ = _document(bot)
     assert doc['messages'][1]['content'] == 'the answer'
+    assert doc['messages'][1]['reasoning'] == 'my reasoning'
+    assert 'opaque' not in json.dumps(doc)
+    assert 'reasoning' not in doc['messages'][0]
+
+
+def test_a_reply_without_a_chain_of_thought_has_no_reasoning_field():
+    out = json.loads(format_export('T', [('user', 'q', None, None), ('assistant', 'a', None, '')], WHEN))
+    assert 'reasoning' not in out['messages'][1]
+
+
+def test_reasoning_survives_a_round_trip():
+    bot = _bot()
+    bot.set_msg_info(CHAT, 1, MsgInfo(False, [make_text_part('q')], None, 'g', None))
+    bot.set_msg_info(CHAT, 2, MsgInfo(True, [make_thinking_text_part('why'), make_text_part('a')], 1, None, None))
+    _ = _export(bot, 2)
+    _, data, _, _ = bot.sent[0]
+    assert parse_import(data.decode()).turns == [('q', 'a', 'why')]
 
 
 def test_an_image_prompt_keeps_a_marker():

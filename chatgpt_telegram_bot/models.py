@@ -93,11 +93,20 @@ class ThreadTurn(NamedTuple):
     msg_id: int
 
 
+class ImportedTurn(NamedTuple):
+    """One prompt of an imported conversation and the response to it."""
+
+    prompt: str
+    response: str
+    # the response's chain of thought, from the message's optional `reasoning` field
+    reasoning: str | None = None
+
+
 class ImportedChat(NamedTuple):
     """A conversation exported from elsewhere, as pairs of prompt and response."""
 
     title: str
-    turns: list[tuple[str, str]]
+    turns: list[ImportedTurn]
     # a prompt the export ends on with nothing answering it; there is no turn to show for it
     trailing_prompt: str | None = None
 

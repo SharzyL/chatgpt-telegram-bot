@@ -26,8 +26,20 @@ TWO_TURNS: dict[str, Any] = {
 def test_turns_are_paired_up():
     chat = parse_import(json.dumps(TWO_TURNS))
     assert chat.title == 'A chat'
-    assert chat.turns == [('first prompt', 'first response'), ('second prompt', 'second response')]
+    assert chat.turns == [('first prompt', 'first response', None), ('second prompt', 'second response', None)]
     assert chat.trailing_prompt is None
+
+
+def test_an_answer_may_carry_its_reasoning():
+    payload = {
+        'messages': [
+            {'role': 'user', 'content': 'q1', 'reasoning': 'a prompt has none to keep'},
+            {'role': 'assistant', 'content': 'a1', 'reasoning': 'thought it over'},
+            {'role': 'user', 'content': 'q2'},
+            {'role': 'assistant', 'content': 'a2', 'reasoning': ''},
+        ]
+    }
+    assert parse_import(json.dumps(payload)).turns == [('q1', 'a1', 'thought it over'), ('q2', 'a2', None)]
 
 
 def test_a_prompt_with_no_response_is_reported_not_dropped_silently():
@@ -58,6 +70,10 @@ def test_a_multiline_title_is_flattened():
         ('{"messages": [{"role": "system", "content": "a"}]}', "unsupported role 'system'"),
         ('{"messages": [{"role": "user"}]}', 'Message 1 has no text content'),
         ('{"messages": ["nope"]}', 'Message 1 is not an object'),
+        (
+            '{"messages": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b", "reasoning": 1}]}',
+            'Message 2 has a "reasoning" that is not text',
+        ),
         ('{"messages": [{"role": "user", "content": "a"}]}', 'no complete prompt-and-response turn'),
     ],
 )
@@ -132,6 +148,32 @@ def test_each_turn_shows_the_prompt_and_the_response():
     assert 'first prompt' in first
     assert 'first response' in first
     assert '(1/2)' in first
+
+
+def test_a_turn_shows_the_prompt_plainly_then_a_line_then_the_answer():
+    bot = _import(TWO_TURNS, 'g')
+    text = bot.sent[1][1].text
+    assert text.index('first prompt') < text.index('\n-----\n') < text.index('first response')
+    quotes = [e for e in bot.sent[1][1].entities if type(e).__name__ == 'MessageEntityBlockquote']
+    assert not quotes, 'the prompt is no longer quoted, and there is no reasoning to quote'
+
+
+def test_a_turn_with_reasoning_shows_it_folded_and_stores_it():
+    payload = {
+        'messages': [
+            {'role': 'user', 'content': 'q'},
+            {'role': 'assistant', 'content': 'the answer', 'reasoning': 'thought it over'},
+        ]
+    }
+    bot = _import(payload, 'g')
+    turn_id, body, _ = bot.sent[1]
+    assert body.text.index('-----') < body.text.index('thought it over') < body.text.index('the answer')
+    quotes = [e for e in body.entities if type(e).__name__ == 'MessageEntityBlockquote']
+    assert len(quotes) == 1
+    assert quotes[0].collapsed
+    info = bot.get_msg_info(1, turn_id)
+    assert info is not None
+    assert [(p.type_, p.text) for p in info.message] == [('thinking_text', 'thought it over'), ('text', 'the answer')]
 
 
 def test_replying_to_a_turn_continues_from_that_point():

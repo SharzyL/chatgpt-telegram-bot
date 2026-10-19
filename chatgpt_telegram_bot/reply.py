@@ -53,14 +53,20 @@ def format_reply(
     return result
 
 
-def format_imported_turn(prompt: str, response: str) -> str:
-    """One turn of an imported conversation: the prompt quoted above the response.
+# a literal dash line: bare, `-----` would be a horizontal rule (sent as `---` by the entity
+# renderer), or turn the line above into a heading when nothing separates them
+IMPORT_SEPARATOR = '\\-----'
 
-    The quote is what visually separates someone else's prompt from the answer, the same
-    way a thinking block is set apart, and `balance_fences` keeps a fence inside the prompt
-    from swallowing the response below it.
+
+def format_imported_turn(prompt: str, response: str, reasoning: str | None = None) -> str:
+    """One turn of an imported conversation: the prompt, a `-----` line, then the answer.
+
+    The answer is laid out as a reply is, its chain of thought quoted above it, so the quote
+    is the first one in the message and the renderer folds it. `balance_fences` keeps a fence
+    left open in the prompt or the reasoning from swallowing what follows.
     """
-    return _blockquote_markdown(balance_fences(normalize_math(prompt))) + '\n\n' + normalize_math(response)
+    answer = format_reply(reasoning or '', response, True)
+    return balance_fences(normalize_math(prompt)) + '\n\n' + IMPORT_SEPARATOR + '\n\n' + answer
 
 
 def format_navigation_page(

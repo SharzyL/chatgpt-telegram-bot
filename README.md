@@ -79,6 +79,7 @@ Overrides go between the prefix and the message, separated by commas:
 | `gpt,r= hello` | render to message entities on the client instead |
 | `gpt,dt hello` | dummy tool: pass earlier chains of thought back, the way DeepSeek needs (see below) |
 | `gpt,dt= hello` | no dummy tool, and earlier chains of thought dropped (the default) |
+| `gpt,live hello` | live: editing any prompt of this conversation answers it again, over its reply |
 | `gpt,[be terse] hello` | replace the system prompt for this conversation |
 | `gpt,+[be terse] hello` | append to the default system prompt |
 | `gpt,[] hello` | send no system prompt at all |
@@ -87,6 +88,13 @@ Overrides go between the prefix and the message, separated by commas:
 
 Several can be combined (`gpt,t=high,s hello`), and brackets may contain spaces and escaped
 brackets (`\[`, `\]`).
+
+In a `live` conversation, editing a prompt you sent answers it again: the edited text is read
+as if you had sent it fresh (a prefix in it can switch the model), and the new answer is written
+over the old reply, its header showing the next `version=`. This works for any prompt of the
+conversation, not only the first. A conversation has to be live already for an edit to count,
+so adding `,live` to a prompt by editing it does not make that edit regenerate. An answer still
+streaming when you edit is stopped, and the latest edit wins.
 
 A model's chain of thought is shown with each reply, but by default earlier ones are not sent
 back. With `dt` (dummy tool) they are, as reasoning: DeepSeek keeps a passed-back chain of
@@ -207,6 +215,7 @@ Each entry in `models`:
 | `search` | `false` | enable web search |
 | `richtext` | `false` | let Telegram render the markdown rather than sending entities |
 | `dummy_tool` | `false` | offer a do-nothing tool and pass earlier chains of thought back (`,dt`); `api_type = "openai"` only |
+| `live` | `false` | editing a prompt answers it again over its reply (`,live`) |
 | `system_prompt` | `null` | replaces the default prompt for this model |
 | `system_prompt_append` | `null` | appended to the default prompt |
 | `no_system_prompt` | `false` | send no system prompt |

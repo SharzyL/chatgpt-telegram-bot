@@ -63,6 +63,7 @@ def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = Non
     bot.bot_id = BOT_ID
     bot.pending_reply_manager = PendingReplyManager()
     bot.generating = {}
+    bot.generation_done = {}
     sent: list[Any] = []
     runs: list[tuple[int, list[int] | None]] = []
     editions: list[int] = []

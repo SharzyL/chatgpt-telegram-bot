@@ -100,6 +100,7 @@ def help_sections(system_prompt: str) -> list[str]:
         '  <code>&lt;prefix&gt;,r &lt;message&gt;</code>  — let Telegram render the markdown',
         '  <code>&lt;prefix&gt;,r= &lt;message&gt;</code>  — render to entities instead',
         '  <code>&lt;prefix&gt;,dt &lt;message&gt;</code>  — dummy tool: pass earlier thinking back (DeepSeek)',
+        '  <code>&lt;prefix&gt;,live &lt;message&gt;</code>  — live: editing a prompt answers it again',
         '  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt',
         '  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt',
         '  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt',

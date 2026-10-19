@@ -35,10 +35,13 @@ CODEC_JSON = 0
 CODEC_ZSTD = 1
 ZSTD_LEVEL = 3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # the statements taking a store from the version before each key to that version, applied in
 # order on open; a new store is made from SCHEMA, which already has every column
-MIGRATIONS: dict[int, list[str]] = {}
+MIGRATIONS: dict[int, list[str]] = {
+    # finding the answer to a prompt, for a live thread's edits
+    2: ['CREATE INDEX turn_reply ON turn (chat_id, reply_id)'],
+}
 SCHEMA = """
 CREATE TABLE turn (
     id            INTEGER PRIMARY KEY,
@@ -63,6 +66,7 @@ CREATE TABLE message (
     PRIMARY KEY (chat_id, msg_id)
 ) WITHOUT ROWID;
 CREATE INDEX message_turn ON message (turn_id, seq);
+CREATE INDEX turn_reply ON turn (chat_id, reply_id);
 """
 
 _TURN_COLUMNS = (
@@ -260,6 +264,15 @@ class Store:
             self._collect_orphans(turns)
         # hand the freed pages back to the filesystem; the pragma runs as its rows are read
         _ = self.conn.execute('PRAGMA incremental_vacuum').fetchall()
+
+    def answers_to(self, chat_id: int, msg_id: int) -> list[int]:
+        """The first live part of each stored answer to the prompt *msg_id*, oldest first."""
+        rows = self.conn.execute(
+            'SELECT m.msg_id FROM turn t JOIN message m ON m.turn_id = t.id AND m.seq = 0'
+            + ' WHERE t.chat_id = ? AND t.reply_id = ? AND t.sent_by_bot ORDER BY t.id',
+            (chat_id, msg_id),
+        )
+        return [r[0] for r in rows]
 
     def chat_nodes(self, chat_id: int) -> dict[int, MsgInfo]:
         """Every stored message of one chat, by id; the parts of a turn share one MsgInfo."""

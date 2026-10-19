@@ -18,6 +18,8 @@ class Model(NamedTuple):
     # True = offer a tool that does nothing, which is what makes DeepSeek keep passed-back
     # chains of thought, and pass the stored ones back as reasoning; False = drop them
     dummy_tool: bool = False
+    # True = an edit to a prompt of this thread answers it again, over the reply that is there
+    live: bool = False
 
 
 class EndPoint(NamedTuple):

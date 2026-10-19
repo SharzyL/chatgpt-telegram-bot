@@ -20,6 +20,7 @@ from telethon import Button, TelegramClient, errors, events, functions, types
 from telethon.tl.custom import Message
 
 from chatgpt_telegram_bot.commands import (
+    COMMANDS_WITH_BODY,
     COMMANDS_WITHOUT_BODY,
     apply_overrides,
     is_foreign_command,
@@ -215,6 +216,9 @@ class ChatGPTTelegramBot:
         # prompts being answered right now, by (chat_id, msg_id). The flag turns True when
         # /abort asks that generation to stop, which it does at its next stream event.
         self.generating: dict[tuple[int, int], bool] = {}
+        # set when the generation of the same key is over and its reply stored, for a live
+        # edit that has to stop one before answering again
+        self.generation_done: dict[tuple[int, int], asyncio.Event] = {}
         # (chat_id, anchor) of a /linearize being carried out, so a second press cannot run it twice
         self.linearizing: set[tuple[int, int]] = set()
 
@@ -380,6 +384,12 @@ class ChatGPTTelegramBot:
             else:
                 await self.reply_handler(event.message)
 
+        @self.bot.on(events.MessageEdited)  # pyright: ignore[reportArgumentType]  # telethon accepts event class at runtime
+        async def _process_edit(event: events.MessageEdited.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
+            if event.message.chat_id is None or event.message.sender_id is None:
+                return
+            await self.edit_handler(event.message)
+
         @self.bot.on(events.CallbackQuery(pattern=rb'^lin:'))
         async def _linearize_confirm(event: events.CallbackQuery.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
             await self.linearize_callback(event)
@@ -456,6 +466,8 @@ class ChatGPTTelegramBot:
             flags.append('richtext')
         if model.dummy_tool:
             flags.append('dummy_tool')
+        if model.live:
+            flags.append('live')
         return flags
 
     @staticmethod
@@ -1193,21 +1205,96 @@ class ChatGPTTelegramBot:
                 parts = replace_text_part(parts, new_prompt)
             info = prompt_info._replace(message=parts)
             if model is not None:
-                info = info._replace(
-                    prefix=model.prefix if model_spec is None else None,
-                    system_prompt=self._system_prompt_for(model),
-                    overrides=overrides or None,
-                    model_spec=model_spec,
-                )
+                info = info._replace(**self._model_fields(model, model_spec, overrides))
             self.set_msg_info(chat_id, prompt_id, info)
 
+        logger.info(f'Regenerating {chat_id=}, {prompt_id=}, reprompted={bool(new_prompt)}')
+        # an error that leaves no reply to write over answers the command: the prompt of an
+        # imported turn is stored under a negative id, which is no message to reply to
+        await self._rewrite_reply(chat_id, prompt_id, target_id, target_info, error_reply_to=msg_id)
+
+    async def _rewrite_reply(
+        self, chat_id: int, prompt_id: int, target_id: int, target_info: MsgInfo, error_reply_to: int
+    ) -> None:
+        """Answer *prompt_id* again over its reply, *target_id*, as the next edition of it."""
         # every part of the old reply is written over, and a shorter one deletes the rest
         adopt = list(target_info.part_ids or [target_id])
         edition = regeneration_edition(target_info) + 1
-        logger.info(f'Regenerating {chat_id=}, {prompt_id=}, {adopt=}, {edition=}, reprompted={bool(new_prompt)}')
-        # an error that leaves no reply to write over answers the command: the prompt of an
-        # imported turn is stored under a negative id, which is no message to reply to
-        await self._run_completion(chat_id, prompt_id, adopt=adopt, error_reply_to=msg_id, edition=edition)
+        logger.info(f'Rewriting the reply to {chat_id=}, {prompt_id=}, {adopt=}, {edition=}')
+        await self._run_completion(chat_id, prompt_id, adopt=adopt, error_reply_to=error_reply_to, edition=edition)
+
+    async def _stop_generation(self, chat_id: int, prompt_id: int) -> None:
+        """Abort an answer to *prompt_id* in progress, and wait until it is over and stored."""
+        key = (chat_id, prompt_id)
+        # another generation may claim the key while this one waits, so it is asked again
+        while key in self.generating:
+            self.generating[key] = True
+            _ = await self.generation_done[key].wait()
+
+    async def edit_handler(self, message: Any) -> None:
+        """Answer an edited prompt again, over its reply, if the thread it belongs to is live.
+
+        The prompt is rebuilt from the edited message as sending it afresh would, its media
+        read again and a prefix in it re-read, but it keeps its place in the thread. Whether
+        the thread is live is judged before the edit, so an edit cannot switch it on for itself.
+        An edit that changes nothing stored -- Telegram adding a link preview -- is left alone.
+        """
+        chat_id = message.chat_id
+        edited_id = message.id
+        if not self.is_allowed(chat_id) or message.sender_id == self.bot_id:
+            return
+        info = self.get_msg_info(chat_id, edited_id)
+        if info is None or info.sent_by_bot:
+            return
+        # an album's caption may sit on any of its messages; the turn is answered under the first
+        prompt_id = info.part_ids[0] if info.part_ids else edited_id
+        try:
+            _, thread_model, _ = self.construct_chat_history(chat_id, prompt_id)
+        except RuntimeError:
+            return
+        if not thread_model.live:
+            return
+
+        messages = await self._album_of(message)
+        text = next((m.message for m in messages if m.message), '')
+        if is_foreign_command(text, self.username):
+            return
+        command = parse_command(text, self.username)
+        chat = command is not None and command[0] == 'chat'
+        if command is not None and not chat and command[0] in COMMANDS_WITH_BODY | COMMANDS_WITHOUT_BODY:
+            return  # edited into a command, which is no prompt to answer
+        try:
+            model, spec, overrides, text = self._turn_model(command[1] if chat and command else text, chat)
+            # media a thread-opening prompt took from the message it replied to comes along
+            # again; a prompt continuing a thread took none
+            replied_media: list[Any] = []
+            if info.reply_id is None and replied_message_id(message) is not None:
+                replied = await message.get_reply_message()
+                if replied is not None and self._media_kind(replied) is not None:
+                    replied_media = await self._album_of(replied)
+            own_media = [m for m in messages if self._media_kind(m) is not None]
+            parts = await self._prompt_parts(chat_id, text, own_media, replied_media, info.reply_id is not None)
+        except ValueError as e:
+            _ = await self.send_message(chat_id, f'[!] {e}', edited_id)
+            return
+        new_info = info._replace(message=parts)
+        if model is not None:
+            new_info = new_info._replace(**self._model_fields(model, spec, overrides))
+        # the system prompt is left out of the comparison: it is rendered with the date
+        if new_info._replace(system_prompt=None) == info._replace(system_prompt=None):
+            return
+
+        logger.info(f'Live edit: {chat_id=}, {prompt_id=}, {edited_id=}')
+        # the latest edit wins: an answer still streaming for an earlier text is stopped, and
+        # nothing awaits between the store write and the new generation claiming the prompt
+        await self._stop_generation(chat_id, prompt_id)
+        self.set_msg_info(chat_id, prompt_id, new_info)
+        answers = self.store.answers_to(chat_id, prompt_id)
+        target_info = self.get_msg_info(chat_id, answers[-1]) if answers else None
+        if target_info is None:  # nothing answered it yet, as after a failed generation
+            await self._run_completion(chat_id, prompt_id)
+            return
+        await self._rewrite_reply(chat_id, prompt_id, answers[-1], target_info, error_reply_to=prompt_id)
 
     @staticmethod
     def _media_kind(message: Any) -> str | None:
@@ -1318,6 +1405,53 @@ class ChatGPTTelegramBot:
             return None, await self._album_of(replied)
         return None
 
+    def _turn_model(self, text: str, chat: bool) -> tuple[Model | None, str | None, dict[str, str | None], str]:
+        """The model a prompt names, the spec stored for it, its overrides, and the prompt left.
+
+        With *chat*, *text* is a /chat body, which always names one. Otherwise a leading prefix
+        does, or nothing does and the model is None. Raises ValueError, for the user.
+        """
+        if chat:
+            head, overrides, text = parse_chat_spec(text)
+            model, spec = self._chat_model(head, overrides)
+            return model, spec, overrides, text
+        matched = self._match_model(text)
+        if matched is None:
+            return None, None, {}, text
+        model, overrides, text = matched
+        return model, None, overrides, text
+
+    def _model_fields(self, model: Model | None, spec: str | None, overrides: dict[str, str | None]) -> dict[str, Any]:
+        """What a user turn records of the model it names, as MsgInfo fields.
+
+        All None on a turn that names none, which is what lets construct_chat_history fall back
+        to the choice already in the chain; a model named by its endpoint is stored as that spec
+        instead of a prefix.
+        """
+        return {
+            'prefix': model.prefix if model is not None and spec is None else None,
+            'system_prompt': self._system_prompt_for(model),
+            'overrides': overrides or None,
+            'model_spec': spec,
+        }
+
+    async def _prompt_parts(
+        self, chat_id: int, text: str, own_media: list[Any], replied_media: list[Any], continuing: bool
+    ) -> list[MsgPartInHistory]:
+        """A prompt's stored parts: text files inlined ahead of the text, then the images.
+
+        Raises ValueError, with a message for the user, on a file that cannot be used.
+        """
+        replied_images, replied_files = await self._read_media(chat_id, replied_media)
+        own_images, own_files = await self._read_media(chat_id, own_media)
+        images = replied_images + own_images
+        if images and not text:
+            text = self.default_image_reply_prompt if continuing else self.default_image_prompt
+        # only the replied message's media is taken, never its caption: the prompt is what
+        # the user wrote in this turn
+        prompt = '\n\n'.join(t for t in (*replied_files, *own_files, text) if t)
+        return [make_text_part(prompt), *(make_image_part(h) for h in images)]
+
     async def _user_turn(
         self, first: Any, msg_ids: list[int], text: str, own_media: list[Any], chat: bool = False
     ) -> None:
@@ -1338,56 +1472,31 @@ class ChatGPTTelegramBot:
         if context is None:
             return
         reply_to_id, replied_media = context
-        model_by_prefix: Model | None = None
-        model_spec: str | None = None
 
         # a message that opens a thread has no model unless its prefix names one, so a
         # missing prefix is an error there; on a reply the prefix is optional and switches
         # the model for this turn and the ones after it
-        overrides: dict[str, str | None] = {}
         try:
-            if chat:
-                head, overrides, text = parse_chat_spec(text)
-                model_by_prefix, model_spec = self._chat_model(head, overrides)
-            elif (matched := self._match_model(text)) is not None:
-                model_by_prefix, overrides, text = matched
+            model, model_spec, overrides, text = self._turn_model(text, chat)
         except ValueError as e:
             _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
             return
         # with no prefix, a reply carries over the model and prompt of the message replied to
-        if model_by_prefix is None and reply_to_id is None:
+        if model is None and reply_to_id is None:
             if chat_id == first.sender_id:  # in private chat, point at /models and /help
                 _ = await self.send_message(chat_id, self._no_prefix_text(), msg_id)
             return
 
         try:
-            replied_images, replied_files = await self._read_media(chat_id, replied_media)
-            own_images, own_files = await self._read_media(chat_id, own_media)
+            new_message = await self._prompt_parts(chat_id, text, own_media, replied_media, reply_to_id is not None)
         except ValueError as e:
             _ = await self.send_message(chat_id, str(e), msg_id)
             return
-        images = replied_images + own_images
-
-        if images and not text:
-            text = self.default_image_reply_prompt if reply_to_id is not None else self.default_image_prompt
-        # only the replied message's media is taken, never its caption: the prompt is what
-        # the user wrote in this turn
-        prompt = '\n\n'.join(t for t in (*replied_files, *own_files, text) if t)
-        new_message: list[MsgPartInHistory] = [make_text_part(prompt), *(make_image_part(h) for h in images)]
-
-        system_prompt = self._system_prompt_for(model_by_prefix)
-
-        # prefix and system_prompt stay None on a reply that named no model, which is what
-        # lets construct_chat_history fall back to the ones already in the chain; a model /chat
-        # named by its endpoint is stored as that spec instead of a prefix
         msg_info = MsgInfo(
             sent_by_bot=False,
             message=new_message,
             reply_id=reply_to_id,
-            prefix=model_by_prefix.prefix if model_by_prefix is not None and model_spec is None else None,
-            system_prompt=system_prompt,
-            overrides=overrides or None,
-            model_spec=model_spec,
+            **self._model_fields(model, model_spec, overrides),
         )
         # an album is one turn, so a reply to any of its messages continues it
         self.store.put_turn(chat_id, msg_ids, msg_info)
@@ -1407,11 +1516,15 @@ class ChatGPTTelegramBot:
         *error_reply_to* is where a failure before any reply exists is reported; *msg_id* by
         default. *edition* is the version of the answer a regeneration writes, 1 otherwise.
         """
-        self.generating[(chat_id, msg_id)] = False
+        key = (chat_id, msg_id)
+        self.generating[key] = False
+        done = self.generation_done[key] = asyncio.Event()
         try:
             await self._generate(chat_id, msg_id, adopt, error_reply_to or msg_id, edition)
         finally:
-            _ = self.generating.pop((chat_id, msg_id), None)
+            _ = self.generating.pop(key, None)
+            _ = self.generation_done.pop(key, None)
+            done.set()
 
     async def _fetch_image(self, chat_id: int, msg_id: int) -> bytes:
         """Download an image again from its message, for one evicted from the cache."""

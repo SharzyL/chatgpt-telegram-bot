@@ -161,7 +161,7 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
                     replacements['thinking'] = int(value)
                 except ValueError:
                     replacements['thinking'] = value
-        elif field in ('search', 'richtext', 'dummy_tool'):
+        elif field in ('search', 'richtext', 'dummy_tool', 'live'):
             # bare key (`s`) enables, explicit empty (`s=`) or a false word disables
             replacements[field] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
         else:

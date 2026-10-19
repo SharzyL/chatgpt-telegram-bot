@@ -376,3 +376,13 @@ def test_a_store_from_a_newer_version_is_refused(tmp_path: Path):
     conn.commit()
     with pytest.raises(RuntimeError, match='newer than this bot knows'):
         _ = Store(path)
+
+
+def test_answers_to_finds_the_first_part_of_each_answer_to_a_prompt():
+    store = Store(':memory:')
+    store.put_turn(CHAT, [10], _user('q', None, 'g'))
+    store.put_turn(CHAT, [11, 12], _bot('a', 10))
+    store.put_turn(CHAT, [20], _user('reply to the prompt itself', 10))
+    store.put_turn(OTHER, [13], _bot('elsewhere', 10))
+    assert store.answers_to(CHAT, 10) == [11]
+    assert store.answers_to(CHAT, 11) == []

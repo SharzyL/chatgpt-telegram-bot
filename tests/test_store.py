@@ -19,6 +19,7 @@ from chatgpt_telegram_bot.store import (
     CODEC_JSON,
     CODEC_ZSTD,
     MIGRATIONS,
+    SCHEMA,
     SCHEMA_VERSION,
     Store,
     decode_parts,
@@ -61,7 +62,7 @@ def test_a_turn_reads_back_as_written():
     )
     store.put_turn(CHAT, [7], info)
     got = store.get(CHAT, 7)
-    assert got == info._replace(part_ids=[7])
+    assert got == info._replace(part_ids=[7], root_msg_id=7)
     assert got is not None and got.sent_by_bot is False
 
 
@@ -108,7 +109,7 @@ def test_an_update_rewrites_every_part_and_keeps_the_mapping():
 def test_an_update_of_an_unknown_message_stores_a_new_turn():
     store = Store(':memory:')
     store.update(CHAT, 5, _user('hi', None, 'g'))
-    assert store.get(CHAT, 5) == _user('hi', None, 'g')._replace(part_ids=[5])
+    assert store.get(CHAT, 5) == _user('hi', None, 'g')._replace(part_ids=[5], root_msg_id=5)
 
 
 def test_a_turn_goes_only_with_its_last_message():
@@ -131,7 +132,7 @@ def test_chat_nodes_covers_one_chat_and_shares_a_turn_between_parts():
     nodes = store.chat_nodes(CHAT)
     assert sorted(nodes) == [1, 2, 3]
     assert nodes[2] is nodes[3] and nodes[2].part_ids == [2, 3]
-    assert store.get(OTHER, 1) == _user('elsewhere', None, 'g')._replace(part_ids=[1])
+    assert store.get(OTHER, 1) == _user('elsewhere', None, 'g')._replace(part_ids=[1], root_msg_id=1)
 
 
 @pytest.mark.skipif(zstd is None, reason='zstd is in the standard library from Python 3.14')
@@ -217,7 +218,7 @@ def test_migration_keeps_every_row_and_stores_each_answer_once(tmp_path: Path):
     for (chat, mid), info in rows.items():
         got = store.get(chat, mid)
         assert got is not None, (chat, mid)
-        assert got._replace(part_ids=None) == info._replace(part_ids=None), (chat, mid)
+        assert got._replace(part_ids=None, root_msg_id=None) == info._replace(part_ids=None), (chat, mid)
         assert got.part_ids == expected_parts.get((chat, mid), [mid]), (chat, mid)
     # 19 rows; the split answers, the regenerated one and its dropped part each become one turn
     assert _count(store, 'turn') == 16
@@ -290,6 +291,9 @@ CREATE TABLE turn (
     sent_by_bot   BOOLEAN NOT NULL CHECK (sent_by_bot IN (0, 1)),
     -- the message this turn replies to, by message id as MsgInfo.reply_id has it
     reply_id      INTEGER,
+    -- the first message of the thread: the replied turn's root, or the turn's own first
+    -- message when it replies to nothing stored
+    root_msg_id   INTEGER NOT NULL,
     prefix        TEXT,
     model_spec    TEXT,
     system_prompt TEXT,
@@ -309,13 +313,15 @@ CREATE TABLE message (
 CREATE INDEX message_turn ON message (turn_id, seq);
 -- finding the answer to a prompt, for a live thread's edits
 CREATE INDEX turn_reply ON turn (chat_id, reply_id);
+-- a thread's whole tree, for /linearize
+CREATE INDEX turn_root ON turn (chat_id, root_msg_id);
 """
 
 
 def _shape(conn: sqlite3.Connection) -> dict[str, Any]:
     """Every table's columns and every index, which is what an upgrade has to reproduce."""
     tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
-    columns = {t: [tuple(c[1:]) for c in conn.execute(f'PRAGMA table_info({t})')] for t in tables}
+    columns = {t: sorted(tuple(c[1:]) for c in conn.execute(f'PRAGMA table_info({t})')) for t in tables}
     indexes = sorted(
         r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL")
     )
@@ -347,6 +353,11 @@ def test_an_upgrade_step_runs_once_and_keeps_the_rows(tmp_path: Path, monkeypatc
     monkeypatch.setattr('chatgpt_telegram_bot.store.SCHEMA_VERSION', SCHEMA_VERSION + 1)
     monkeypatch.setattr(
         'chatgpt_telegram_bot.store.MIGRATIONS', {SCHEMA_VERSION + 1: ['ALTER TABLE turn ADD COLUMN probe TEXT']}
+    )
+    # the schema a new store gets at that version, which the upgraded file is checked against
+    monkeypatch.setattr(
+        'chatgpt_telegram_bot.store.SCHEMA',
+        SCHEMA.replace('CREATE TABLE turn (', 'CREATE TABLE turn (\n    probe TEXT,'),
     )
     store = Store(path)
     assert store.conn.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION + 1
@@ -388,3 +399,73 @@ def test_answers_to_finds_the_first_part_of_each_answer_to_a_prompt():
     store.put_turn(OTHER, [13], _bot('elsewhere', 10))
     assert store.answers_to(CHAT, 10) == [11]
     assert store.answers_to(CHAT, 11) == []
+
+
+# --- roots --------------------------------------------------------------------------------------
+
+
+def _root(store: Store, msg_id: int, chat_id: int = CHAT) -> int | None:
+    info = store.get(chat_id, msg_id)
+    assert info is not None
+    return info.root_msg_id
+
+
+def test_every_turn_records_the_first_message_of_its_thread():
+    store = Store(':memory:')
+    store.put_turn(CHAT, [1], _user('q', None, 'g'))
+    store.put_turn(CHAT, [2, 3], _bot('split', 1))
+    store.put_turn(CHAT, [4], _user('on part 3', 3))
+    store.put_turn(CHAT, [5], _bot('a', 4))
+    store.put_turn(CHAT, [6], _user('a fork off part 2', 2))
+    assert [_root(store, mid) for mid in range(1, 7)] == [1, 1, 1, 1, 1, 1]
+    assert sorted(store.tree_nodes(CHAT, 1)) == [1, 2, 3, 4, 5, 6]
+
+
+def test_a_turn_replying_to_nothing_stored_is_a_root_of_its_own():
+    store = Store(':memory:')
+    store.put_turn(CHAT, [-50], _user('imported', None))
+    store.put_turn(CHAT, [50], _bot('imported answer', -50))
+    store.put_turn(CHAT, [60], _user('replies to a message never stored', 59))
+    assert (_root(store, -50), _root(store, 50), _root(store, 60)) == (-50, -50, 60)
+
+
+def test_a_rewrite_keeps_the_root_and_may_not_move_the_turn():
+    store = Store(':memory:')
+    store.put_turn(CHAT, [1], _user('q', None, 'g'))
+    store.put_turn(CHAT, [2], _bot('a', 1))
+    store.put_turn(CHAT, [2], _bot('regenerated', 1)._replace(root_msg_id=999))
+    store.update(CHAT, 2, _bot('manipulated', 1))
+    assert _root(store, 2) == 1
+    with pytest.raises(ValueError, match='keeps the message it replies to'):
+        store.update(CHAT, 2, _bot('moved', 7))
+
+
+def test_a_file_laid_out_otherwise_than_its_version_is_refused(tmp_path: Path):
+    # what a store made by an earlier draft of the same schema version looks like
+    path = str(tmp_path / 'db.sqlite3')
+    _ = Store(path)
+    conn = sqlite3.connect(path)
+    _ = conn.execute('ALTER TABLE turn ADD COLUMN stray TEXT')
+    conn.commit()
+    with pytest.raises(RuntimeError, match='its tables differ'):
+        _ = Store(path)
+
+
+def test_migration_records_roots_as_the_store_would(tmp_path: Path):
+    shelf_path, store_path = str(tmp_path / 'db'), str(tmp_path / 'db.sqlite3')
+    _write_shelf(
+        shelf_path,
+        {
+            (CHAT, 1): _user('q', None, 'g'),
+            (CHAT, 2): _bot('a', 1, [2]),
+            (CHAT, 3): _user('on', 2),
+            # a parent that was never stored, and a loop in damaged data
+            (CHAT, 10): _user('orphan', 9),
+            (CHAT, 11): _bot('orphan answer', 10, [11]),
+            (CHAT, 30): _user('loop', 31),
+            (CHAT, 31): _bot('loop answer', 30, [31]),
+        },
+    )
+    migrate_shelf(shelf_path, store_path)
+    store = Store(store_path)
+    assert [_root(store, mid) for mid in (1, 2, 3, 10, 11, 30, 31)] == [1, 1, 1, 10, 10, 30, 30]

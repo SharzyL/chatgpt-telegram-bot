@@ -103,6 +103,10 @@ class MsgInfo(NamedTuple):
     Read each field through one helper that supplies its default and type."""
     extra_metadata: dict[str, Any] | None = None
 
+    """the first message of this turn's thread, which every branch of it shares; the store
+    records it when the turn is first written, from the turn replied to, and ignores this value"""
+    root_msg_id: int | None = None
+
 
 # the version of its answer a regenerated reply is, in MsgInfo.extra_metadata
 REGENERATION_EDITION = 'regeneration_edition'

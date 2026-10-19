@@ -46,37 +46,44 @@ def _tree() -> dict[int, MsgInfo]:
 # --- the plan -----------------------------------------------------------------------------------
 
 
+def _main() -> dict[int, MsgInfo]:
+    """The first tree alone: what the store hands the planner for any anchor in it."""
+    return {mid: info for mid, info in _tree().items() if mid < 20}
+
+
 def test_the_line_to_the_anchor_is_kept_and_every_branch_goes():
-    keep, delete = linearize_plan(_tree(), 5) or (set(), set())
+    keep, delete = linearize_plan(_main(), 5) or (set(), set())
     assert keep == {1, 2, 3, 4, 5}
     assert delete == {6, 7, 8, 9, 10, 11}
 
 
 def test_every_part_of_a_kept_answer_is_kept():
     # the path runs through part 3 only, but part 2 is the same answer
-    keep, _ = linearize_plan(_tree(), 5) or (set(), set())
+    keep, _ = linearize_plan(_main(), 5) or (set(), set())
     assert {2, 3} <= keep
 
 
 def test_a_prompt_anchor_keeps_its_own_answer():
-    keep, _ = linearize_plan(_tree(), 4) or (set(), set())
+    keep, _ = linearize_plan(_main(), 4) or (set(), set())
     assert 5 in keep
 
 
 def test_anchoring_on_a_fork_drops_the_main_line():
-    keep, delete = linearize_plan(_tree(), 9) or (set(), set())
+    keep, delete = linearize_plan(_main(), 9) or (set(), set())
     assert keep == {1, 2, 3, 8, 9}
     assert delete == {4, 5, 6, 7, 10, 11}
 
 
 def test_the_last_message_of_a_line_deletes_only_side_branches():
-    _, delete = linearize_plan(_tree(), 7) or (set(), set())
+    _, delete = linearize_plan(_main(), 7) or (set(), set())
     assert delete == {8, 9, 10, 11}
 
 
 def test_another_tree_in_the_chat_is_never_touched():
-    keep, delete = linearize_plan(_tree(), 5) or (set(), set())
-    assert not {20, 21} & (keep | delete)
+    # the store hands the planner the anchor's tree only, by the root every turn records
+    bot = _bot()
+    assert sorted(bot.store.tree_nodes(CHAT, 1)) == list(range(1, 12))
+    assert sorted(bot.store.tree_nodes(CHAT, 20)) == [20, 21]
 
 
 def test_an_imported_turn_goes_with_its_prompt_half():
@@ -93,7 +100,7 @@ def test_an_imported_turn_goes_with_its_prompt_half():
 
 
 def test_an_unknown_anchor_has_no_plan():
-    assert linearize_plan(_tree(), 404) is None
+    assert linearize_plan(_main(), 404) is None
 
 
 def test_a_loop_has_no_plan():
@@ -144,12 +151,13 @@ def _bot(missing_after_delete: set[int] | None = None, delete_raises: bool = Fal
     bot.linearizing = set()
     bot.NAVIGATE_PREVIEW_WIDTH = 36
     bot.LINEARIZE_LIST_LIMIT = 30
-    tree = _tree()
-    for mid, info in tree.items():
-        if mid != 3:
+    # stored parents first, as the bot stores them; the split first answer is one turn shown by
+    # both of its messages
+    for mid, info in sorted(_tree().items()):
+        if mid == 2:
+            bot.store.put_turn(CHAT, [2, 3], info)
+        elif mid != 3:
             bot.set_msg_info(CHAT, mid, info)
-    # the split first answer is one turn shown by both of its messages, as the bot stores it
-    bot.store.put_turn(CHAT, [2, 3], tree[2])
     sent: list[Any] = []
     deleted: list[list[int]] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
@@ -252,7 +260,7 @@ def _confirm(
     bot: Any, anchor: int = 5, action: str = 'go', sender: int = ASKER, digest: str | None = None
 ) -> FakePress:
     if digest is None:
-        plan = linearize_plan(bot._chat_nodes(CHAT), anchor)
+        plan = bot._linearize_plan(CHAT, anchor)
         assert plan is not None
         digest = plan_digest(plan[1])
     press = FakePress(f'lin:{anchor}:{digest}:{ASKER}:{action}'.encode(), sender_id=sender)

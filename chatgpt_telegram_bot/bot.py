@@ -1014,13 +1014,12 @@ class ChatGPTTelegramBot:
         _ = await self.send_document(chat_id, document, export_filename(title), caption, msg_id)
         logger.info(f'Exported {chat_id=}, {anchor_id=}, messages={len(messages)}, bytes={len(document)}')
 
-    def _chat_nodes(self, chat_id: int) -> dict[int, MsgInfo]:
-        """Every stored node of one chat, by message id; MsgInfo links only backwards."""
-        return self.store.chat_nodes(chat_id)
-
     def _linearize_plan(self, chat_id: int, anchor_id: int) -> tuple[dict[int, MsgInfo], set[int]] | None:
-        """The chat's nodes and the ids a /linearize at *anchor_id* would delete; None if not stored."""
-        nodes = self._chat_nodes(chat_id)
+        """The anchor's tree and the ids a /linearize at *anchor_id* would delete; None if not stored."""
+        anchor = self.get_msg_info(chat_id, anchor_id)
+        if anchor is None or anchor.root_msg_id is None:
+            return None
+        nodes = self.store.tree_nodes(chat_id, anchor.root_msg_id)
         plan = linearize_plan(nodes, anchor_id)
         if plan is None:
             return None

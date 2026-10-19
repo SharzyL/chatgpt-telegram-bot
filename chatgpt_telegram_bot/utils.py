@@ -77,53 +77,28 @@ def message_link(chat_id: int, msg_id: int) -> str | None:
     return f'https://t.me/c/{peer[4:]}/{msg_id}'
 
 
-def linearize_plan(nodes: dict[int, MsgInfo], anchor_id: int) -> tuple[set[int], set[int]] | None:
-    """Split the tree holding *anchor_id* into the node ids to keep and the ones to delete.
+def linearize_plan(tree: dict[int, MsgInfo], anchor_id: int) -> tuple[set[int], set[int]] | None:
+    """Split one tree of branches into the node ids to keep and the ones to delete.
 
-    *nodes* is every stored node of one chat, by id. What is kept is the path from the first
-    message down to the anchor, as whole turns: a prompt on the path keeps every part of its
-    answer -- a split reply is stored under several ids that all name the prompt -- and so does
-    the anchor when it is a prompt. Everything else rooted at the same first message is
-    deleted, including whatever came after the anchor. Other trees in the chat are untouched.
-    None when the anchor is not stored, or its chain loops.
+    *tree* is every stored node sharing the anchor's root (`MsgInfo.root_msg_id`), by id. What
+    is kept is the path from the first message down to the anchor, as whole turns: a prompt on
+    the path keeps every part of its answer -- a split reply is shown by several ids that all
+    name the prompt -- and so does the anchor when it is a prompt. Everything else in the tree is
+    deleted, including whatever came after the anchor. None when the anchor is not in the tree,
+    or its chain loops.
     """
-    if anchor_id not in nodes:
-        return None
-    roots: dict[int, int | None] = {}
-
-    def root_of(start: int) -> int | None:
-        trail: list[int] = []
-        cur = start
-        while True:
-            if cur in roots:
-                result = roots[cur]
-                break
-            if cur in trail:  # a loop in damaged data has no root
-                result = None
-                break
-            trail.append(cur)
-            parent = nodes[cur].reply_id
-            if parent is None or parent not in nodes:
-                # the topmost stored node; a missing parent makes it the root of what is left
-                result = cur
-                break
-            cur = parent
-        for visited in trail:
-            roots[visited] = result
-        return result
-
-    root = root_of(anchor_id)
-    if root is None:
+    if anchor_id not in tree:
         return None
     keep: set[int] = set()
     cur: int | None = anchor_id
-    while cur is not None and cur in nodes and cur not in keep:
+    while cur is not None and cur in tree:
+        if cur in keep:  # a loop in damaged data
+            return None
         keep.add(cur)
-        cur = nodes[cur].reply_id
-    tree = {n for n in nodes if root_of(n) == root}
-    prompts = {n for n in keep if not nodes[n].sent_by_bot}
-    keep |= {n for n in tree if nodes[n].sent_by_bot and nodes[n].reply_id in prompts}
-    return keep, tree - keep
+        cur = tree[cur].reply_id
+    prompts = {n for n in keep if not tree[n].sent_by_bot}
+    keep |= {n for n, info in tree.items() if info.sent_by_bot and info.reply_id in prompts}
+    return keep, set(tree) - keep
 
 
 def plan_digest(ids: set[int]) -> str:

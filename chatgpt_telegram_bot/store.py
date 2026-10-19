@@ -2,12 +2,13 @@
 
 Two tables. A `turn` is one prompt or one answer, with its content. A `message` maps a
 Telegram message id to the turn it shows, so an answer split over 42 messages is one turn
-and 42 small rows rather than 42 copies of the answer. `seq` orders a turn's live parts; a
+and 42 small rows rather than 42 copies of the answer. Every turn records the first message
+of its thread, `root_msg_id`, so a whole tree of branches is one indexed query. `seq` orders a turn's live parts; a
 part that no longer shows the turn (a shorter regeneration deleted it) keeps its row with
 `seq` NULL, since a later turn may have replied to it and its history runs through it.
 
-The handlers still see `MsgInfo`, with `part_ids` derived from the live parts rather than
-stored. Content is JSON, compressed with zstd when the interpreter has it (Python 3.14+);
+The handlers still see `MsgInfo`, with `part_ids` derived from the live parts and
+`root_msg_id` from the turn replied to, neither of them set by a caller. Content is JSON, compressed with zstd when the interpreter has it (Python 3.14+);
 `codec` says which, so compressed and plain rows can sit side by side.
 
 Schema changes go in two ways. A field the model's input does not depend on goes in
@@ -46,6 +47,9 @@ CREATE TABLE turn (
     sent_by_bot   BOOLEAN NOT NULL CHECK (sent_by_bot IN (0, 1)),
     -- the message this turn replies to, by message id as MsgInfo.reply_id has it
     reply_id      INTEGER,
+    -- the first message of the thread: the replied turn's root, or the turn's own first
+    -- message when it replies to nothing stored
+    root_msg_id   INTEGER NOT NULL,
     prefix        TEXT,
     model_spec    TEXT,
     system_prompt TEXT,
@@ -65,12 +69,29 @@ CREATE TABLE message (
 CREATE INDEX message_turn ON message (turn_id, seq);
 -- finding the answer to a prompt, for a live thread's edits
 CREATE INDEX turn_reply ON turn (chat_id, reply_id);
+-- a thread's whole tree, for /linearize
+CREATE INDEX turn_root ON turn (chat_id, root_msg_id);
 """
 
 _TURN_COLUMNS = (
     't.id, t.sent_by_bot, t.reply_id, t.prefix, t.system_prompt, t.overrides, t.model_spec, t.codec, t.parts,'
-    + ' t.extra_metadata'
+    + ' t.extra_metadata, t.root_msg_id'
 )
+
+
+def _columns(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Every table's column names, sorted: an upgrade appends a column wherever SCHEMA has it,
+    and no query depends on the order."""
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+    return {t: sorted(c[1] for c in conn.execute(f'PRAGMA table_info({t})')) for t in tables}
+
+
+def _schema_columns() -> dict[str, list[str]]:
+    conn = sqlite3.connect(':memory:')
+    _ = conn.executescript(SCHEMA)
+    columns = _columns(conn)
+    conn.close()
+    return columns
 
 
 def encode_parts(parts: list[MsgPartInHistory], compress: bool) -> tuple[int, bytes]:
@@ -119,6 +140,12 @@ class Store:
             raise RuntimeError(
                 f'{path} has schema version {version}, newer than this bot knows ({SCHEMA_VERSION}); upgrade the bot'
             )
+        # a file claiming this version but laid out otherwise -- made by an earlier draft of it,
+        # or by an upgrade step that missed something -- would fail on its first write
+        if (found := _columns(self.conn)) != (expected := _schema_columns()):
+            raise RuntimeError(
+                f'{path} says schema version {SCHEMA_VERSION} but its tables differ: {found} != {expected}'
+            )
         if path != ':memory:':
             _ = self.conn.execute('PRAGMA journal_mode = WAL')
         self.conn.commit()
@@ -155,7 +182,7 @@ class Store:
 
     @staticmethod
     def _info(row: Any, part_ids: list[int]) -> MsgInfo:
-        _, sent_by_bot, reply_id, prefix, system_prompt, overrides, model_spec, codec, parts, extra = row
+        _, sent_by_bot, reply_id, prefix, system_prompt, overrides, model_spec, codec, parts, extra, root = row
         return MsgInfo(
             sent_by_bot=bool(sent_by_bot),
             message=decode_parts(codec, parts),
@@ -166,6 +193,7 @@ class Store:
             part_ids=part_ids,
             model_spec=model_spec,
             extra_metadata=json.loads(extra) if extra is not None else None,
+            root_msg_id=root,
         )
 
     def _turn_values(self, info: MsgInfo, extra: dict[str, Any] | None) -> tuple[Any, ...]:
@@ -183,11 +211,30 @@ class Store:
             json.dumps(extra, ensure_ascii=False) if extra else None,
         )
 
-    def _write_turn(self, turn_id: int | None, chat_id: int, info: MsgInfo) -> int:
+    def _root_for(self, chat_id: int, reply_id: int | None, first_msg_id: int) -> int:
+        """The root of a new turn: that of the turn it replies to, or its own first message."""
+        if reply_id is not None:
+            found = self.conn.execute(
+                'SELECT t.root_msg_id FROM message m JOIN turn t ON t.id = m.turn_id'
+                + ' WHERE m.chat_id = ? AND m.msg_id = ?',
+                (chat_id, reply_id),
+            ).fetchone()
+            if found is not None:
+                return found[0]
+        # replying to nothing, or to nothing stored: the topmost stored message is the root
+        return first_msg_id
+
+    def _write_turn(self, turn_id: int | None, chat_id: int, info: MsgInfo, root: int | None = None) -> int:
+        """Rewrite turn *turn_id*, keeping its root, or insert a new turn under *root*."""
         if turn_id is not None:
+            stored_reply, stored = self.conn.execute(
+                'SELECT reply_id, extra_metadata FROM turn WHERE id = ?', (turn_id,)
+            ).fetchone()
+            # every turn below this one has its root, so moving it would split its tree
+            if info.reply_id != stored_reply:
+                raise ValueError(f'a turn keeps the message it replies to ({stored_reply}, not {info.reply_id})')
             # merged rather than replaced, so a key this version does not know -- one a newer
             # version wrote before a rollback -- survives it rewriting the turn
-            stored = self.conn.execute('SELECT extra_metadata FROM turn WHERE id = ?', (turn_id,)).fetchone()[0]
             extra = merge_extra(json.loads(stored) if stored is not None else None, info.extra_metadata)
             _ = self.conn.execute(
                 'UPDATE turn SET sent_by_bot = ?, reply_id = ?, prefix = ?, model_spec = ?, system_prompt = ?,'
@@ -195,10 +242,11 @@ class Store:
                 (*self._turn_values(info, extra), turn_id),
             )
             return turn_id
+        assert root is not None, 'a new turn needs its root'
         cursor = self.conn.execute(
             'INSERT INTO turn (chat_id, sent_by_bot, reply_id, prefix, model_spec, system_prompt, overrides, codec, parts,'
-            + ' extra_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            (chat_id, *self._turn_values(info, merge_extra(None, info.extra_metadata))),
+            + ' extra_metadata, root_msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (chat_id, *self._turn_values(info, merge_extra(None, info.extra_metadata)), root),
         )
         assert cursor.lastrowid is not None
         return cursor.lastrowid
@@ -220,7 +268,9 @@ class Store:
         return self._info(row, self._live_parts(row[0]))
 
     def put_turn(self, chat_id: int, msg_ids: list[int], info: MsgInfo) -> None:
-        """Store *info* as the turn shown by *msg_ids*, in order; `info.part_ids` is ignored.
+        """Store *info* as the turn shown by *msg_ids*, in order.
+
+        `info.part_ids` and `info.root_msg_id` are ignored: both are derived.
 
         A turn already shown by ``msg_ids[0]`` is rewritten in place: a regeneration keeps its
         first part, so the turn keeps its identity, and any part it held that is not listed
@@ -230,7 +280,8 @@ class Store:
         with self.conn:
             turn_id = self._turn_of(chat_id, msg_ids[0])
             previous = {t for mid in msg_ids if (t := self._turn_of(chat_id, mid)) is not None and t != turn_id}
-            turn_id = self._write_turn(turn_id, chat_id, info)
+            root = self._root_for(chat_id, info.reply_id, msg_ids[0]) if turn_id is None else None
+            turn_id = self._write_turn(turn_id, chat_id, info, root)
             _ = self.conn.execute('UPDATE message SET seq = NULL WHERE turn_id = ?', (turn_id,))
             _ = self.conn.executemany(
                 'INSERT INTO message (chat_id, msg_id, turn_id, seq) VALUES (?, ?, ?, ?)'
@@ -274,10 +325,16 @@ class Store:
 
     def chat_nodes(self, chat_id: int) -> dict[int, MsgInfo]:
         """Every stored message of one chat, by id; the parts of a turn share one MsgInfo."""
+        return self._nodes('t.chat_id = ?', (chat_id,))
+
+    def tree_nodes(self, chat_id: int, root_msg_id: int) -> dict[int, MsgInfo]:
+        """Every stored message of the tree rooted at *root_msg_id*: a thread and all its branches."""
+        return self._nodes('t.chat_id = ? AND t.root_msg_id = ?', (chat_id, root_msg_id))
+
+    def _nodes(self, where: str, params: tuple[int, ...]) -> dict[int, MsgInfo]:
         rows = self.conn.execute(
-            f'SELECT m.msg_id, m.seq, {_TURN_COLUMNS} FROM message m JOIN turn t ON t.id = m.turn_id'
-            + ' WHERE m.chat_id = ?',
-            (chat_id,),
+            f'SELECT m.msg_id, m.seq, {_TURN_COLUMNS} FROM turn t JOIN message m ON m.turn_id = t.id WHERE {where}',
+            params,
         ).fetchall()
         live: dict[int, list[tuple[int, int]]] = {}
         for msg_id, seq, turn_id, *_ in rows:
@@ -334,6 +391,29 @@ def plan_migration(rows: Iterable[tuple[int, int, MsgInfo]]) -> list[tuple[int, 
     return plan
 
 
+def shelf_roots(rows: Iterable[tuple[int, int, MsgInfo]]) -> dict[tuple[int, int], int]:
+    """The root of every shelf row, as the store would have recorded it: up `reply_id` to the
+    topmost stored message. A loop in damaged data has no top, and takes its smallest id."""
+    parent = {(chat_id, msg_id): info.reply_id for chat_id, msg_id, info in rows}
+    roots: dict[tuple[int, int], int] = {}
+    for start in parent:
+        trail: list[tuple[int, int]] = []
+        cur = start
+        while cur not in roots:
+            if cur in trail:
+                roots[cur] = min(mid for _, mid in trail[trail.index(cur) :])
+                break
+            trail.append(cur)
+            up = parent[cur]
+            if up is None or (cur[0], up) not in parent:
+                roots[cur] = cur[1]
+                break
+            cur = (cur[0], up)
+        for visited in trail:
+            roots[visited] = roots[cur]
+    return roots
+
+
 def _same_turn(old: MsgInfo, new: MsgInfo, members: set[int]) -> bool:
     """Whether a migrated row reads back as stored.
 
@@ -342,7 +422,7 @@ def _same_turn(old: MsgInfo, new: MsgInfo, members: set[int]) -> bool:
     """
     if old.part_ids and new.part_ids != [mid for mid in old.part_ids if mid in members]:
         return False
-    return old._replace(part_ids=None, overrides=old.overrides or None) == new._replace(part_ids=None)
+    return old._replace(part_ids=None, overrides=old.overrides or None) == new._replace(part_ids=None, root_msg_id=None)
 
 
 def migrate_shelf(shelf_path: str, store_path: str, compress: bool = True) -> None:
@@ -365,20 +445,31 @@ def migrate_shelf(shelf_path: str, store_path: str, compress: bool = True) -> No
                 continue
             rows.append((int(parts[2]), int(parts[3]), shelf[key]))
     plan = plan_migration(rows)
+    roots = shelf_roots(rows)
     store = Store(building, compress)
     try:
         with store.conn:
             for chat_id, live, dropped, info in plan:
-                turn_id = store._write_turn(None, chat_id, info)  # pyright: ignore[reportPrivateUsage]  # one transaction for all rows
+                root = roots[(chat_id, (live or dropped)[0])]
+                turn_id = store._write_turn(None, chat_id, info, root)  # pyright: ignore[reportPrivateUsage]  # one transaction for all rows
                 _ = store.conn.executemany(
                     'INSERT INTO message (chat_id, msg_id, turn_id, seq) VALUES (?, ?, ?, ?)',
                     [(chat_id, mid, turn_id, seq) for seq, mid in enumerate(live)]
                     + [(chat_id, mid, turn_id, None) for mid in dropped],
                 )
-        members = {(chat_id, mid): {*live, *dropped} for chat_id, live, dropped, _ in plan for mid in (*live, *dropped)}
+        members: dict[tuple[int, int], set[int]] = {}
+        turn_roots: dict[tuple[int, int], int] = {}
+        for chat_id, live, dropped, _ in plan:
+            for mid in (*live, *dropped):
+                members[(chat_id, mid)] = {*live, *dropped}
+                turn_roots[(chat_id, mid)] = roots[(chat_id, (live or dropped)[0])]
         for chat_id, msg_id, info in rows:
             new = store.get(chat_id, msg_id)
-            if new is None or not _same_turn(info, new, members[(chat_id, msg_id)]):
+            if (
+                new is None
+                or not _same_turn(info, new, members[(chat_id, msg_id)])
+                or new.root_msg_id != turn_roots[(chat_id, msg_id)]
+            ):
                 raise RuntimeError(f'migration check failed for message {msg_id} in chat {chat_id}')
         _ = store.conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
     finally:

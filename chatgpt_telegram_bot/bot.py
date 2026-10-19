@@ -229,6 +229,8 @@ class ChatGPTTelegramBot:
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
         self.TEXT_FILE_SIZE_LIMIT: int = 900_000
+        # an image sent as a file is not recompressed by Telegram; the models' own caps are lower
+        self.IMAGE_FILE_SIZE_LIMIT: int = 20_000_000
         # /navigate: turns per page, and the width of a preview line in columns -- about what a
         # phone shows on one line, with a wide (CJK) character counting two
         self.NAVIGATE_PER_PAGE: int = 8
@@ -504,6 +506,7 @@ class ChatGPTTelegramBot:
             '  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt',
             '  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt',
             'Reply to a bot message to continue; reply to an older one to fork.',
+            'Reply to a photo or file with a prefix to talk about it.',
             'A prefix on a reply switches the model from there on.',
         ]
 
@@ -1225,48 +1228,112 @@ class ChatGPTTelegramBot:
         logger.info(f'Regenerating {chat_id=}, {prompt_id=}, {adopt=}, reprompted={bool(new_prompt)}')
         await self._run_completion(chat_id, prompt_id, adopt=adopt)
 
+    @staticmethod
+    def _media_kind(message: Any) -> str | None:
+        """``'image'`` for a photo or an image sent as a file, ``'file'`` for any other file."""
+        if message.photo is not None:
+            return 'image'
+        document = message.document
+        if document is None:
+            return None
+        if (getattr(document, 'mime_type', None) or '').startswith('image/'):
+            return 'image'
+        return 'file'
+
+    async def _album_of(self, message: Any) -> list[Any]:
+        """The album *message* belongs to, in order, or the message alone."""
+        if message.grouped_id is None:
+            return [message]
+        # Telegram has no call for an album, but one holds at most ten consecutive messages
+        try:
+            around: Any = await self.bot.get_messages(message.chat_id, ids=list(range(message.id - 9, message.id + 10)))
+        except Exception:  # noqa: BLE001  # without its siblings the replied message is still usable
+            logger.warning(f'Failed to fetch the album of {message.chat_id=}, {message.id=}')
+            return [message]
+        album = [m for m in around if m is not None and m.grouped_id == message.grouped_id]
+        return album or [message]
+
+    async def _read_media(self, chat_id: int, messages: list[Any]) -> tuple[list[str], list[str]]:
+        """The images (cache keys) and text files (decoded) *messages* carry.
+
+        Raises ValueError, with a message for the user, on a file that cannot be used.
+        """
+        images: list[str] = []
+        files: list[str] = []
+        for m in messages:
+            kind = self._media_kind(m)
+            if kind == 'image':
+                if m.document is not None and m.document.size > self.IMAGE_FILE_SIZE_LIMIT:
+                    raise ValueError('Image too large')
+                blob = await m.download_media(bytes)
+                images.append(save_photo(self.image_cache, blob, chat_id, m.id))
+            elif kind == 'file':
+                if m.document.size > self.TEXT_FILE_SIZE_LIMIT:
+                    raise ValueError('File too large')
+                text = decode_text_file(await m.download_media(bytes))
+                if text is None:
+                    raise ValueError('File is not text file or not valid UTF-8')
+                files.append(text)
+        return images, files
+
     @only_allowed
     async def reply_handler(self, message: Any) -> None:
-        chat_id = message.chat_id
-        sender_id = message.sender_id
-        msg_id = message.id
-        text = message.message
         logger.info(
-            f'New message to reply: {chat_id=}, {sender_id=}, {msg_id=}, {text=}, {message.photo=}, {message.document=}'
+            f'New message to reply: {message.chat_id=}, {message.sender_id=}, {message.id=}, {message.message=},'
+            + f' {message.photo=}, {message.document=}'
         )
+        if not message.message and message.photo is None and message.document is None:
+            logger.debug(f'Unknown media types {message.chat_id=}, {message.id=}')
+            return
+        own_media = [message] if self._media_kind(message) is not None else []
+        await self._user_turn(message, [message.id], message.message or '', own_media)
+
+    async def _user_turn(self, first: Any, msg_ids: list[int], text: str, own_media: list[Any]) -> None:
+        """Record a user's turn and answer it: one message, or the messages of an album.
+
+        *first* is the message whose reply header counts, *own_media* the messages whose photos
+        and files belong to the turn. Replying to a message that carries media, rather than to
+        a bot reply, brings that media in as well -- a forwarded image, a file sent on its own
+        beforehand, or a file the bot sent outside any thread -- but not its caption, and
+        opens a thread. A bot message that is a stored turn is continued, media or not.
+        """
+        chat_id = first.chat_id
+        sender_id = first.sender_id
+        msg_id = msg_ids[0]
         reply_to_id: int | None = None
         model_by_prefix: Model | None = None
+        replied_media: list[Any] = []
 
-        extra_photo_message = None
-        extra_document_message = None
-        if not text and message.photo is None and message.document is None:
-            logger.debug(f'Unknown media types {chat_id=}, {msg_id=}')
-            return
         # a message sitting in a forum topic carries a reply header too, so what counts as a
         # reply is decided by replied_message_id rather than by the header being present
-        replied_id = replied_message_id(message)
+        replied_id = replied_message_id(first)
         if replied_id is not None:
-            if message.reply_to.quote_text is not None:
+            if first.reply_to.quote_text is not None:
                 logger.debug(f'Reply contains quote text {chat_id=}, {msg_id=}')
                 return
-            reply_to_message = await message.get_reply_message()
+            reply_to_message = await first.get_reply_message()
             if reply_to_message is None:
                 logger.debug(f'Replied message is unavailable {chat_id=}, {msg_id=}')
                 return
-            if reply_to_message.sender_id == self.bot_id:  # user reply to a bot message
+            # a bot message continues its thread when it is a stored turn, whatever it carries;
+            # one with media and no turn behind it is a file the bot sent for keeping, such as
+            # an /export, and is talked about like anyone else's. A turn still streaming has
+            # no MsgInfo until it finishes, hence the wait before looking.
+            continues_thread = False
+            if reply_to_message.sender_id == self.bot_id:
+                await self.pending_reply_manager.wait_for((chat_id, replied_id))
+                stored = self.get_msg_info(chat_id, replied_id)
+                continues_thread = stored is not None or self._media_kind(reply_to_message) is None
+            if continues_thread:  # user reply to a bot message
                 reply_to_id = replied_id
-                await self.pending_reply_manager.wait_for((chat_id, reply_to_id))
-            elif reply_to_message.photo is not None:  # user reply to a photo
-                extra_photo_message = reply_to_message
-            elif reply_to_message.document is not None:  # user reply to a document
-                extra_document_message = reply_to_message
+            elif self._media_kind(reply_to_message) is not None:
+                replied_media = await self._album_of(reply_to_message)
             else:
                 return
 
         # a message that opens a thread has no model unless its prefix names one, so a
         # missing prefix is an error there; on a reply the prefix is optional and switches
         # the model for this turn and the ones after it
-        opens_thread = replied_id is None or extra_photo_message is not None or extra_document_message is not None
         overrides: dict[str, str | None] = {}
         for m in self.models:
             match = match_prefix(text, m.prefix)
@@ -1279,62 +1346,41 @@ class ChatGPTTelegramBot:
                     return
                 break
         else:  # no matching prefix
-            if opens_thread:
+            if reply_to_id is None:
                 if chat_id == sender_id:  # in private chat, show help with error
-                    await self.help_handler(message, error='Unknown prefix. Use one of the prefixes below.')
+                    await self.help_handler(first, error='Unknown prefix. Use one of the prefixes below.')
                 return
             # continuing a thread: model and prompt carry over from the message replied to
 
-        photo_message = message if message.photo is not None else extra_photo_message
-        photo_hash = None
-        if photo_message is not None:
-            photo_blob = await photo_message.download_media(bytes)
-            photo_hash = save_photo(self.image_cache, photo_blob, chat_id, photo_message.id)
+        try:
+            replied_images, replied_files = await self._read_media(chat_id, replied_media)
+            own_images, own_files = await self._read_media(chat_id, own_media)
+        except ValueError as e:
+            _ = await self.send_message(chat_id, str(e), msg_id)
+            return
+        images = replied_images + own_images
 
-        document_message = message if message.document is not None else extra_document_message
-        document_text = None
-        if document_message is not None:
-            if document_message.document.size > self.TEXT_FILE_SIZE_LIMIT:
-                _ = await self.send_message(chat_id, 'File too large', msg_id)
-                return
-            document_blob = await document_message.download_media(bytes)
-            document_text = decode_text_file(document_blob)
-            if document_text is None:
-                _ = await self.send_message(chat_id, 'File is not text file or not valid UTF-8', msg_id)
-                return
-
-        if photo_hash and not text:
+        if images and not text:
             text = self.default_image_reply_prompt if reply_to_id is not None else self.default_image_prompt
-
-        if photo_hash:
-            new_message: list[MsgPartInHistory] = [
-                make_text_part(text),
-                make_image_part(photo_hash),
-            ]
-        elif document_text:
-            if text:
-                new_message = [make_text_part(document_text + '\n\n' + text)]
-            else:
-                new_message = [make_text_part(document_text)]
-        else:
-            new_message = [make_text_part(text)]
+        # only the replied message's media is taken, never its caption: the prompt is what
+        # the user wrote in this turn
+        prompt = '\n\n'.join(t for t in (*replied_files, *own_files, text) if t)
+        new_message: list[MsgPartInHistory] = [make_text_part(prompt), *(make_image_part(h) for h in images)]
 
         system_prompt = self._system_prompt_for(model_by_prefix)
 
         # prefix and system_prompt stay None on a reply that named no model, which is what
         # lets construct_chat_history fall back to the ones already in the chain
-        self.set_msg_info(
-            chat_id,
-            msg_id,
-            MsgInfo(
-                sent_by_bot=False,
-                message=new_message,
-                reply_id=reply_to_id,
-                prefix=model_by_prefix and model_by_prefix.prefix,
-                system_prompt=system_prompt,
-                overrides=overrides or None,
-            ),
+        msg_info = MsgInfo(
+            sent_by_bot=False,
+            message=new_message,
+            reply_id=reply_to_id,
+            prefix=model_by_prefix and model_by_prefix.prefix,
+            system_prompt=system_prompt,
+            overrides=overrides or None,
         )
+        for mid in msg_ids:
+            self.set_msg_info(chat_id, mid, msg_info)
 
         await self._run_completion(chat_id, msg_id)
 
@@ -1491,93 +1537,25 @@ class ChatGPTTelegramBot:
 
     async def album_handler(self, event: events.Album.Event) -> None:
         chat_id: int = event.chat_id  # pyright: ignore[reportAssignmentType]  # checked for None in process_album
-        sender_id = event.sender_id
+        first = event.messages[0]
 
         # Inline allowed check (Album.Event lacks .id, so @only_allowed cannot be used)
         if not self.is_allowed(chat_id):
-            if chat_id == sender_id:
-                _ = await self.send_message(chat_id, 'This chat is not allowed', event.messages[0].id)
+            if chat_id == event.sender_id:
+                _ = await self.send_message(chat_id, 'This chat is not allowed', first.id)
             return
 
-        msg_id = event.messages[0].id
-        all_msg_ids = [m.id for m in event.messages]
         text = next((m.message for m in event.messages if m.message), '')
-
         logger.info(
-            f'New album to reply: {chat_id=}, {sender_id=}, {msg_id=}, {text=}, num_messages={len(event.messages)}'
+            f'New album to reply: {chat_id=}, {event.sender_id=}, {first.id=}, {text=},'
+            + f' num_messages={len(event.messages)}'
         )
-
-        reply_to_id: int | None = None
-        model_by_prefix: Model | None = None
-
-        replied_id = replied_message_id(event.messages[0])
-        if replied_id is not None:
-            first_msg = event.messages[0]
-            if first_msg.reply_to.quote_text is not None:
-                logger.debug(f'Album reply contains quote text {chat_id=}, {msg_id=}')
-                return
-            reply_to_message = await event.get_reply_message()
-            if reply_to_message is None:
-                logger.debug(f'Replied message is unavailable {chat_id=}, {msg_id=}')
-                return
-            if reply_to_message.sender_id == self.bot_id:
-                reply_to_id = replied_id
-                await self.pending_reply_manager.wait_for((chat_id, reply_to_id))
-            else:
-                return
-
-        # as in reply_handler: naming a model is required to open a thread, optional to
-        # continue one, and switches the model for this turn and the ones after it
-        overrides: dict[str, str | None] = {}
-        for m in self.models:
-            match = match_prefix(text, m.prefix)
-            if match is not None:
-                text, overrides = match
-                try:
-                    model_by_prefix = apply_overrides(m, overrides)
-                except ValueError as e:
-                    _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
-                    return
-                break
-        else:
-            if replied_id is None:
-                if chat_id == sender_id:
-                    _ = await self.send_message(
-                        chat_id,
-                        'Please start a new conversation with specified prefixes or reply to a bot message',
-                        msg_id,
-                    )
-                return
-
-        photo_messages = [m for m in event.messages if m.photo is not None]
-        photo_blobs = await asyncio.gather(*[m.download_media(bytes) for m in photo_messages])
-        photo_hashes = [
-            save_photo(self.image_cache, blob, chat_id, msg.id) for blob, msg in zip(photo_blobs, photo_messages)
-        ]
-
-        if not photo_hashes:
-            logger.debug(f'Album has no photos {chat_id=}, {msg_id=}')
+        own_media = [m for m in event.messages if self._media_kind(m) is not None]
+        if not own_media:
+            logger.debug(f'Album has no photos or files {chat_id=}, {first.id=}')
             return
-
-        new_message: list[MsgPartInHistory] = [make_text_part(text)]
-        for h in photo_hashes:
-            new_message.append(make_image_part(h))
-
-        system_prompt = self._system_prompt_for(model_by_prefix)
-
-        msg_info = MsgInfo(
-            sent_by_bot=False,
-            message=new_message,
-            reply_id=reply_to_id,
-            prefix=model_by_prefix and model_by_prefix.prefix,
-            system_prompt=system_prompt,
-            overrides=overrides or None,
-        )
-
-        for mid in all_msg_ids:
-            self.set_msg_info(chat_id, mid, msg_info)
-
-        await self._run_completion(chat_id, msg_id)
+        # every message of the album is stored, so a reply to any of them continues the thread
+        await self._user_turn(first, [m.id for m in event.messages], text, own_media)
 
     async def command_argument_error(self, message: Any, name: str) -> None:
         """Refuse an argument given to a command that takes none, such as ``/ping now``."""

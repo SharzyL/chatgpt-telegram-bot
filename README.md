@@ -30,7 +30,8 @@ A fork of [zzh1996/chatgpt-telegram-bot](https://github.com/zzh1996/chatgpt-tele
 - **Conversation import** — `/import` replays a conversation exported from elsewhere into the
   chat, one message per turn, each of them replyable.
 - **Long replies** — output over Telegram's per-message limit is split across several messages.
-- **Multimodal input** — photos (single or albums) and UTF-8 text files.
+- **Multimodal input** — photos and image files (single or albums) and UTF-8 text files,
+  attached or in a message you reply to.
 - **Concurrency and queueing** — requests run in parallel, and a reply to a message that is
   still generating waits for it to finish.
 - **Per-chat allowlist** — the bot answers only in chats you list, and stays silent elsewhere.
@@ -108,8 +109,12 @@ all of them):
   down to it; lists what will go and asks you to confirm. In a group the bot needs delete
   rights to remove other people's messages
 
-Attach a photo or a UTF-8 text file to a message, with or without a caption; you can also
-reply to someone else's photo or file to feed it to a model.
+Attach a photo, an image file or a UTF-8 text file to a message, with or without a caption.
+When sending them together is awkward, send or forward the media first and then reply to it
+with a prefixed message: the photos and files of the message replied to — all of an album —
+become part of the prompt (its caption does not), and a new conversation starts from there. This
+works for files the bot sent too, such as an `/export`. `/import` likewise reads a file it
+replies to.
 
 `/import` takes a conversation exported as JSON:
 

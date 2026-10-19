@@ -17,6 +17,7 @@ from chatgpt_telegram_bot.models import (
     ThinkingDelta,
     make_text_part,
 )
+from chatgpt_telegram_bot.utils import image_media_type
 
 LoadImage = Callable[[str], Awaitable[bytes | None]]
 
@@ -126,7 +127,8 @@ async def build_input_openai(
                 if blob is None:
                     continue
                 blob_base64 = base64.b64encode(blob).decode()
-                content.append({'type': 'input_image', 'image_url': 'data:image/jpeg;base64,' + blob_base64})
+                data_url = f'data:{image_media_type(blob)};base64,{blob_base64}'
+                content.append({'type': 'input_image', 'image_url': data_url})
             elif part.type_ == 'reasoning' and replay_reasoning:
                 item = read_reasoning_part(part, model_name)
                 if item is not None:
@@ -167,7 +169,7 @@ async def convert_history_anthropic(
                 converted.append(
                     {
                         'type': 'image',
-                        'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': blob_base64},
+                        'source': {'type': 'base64', 'media_type': image_media_type(blob), 'data': blob_base64},
                     }
                 )
         result.append(converted)
@@ -344,7 +346,8 @@ async def completion_openai_legacy(
                 if blob is None:
                     continue
                 blob_base64 = base64.b64encode(blob).decode()
-                parts.append({'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,' + blob_base64}})
+                data_url = f'data:{image_media_type(blob)};base64,{blob_base64}'
+                parts.append({'type': 'image_url', 'image_url': {'url': data_url}})
         content: Any = parts
         if len(parts) == 1 and parts[0]['type'] == 'text':
             content = parts[0]['text']

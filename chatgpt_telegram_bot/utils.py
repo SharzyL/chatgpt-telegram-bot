@@ -597,6 +597,26 @@ class Throttle:
         self.last_flush = now
 
 
+# leading bytes of the image formats a model accepts; a Telegram photo is always JPEG, but an
+# image sent as a file keeps whatever format it was saved in
+_IMAGE_SIGNATURES = (
+    (b'\xff\xd8\xff', 'image/jpeg'),
+    (b'\x89PNG\r\n\x1a\n', 'image/png'),
+    (b'GIF87a', 'image/gif'),
+    (b'GIF89a', 'image/gif'),
+)
+
+
+def image_media_type(blob: bytes) -> str:
+    """The media type of an image, read from its leading bytes; JPEG when unrecognised."""
+    for signature, media_type in _IMAGE_SIGNATURES:
+        if blob.startswith(signature):
+            return media_type
+    if blob[:4] == b'RIFF' and blob[8:12] == b'WEBP':
+        return 'image/webp'
+    return 'image/jpeg'
+
+
 def save_photo(cache: diskcache.Cache, photo_blob: bytes, chat_id: int, msg_id: int) -> str:
     key = f'{chat_id}:{msg_id}'
     _ = cache.set(key, photo_blob)

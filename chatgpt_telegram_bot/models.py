@@ -102,6 +102,17 @@ class MsgInfo(NamedTuple):
     extra_metadata: dict[str, Any] | None = None
 
 
+# the version of its answer a regenerated reply is, in MsgInfo.extra_metadata
+REGENERATION_EDITION = 'regeneration_edition'
+
+
+def regeneration_edition(info: MsgInfo) -> int:
+    """Which version of its answer a reply is: 1 for the original, one more per /regenerate."""
+    value = (info.extra_metadata or {}).get(REGENERATION_EDITION)
+    # JSON has no int type of its own, and a bool is an int to isinstance
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 1
+
+
 class ThreadTurn(NamedTuple):
     """One prompt of a thread and what answered it, for /navigate."""
 

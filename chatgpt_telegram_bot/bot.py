@@ -31,6 +31,7 @@ from chatgpt_telegram_bot.commands import (
 from chatgpt_telegram_bot.completion import completion, reasoning_text_of, thinking_text_of
 from chatgpt_telegram_bot.markdown import preview_line
 from chatgpt_telegram_bot.models import (
+    REGENERATION_EDITION,
     EndPoint,
     Model,
     MsgInfo,
@@ -44,6 +45,7 @@ from chatgpt_telegram_bot.models import (
     make_reasoning_part,
     make_text_part,
     make_thinking_text_part,
+    regeneration_edition,
     text_of,
 )
 from chatgpt_telegram_bot.render import (
@@ -426,9 +428,12 @@ class ChatGPTTelegramBot:
         """The renderer a model asks for; entities when no model has been chosen yet."""
         return SERVER_MARKDOWN_RENDERER if model is not None and model.richtext else ENTITY_RENDERER
 
-    def _reply_prefix(self, model: Model, manipulated: bool = False) -> str:
+    def _reply_prefix(self, model: Model, manipulated: bool = False, edition: int = 1) -> str:
+        """The header of a reply; *edition* above 1 marks a regenerated one with its version."""
         prefix = f'🤖 `{model.name}`'
         flags = self._model_flags(model)
+        if edition > 1:
+            flags.append(f'version={edition}')
         if flags:
             prefix += ' (' + ', '.join(flags) + ')'
         if manipulated:
@@ -698,7 +703,7 @@ class ChatGPTTelegramBot:
         # only the message replied to is rewritten, so a body that no longer fits is refused
         bodies = self.get_renderer(model).render(
             format_reply(thinking or '', text, True),
-            self._reply_prefix(model, manipulated=True),
+            self._reply_prefix(model, manipulated=True, edition=regeneration_edition(target_info)),
             thinking is not None,
         )
         if len(bodies) > 1:
@@ -1198,10 +1203,11 @@ class ChatGPTTelegramBot:
 
         # every part of the old reply is written over, and a shorter one deletes the rest
         adopt = list(target_info.part_ids or [target_id])
-        logger.info(f'Regenerating {chat_id=}, {prompt_id=}, {adopt=}, reprompted={bool(new_prompt)}')
+        edition = regeneration_edition(target_info) + 1
+        logger.info(f'Regenerating {chat_id=}, {prompt_id=}, {adopt=}, {edition=}, reprompted={bool(new_prompt)}')
         # an error that leaves no reply to write over answers the command: the prompt of an
         # imported turn is stored under a negative id, which is no message to reply to
-        await self._run_completion(chat_id, prompt_id, adopt=adopt, error_reply_to=msg_id)
+        await self._run_completion(chat_id, prompt_id, adopt=adopt, error_reply_to=msg_id, edition=edition)
 
     @staticmethod
     def _media_kind(message: Any) -> str | None:
@@ -1389,15 +1395,21 @@ class ChatGPTTelegramBot:
         await self._run_completion(chat_id, msg_id)
 
     async def _run_completion(
-        self, chat_id: int, msg_id: int, adopt: list[int] | None = None, error_reply_to: int | None = None
+        self,
+        chat_id: int,
+        msg_id: int,
+        adopt: list[int] | None = None,
+        error_reply_to: int | None = None,
+        edition: int = 1,
     ) -> None:
         """Answer *msg_id*, recorded as in flight so /abort can reach it.
 
-        *error_reply_to* is where a failure before any reply exists is reported; *msg_id* by default.
+        *error_reply_to* is where a failure before any reply exists is reported; *msg_id* by
+        default. *edition* is the version of the answer a regeneration writes, 1 otherwise.
         """
         self.generating[(chat_id, msg_id)] = False
         try:
-            await self._generate(chat_id, msg_id, adopt, error_reply_to or msg_id)
+            await self._generate(chat_id, msg_id, adopt, error_reply_to or msg_id, edition)
         finally:
             _ = self.generating.pop((chat_id, msg_id), None)
 
@@ -1436,6 +1448,7 @@ class ChatGPTTelegramBot:
         part_ids: list[int],
         reply: str,
         carry: list[dict[str, Any]],
+        edition: int,
     ) -> None:
         """Record a finished reply as the turn its messages show, with what it carries forward.
 
@@ -1458,10 +1471,19 @@ class ChatGPTTelegramBot:
             else:
                 parts.append(make_reasoning_part(model.name, item))
         parts.append(make_text_part(reply))
-        info = MsgInfo(sent_by_bot=True, message=parts, reply_id=prompt_id, prefix=None, system_prompt=None)
+        info = MsgInfo(
+            sent_by_bot=True,
+            message=parts,
+            reply_id=prompt_id,
+            prefix=None,
+            system_prompt=None,
+            extra_metadata={REGENERATION_EDITION: edition} if edition > 1 else None,
+        )
         self.store.put_turn(chat_id, part_ids, info)
 
-    async def _generate(self, chat_id: int, msg_id: int, adopt: list[int] | None, error_reply_to: int) -> None:
+    async def _generate(
+        self, chat_id: int, msg_id: int, adopt: list[int] | None, error_reply_to: int, edition: int
+    ) -> None:
         try:
             chat_history, model, system_prompt = self.construct_chat_history(chat_id, msg_id)
         except RuntimeError as e:
@@ -1475,7 +1497,7 @@ class ChatGPTTelegramBot:
             reply = ''
             thinking_done = False
             stream_meta = StreamMeta()
-            prefix = self._reply_prefix(model)
+            prefix = self._reply_prefix(model, edition=edition)
             async with BotReplyMessages(self, chat_id, msg_id, prefix, self.get_renderer(model), adopt) as replymsgs:
                 try:
                     status: str | None = 'Generating...'
@@ -1519,7 +1541,7 @@ class ChatGPTTelegramBot:
                     await replymsgs.update(final, bool(thinking))
                     await replymsgs.finalize()
                     part_ids = [bot_msg_id for bot_msg_id, _ in replymsgs.replied_msgs]
-                    self._store_reply(chat_id, msg_id, model, part_ids, reply, stream_meta.carry_items)
+                    self._store_reply(chat_id, msg_id, model, part_ids, reply, stream_meta.carry_items, edition)
                     return
 
                 # handling completion errors

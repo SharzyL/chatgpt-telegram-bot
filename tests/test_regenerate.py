@@ -9,7 +9,15 @@ import pytest
 from telethon.tl.types import MessageReplyHeader
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
-from chatgpt_telegram_bot.models import EndPoint, Model, MsgInfo, ResponseDelta, make_image_part, make_text_part
+from chatgpt_telegram_bot.models import (
+    EndPoint,
+    Model,
+    MsgInfo,
+    ResponseDelta,
+    make_image_part,
+    make_text_part,
+    regeneration_edition,
+)
 from chatgpt_telegram_bot.store import Store
 from chatgpt_telegram_bot.utils import PendingReplyManager
 
@@ -57,6 +65,8 @@ def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = Non
     bot.generating = {}
     sent: list[Any] = []
     runs: list[tuple[int, list[int] | None]] = []
+    editions: list[int] = []
+    bot.editions = editions  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
     bot.runs = runs  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
 
@@ -65,11 +75,12 @@ def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = Non
         return 999
 
     async def run_completion(
-        chat_id: int, msg_id: int, adopt: list[int] | None = None, error_reply_to: int | None = None
+        chat_id: int, msg_id: int, adopt: list[int] | None = None, error_reply_to: int | None = None, edition: int = 1
     ) -> None:
         assert chat_id == CHAT
         assert error_reply_to == COMMAND_ID, 'failures are reported to the command'
         runs.append((msg_id, adopt))
+        editions.append(edition)
 
     bot.send_message = send_message  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub
     bot._run_completion = run_completion  # pyright: ignore[reportPrivateUsage]  # test-only stub
@@ -292,6 +303,8 @@ def _recording_bot() -> Any:
     bot.TELEGRAM_BURST_WINDOW = 0.001
     calls: list[tuple[str, int]] = []
     bot.calls = calls
+    bodies: list[str] = []
+    bot.bodies = bodies
     next_id = [200]
 
     async def send_message(_chat_id: int, _body: Any, reply_to: int) -> int:
@@ -299,8 +312,9 @@ def _recording_bot() -> Any:
         calls.append(('send', reply_to))
         return next_id[0]
 
-    async def edit_message(_chat_id: int, _body: Any, message_id: int) -> None:
+    async def edit_message(_chat_id: int, body: Any, message_id: int) -> None:
         calls.append(('edit', message_id))
+        bodies.append(body.text)
 
     async def delete_message(_chat_id: int, message_id: int) -> None:
         calls.append(('delete', message_id))
@@ -317,17 +331,18 @@ def _recording_bot() -> Any:
 
 
 def _regenerate_for_real(
-    monkeypatch: pytest.MonkeyPatch, old_parts: list[int], answer: str
+    monkeypatch: pytest.MonkeyPatch, old_parts: list[int], answer: str, old_extra: dict[str, Any] | None = None
 ) -> tuple[Any, dict[int, MsgInfo]]:
     bot = _recording_bot()
-    old = MsgInfo(True, [make_text_part('the old answer')], PROMPT_ID, None, None, None, old_parts)
+    old = MsgInfo(True, [make_text_part('the old answer')], PROMPT_ID, None, None, None, old_parts, None, old_extra)
     bot.store.put_turn(CHAT, old_parts, old)
 
     async def fake(*_args: Any, **_kwargs: Any) -> Any:
         yield ResponseDelta(text=answer)
 
     monkeypatch.setattr('chatgpt_telegram_bot.bot.completion', fake)
-    asyncio.run(ChatGPTTelegramBot._run_completion(bot, CHAT, PROMPT_ID, adopt=old_parts))  # pyright: ignore[reportPrivateUsage]  # exercising the real path
+    edition = regeneration_edition(old) + 1
+    asyncio.run(ChatGPTTelegramBot._run_completion(bot, CHAT, PROMPT_ID, adopt=old_parts, edition=edition))  # pyright: ignore[reportPrivateUsage]  # exercising the real path
     rows = {mid: info for mid, info in bot.store.chat_nodes(CHAT).items() if mid != PROMPT_ID}
     return bot, rows
 
@@ -386,3 +401,32 @@ def test_an_imported_turn_with_no_model_reports_to_the_command():
     bot.send_message = send_message
     asyncio.run(ChatGPTTelegramBot._run_completion(bot, CHAT, -50, adopt=[50], error_reply_to=COMMAND_ID))  # pyright: ignore[reportPrivateUsage]  # exercising the real path
     assert replies == [COMMAND_ID]
+
+
+def test_each_regeneration_counts_one_more_edition():
+    bot = _regenerate(_bot())
+    assert bot.editions == [2], 'the original answer is the first edition'
+    bot = _bot()
+    target = bot.get_msg_info(CHAT, REPLY_IDS[0])
+    bot.store.update(CHAT, REPLY_IDS[0], target._replace(extra_metadata={'regeneration_edition': 4}))
+    assert _regenerate(bot).editions == [5]
+
+
+def test_a_regenerated_reply_records_its_edition_and_shows_it_in_the_header(monkeypatch: pytest.MonkeyPatch):
+    bot, rows = _regenerate_for_real(monkeypatch, [REPLY_IDS[0]], 'again', {'regeneration_edition': 2})
+    assert rows[REPLY_IDS[0]].extra_metadata == {'regeneration_edition': 3}
+    assert regeneration_edition(rows[REPLY_IDS[0]]) == 3
+    # the version joins the turn's other flags in the header, from the first edit on
+    assert all(text.split('\n', 1)[0] == '🤖 gpt-5 (thinking=high, version=3)' for text in bot.bodies)
+
+
+def test_an_original_reply_has_no_version():
+    bot = _bot()
+    assert 'version' not in bot._reply_prefix(Model(prefix='g', name='gpt-5'))
+    assert bot._reply_prefix(Model(prefix='g', name='gpt-5'), edition=2) == '🤖 `gpt-5` (version=2)\n\n'
+
+
+def test_an_edition_that_is_not_a_positive_number_reads_as_the_original():
+    for value in (None, True, 0, -3, '2', 2.5):
+        info = MsgInfo(True, [make_text_part('a')], 1, None, None, extra_metadata={'regeneration_edition': value})
+        assert regeneration_edition(info) == 1, value

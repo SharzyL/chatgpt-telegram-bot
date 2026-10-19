@@ -130,7 +130,8 @@ all of them):
   `/regenerate <prefix> <new prompt>` — reply to a bot message to answer its prompt again,
   writing over the reply in place. A first word that is a model prefix is read as one, and so
   is `<endpoint>/<model>[,flags]` on an endpoint from `bot.toml`, as `/chat` takes it.
-  `/re` is short for `/regenerate`
+  A regenerated reply's header shows which version of the answer it is (`version=2` for the
+  first regeneration, the original being version 1). `/re` is short for `/regenerate`
 - `/abort` — stop whatever is generating in this chat; the reply keeps what it had, marked
   `[!aborted]`, and can still be replied to
 - `/navigate` — reply to a message to list the turns of its thread, one line each, paged with

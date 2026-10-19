@@ -528,9 +528,9 @@ class PendingReplyManager:
     async def wait_for(self, reply_id: tuple[int, int]) -> None:
         if reply_id not in self.messages:
             return
-        logger.info('PendingReplyManager waiting for %r', reply_id)
+        logger.info(f'PendingReplyManager waiting for {reply_id!r}')
         _ = await self.messages[reply_id].wait()
-        logger.info('PendingReplyManager waiting for %r finished', reply_id)
+        logger.info(f'PendingReplyManager waiting for {reply_id!r} finished')
 
 
 class Throttle:

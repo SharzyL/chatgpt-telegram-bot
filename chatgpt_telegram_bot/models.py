@@ -82,6 +82,10 @@ class MsgInfo(NamedTuple):
     """every message id this reply occupies, so a regeneration can reuse all of them"""
     part_ids: list[int] | None = None
 
+    """only present for head of conversation, a model named as ``<endpoint>/<name>`` by /chat
+    rather than by a configured prefix; `prefix` is None then"""
+    model_spec: str | None = None
+
 
 class ThreadTurn(NamedTuple):
     """One prompt of a thread and what answered it, for /navigate."""

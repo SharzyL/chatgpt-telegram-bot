@@ -5,7 +5,7 @@ from typing import Any
 from telethon.extensions import html
 
 from chatgpt_telegram_bot.bot import BOT_COMMANDS, ChatGPTTelegramBot
-from chatgpt_telegram_bot.models import Model
+from chatgpt_telegram_bot.models import EndPoint, Model
 from chatgpt_telegram_bot.utils import (
     COMMAND_ALIASES,
     COMMANDS_WITH_BODY,
@@ -19,6 +19,7 @@ def _bot() -> Any:
     bot: Any = object.__new__(ChatGPTTelegramBot)
     bot.models = [Model(prefix='g', name='gpt-test')]
     bot.default_endpoint = 'default'
+    bot.endpoints = [EndPoint(name='default', url='https://default.test'), EndPoint(name='alt', url='https://alt.test')]
     bot.system_prompt = 'be helpful'
     return bot
 
@@ -52,6 +53,7 @@ def test_models_lists_every_prefix_and_flag():
     text, _ = html.parse(bot._build_models_text())
     assert 'g → gpt-test' in text
     assert 'gs → gpt-test (search)' in text
+    assert 'Endpoints, for /chat <endpoint>/<model>: default, alt' in text
 
 
 def test_a_message_without_a_prefix_gets_a_short_pointer():

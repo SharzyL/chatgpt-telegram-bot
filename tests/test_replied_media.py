@@ -1,15 +1,23 @@
-"""Replying to a message that carries media brings that media into the turn."""
+"""Replying to a message that carries media brings that media into the turn, and /chat, which opens a
+thread whatever it replies to."""
 
 import asyncio
 from types import SimpleNamespace
 from typing import Any, final
 from zoneinfo import ZoneInfo
 
+import pytest
 from telethon.tl.types import MessageReplyHeader
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
-from chatgpt_telegram_bot.models import Model, MsgInfo
-from chatgpt_telegram_bot.utils import PendingReplyManager, image_media_type
+from chatgpt_telegram_bot.models import EndPoint, Model, MsgInfo, make_text_part
+from chatgpt_telegram_bot.utils import (
+    PendingReplyManager,
+    apply_overrides,
+    image_media_type,
+    parse_chat_spec,
+    parse_command,
+)
 
 CHAT = -100
 BOT_ID = 7
@@ -64,6 +72,16 @@ def _bot(*neighbours: FakeMessage) -> Any:
     bot: Any = object.__new__(ChatGPTTelegramBot)
     bot.db = {}
     bot.models = [Model(prefix='g', name='gpt-5')]
+    bot.endpoints = [EndPoint(name='main', url='https://main.test'), EndPoint(name='alt', url='https://alt.test')]
+    bot.endpoint_by_name = {e.name: e for e in bot.endpoints}
+    bot.default_endpoint = 'main'
+    # every client is made on demand; a stand-in keeps the test off the network and the env
+    bot.clients = {}
+
+    def make_client(*triple: str) -> Any:
+        return SimpleNamespace(triple=triple)
+
+    bot._make_client = make_client
     bot.system_prompt = 'be helpful'
     bot.timezone = ZoneInfo('UTC')
     bot.allowed_chats = {CHAT}
@@ -242,3 +260,145 @@ def test_import_prefers_a_file_attached_to_the_command():
 def test_import_reads_a_file_the_bot_sent():
     export = FakeMessage(10, sender_id=BOT_ID, document=document('application/json'))
     assert asyncio.run(_bot()._import_document(FakeMessage(11, '/import', replied=export))) is export
+
+
+# /chat
+
+
+def _chat(bot: Any, message: FakeMessage) -> MsgInfo | None:
+    command = parse_command(message.message, 'the_bot')
+    assert command is not None
+    assert command[0] == 'chat'
+    asyncio.run(bot.chat_handler(message, command[1]))
+    return bot.get_msg_info(CHAT, message.id)
+
+
+def test_a_spec_splits_into_model_overrides_and_prompt():
+    assert parse_chat_spec('alt/some-model,suffix=/v2,t=high hello there') == (
+        'alt/some-model',
+        {'suffix': '/v2', 't': 'high'},
+        'hello there',
+    )
+    assert parse_chat_spec('g,[be terse, please] hi') == ('g', {'system_prompt': 'be terse, please'}, 'hi')
+    assert parse_chat_spec('g\n\nfirst line\nsecond') == ('g', {}, 'first line\nsecond')
+    assert parse_chat_spec('g') == ('g', {}, '')
+
+
+def test_a_configured_prefix_takes_its_flags():
+    bot = _bot()
+    info = _chat(bot, FakeMessage(11, '/chat g,s what is new'))
+    assert info is not None
+    assert (info.prefix, info.model_spec, info.overrides) == ('g', None, {'s': None})
+    assert info.message[0].text == 'what is new'
+    assert bot.completions == [(CHAT, 11)]
+
+
+def test_an_unconfigured_model_is_stored_as_its_spec():
+    bot = _bot()
+    info = _chat(bot, FakeMessage(11, '/chat alt/vendor/big-model,suffix=/v2,api_type=openai_legacy hi'))
+    assert info is not None
+    assert info.prefix is None, 'no prefix stands for it'
+    assert info.model_spec == 'alt/vendor/big-model'
+    assert bot.clients == {('alt', 'openai_legacy', '/v2'): SimpleNamespace(triple=('alt', 'openai_legacy', '/v2'))}
+
+    bot.set_msg_info(
+        CHAT,
+        12,
+        MsgInfo(sent_by_bot=True, message=[make_text_part('hello')], reply_id=11, prefix=None, system_prompt=None),
+    )
+    bot.set_msg_info(
+        CHAT,
+        13,
+        MsgInfo(sent_by_bot=False, message=[make_text_part('more')], reply_id=12, prefix=None, system_prompt=None),
+    )
+    _, model, _ = bot.construct_chat_history(CHAT, 13)
+    assert (model.endpoint, model.name, model.suffix, model.api_type) == (
+        'alt',
+        'vendor/big-model',
+        '/v2',
+        'openai_legacy',
+    )
+
+
+def test_a_prefix_that_looks_like_a_spec_means_the_configured_model():
+    bot = _bot()
+    bot.models = [Model(prefix='alt/x', name='configured-x')]
+    info = _chat(bot, FakeMessage(11, '/chat alt/x hi'))
+    assert info is not None
+    assert (info.prefix, info.model_spec) == ('alt/x', None)
+
+
+@pytest.mark.parametrize(
+    ('text', 'error'),
+    [
+        ('/chat nope hi', '[!] `nope` is neither a model prefix nor `<endpoint>/<model>`; /models lists both'),
+        ('/chat gone/m hi', '[!] Unknown endpoint `gone`; /models lists the endpoints'),
+        ('/chat alt/m,api_type=grpc hi', '[!] api_type must be one of openai, openai_legacy, anthropic'),
+        ('/chat alt/m,api_type=anthropic,dt hi', '[!] dt needs api_type openai'),
+    ],
+)
+def test_a_bad_spec_is_reported(text: str, error: str):
+    bot = _bot()
+    assert _chat(bot, FakeMessage(11, text)) is None
+    assert bot.sent == [error]
+    assert bot.completions == []
+
+
+def test_a_bare_chat_shows_usage():
+    bot = _bot()
+    assert _chat(bot, FakeMessage(11, '/chat')) is None
+    assert bot.sent[0].startswith('[!] `/chat` starts a new conversation')
+
+
+def test_a_missing_api_key_is_reported_up_front():
+    bot = _bot()
+
+    def no_key(ep_name: str, *_rest: str) -> Any:
+        raise ValueError(f'No API key for endpoint "{ep_name}": set OPENAI_API_KEY_{ep_name}')
+
+    bot._make_client = no_key
+    assert _chat(bot, FakeMessage(11, '/chat alt/m hi')) is None
+    assert bot.sent == ['[!] No API key for endpoint "alt": set OPENAI_API_KEY_alt']
+
+
+def test_replying_to_a_bot_turn_with_media_starts_afresh_with_that_media():
+    bot = _bot()
+    bot.set_msg_info(CHAT, 10, MsgInfo(sent_by_bot=True, message=[], reply_id=9, prefix=None, system_prompt=None))
+    turn = FakeMessage(10, sender_id=BOT_ID, photo=photo(), blob=JPEG)
+    info = _chat(bot, FakeMessage(11, '/chat g what is this', replied=turn))
+    assert info is not None
+    assert info.reply_id is None, 'a plain reply would have continued that turn'
+    assert [p.type_ for p in info.message] == ['text', 'image']
+    assert bot.cached == {f'{CHAT}:10': JPEG}
+
+
+def test_replying_to_a_bot_text_starts_afresh_without_its_history():
+    bot = _bot()
+    bot.set_msg_info(CHAT, 10, MsgInfo(sent_by_bot=True, message=[], reply_id=9, prefix=None, system_prompt=None))
+    info = _chat(bot, FakeMessage(11, '/chat g new topic', replied=FakeMessage(10, sender_id=BOT_ID)))
+    assert info is not None
+    assert info.reply_id is None
+    assert [p.type_ for p in info.message] == ['text']
+
+
+def test_a_photo_captioned_with_chat_is_part_of_it():
+    bot = _bot()
+    info = _chat(bot, FakeMessage(11, '/chat alt/m', photo=photo(), blob=JPEG))
+    assert info is not None
+    assert [p.type_ for p in info.message] == ['text', 'image']
+    assert info.message[0].text == 'Describe the image'
+
+
+def test_an_album_captioned_with_chat():
+    bot = _bot()
+    own = [FakeMessage(i, photo=photo(), blob=JPEG, grouped_id=9) for i in (40, 41)]
+    own[0].message = '/chat alt/m compare'
+    asyncio.run(bot.album_handler(SimpleNamespace(chat_id=CHAT, sender_id=HUMAN_ID, messages=own)))
+    info = bot.get_msg_info(CHAT, 41)
+    assert info is not None
+    assert (info.model_spec, info.message[0].text) == ('alt/m', 'compare')
+
+
+def test_flags_on_a_configured_model_change_its_backend():
+    model = apply_overrides(Model(prefix='g', name='m'), {'api_type': 'anthropic', 't': None, 'suffix': ''})
+    assert (model.api_type, model.thinking, model.suffix) == ('anthropic', 'adaptive', '')

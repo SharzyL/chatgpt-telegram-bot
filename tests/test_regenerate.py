@@ -1,6 +1,7 @@
 """Answering a prompt again in place."""
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, final
 from zoneinfo import ZoneInfo
 
@@ -8,7 +9,7 @@ import pytest
 from telethon.tl.types import MessageReplyHeader
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
-from chatgpt_telegram_bot.models import Model, MsgInfo, ResponseDelta, make_image_part, make_text_part
+from chatgpt_telegram_bot.models import EndPoint, Model, MsgInfo, ResponseDelta, make_image_part, make_text_part
 from chatgpt_telegram_bot.utils import PendingReplyManager
 
 BOT_ID = 7
@@ -38,6 +39,15 @@ def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = Non
     bot = object.__new__(ChatGPTTelegramBot)
     bot.db = {}  # pyright: ignore[reportAttributeAccessIssue]  # a dict is enough of a shelf here
     bot.models = [Model(prefix='g', name='gpt-5'), Model(prefix='c', name='claude')]
+    bot.endpoints = [EndPoint(name='main', url='https://main.test'), EndPoint(name='alt', url='https://alt.test')]
+    bot.endpoint_by_name = {e.name: e for e in bot.endpoints}
+    bot.default_endpoint = 'main'
+    bot.clients = {}
+
+    def make_client(ep_name: str, api_type: str, suffix: str) -> Any:
+        return SimpleNamespace(triple=(ep_name, api_type, suffix))
+
+    bot._make_client = make_client  # pyright: ignore[reportPrivateUsage]  # test-only stub
     bot.system_prompt = 'be helpful'
     bot.timezone = ZoneInfo('UTC')
     bot.allowed_chats = {CHAT}
@@ -90,6 +100,35 @@ def test_a_bare_regenerate_reruns_the_same_prompt_and_model():
     assert _prompt(bot).message[0].text == 'the original prompt'
     assert _prompt(bot).prefix == 'g'
     assert _prompt(bot).overrides == {'t': 'high'}
+
+
+def test_an_endpoint_model_switches_the_model_for_the_turn():
+    bot = _regenerate(_bot(), 'alt/vendor/m,suffix=/v2 a reworded prompt')
+    assert bot.runs == [(PROMPT_ID, [REPLY_IDS[0]])]
+    info = _prompt(bot)
+    assert (info.prefix, info.model_spec, info.overrides) == (None, 'alt/vendor/m', {'suffix': '/v2'})
+    assert info.message[0].text == 'a reworded prompt'
+    _, model, _ = bot.construct_chat_history(CHAT, PROMPT_ID)
+    assert (model.endpoint, model.name, model.suffix) == ('alt', 'vendor/m', '/v2')
+
+
+def test_a_prefix_after_an_endpoint_model_clears_the_spec():
+    bot = _regenerate(_bot(), 'alt/m')
+    bot = _regenerate(bot, 'c')
+    assert (_prompt(bot).prefix, _prompt(bot).model_spec) == ('c', None)
+
+
+def test_a_slash_word_on_no_known_endpoint_is_prompt():
+    bot = _regenerate(_bot(), 'and/or which one')
+    info = _prompt(bot)
+    assert (info.prefix, info.model_spec) == ('g', None)
+    assert info.message[0].text == 'and/or which one'
+
+
+def test_an_endpoint_model_with_bad_flags_is_reported():
+    bot = _regenerate(_bot(), 'alt/m,api_type=grpc hi')
+    assert bot.sent == ['[!] api_type must be one of openai, openai_legacy, anthropic']
+    assert bot.runs == []
 
 
 def test_a_prefix_switches_the_model_for_the_turn():

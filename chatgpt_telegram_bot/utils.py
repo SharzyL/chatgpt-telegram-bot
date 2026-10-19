@@ -57,8 +57,11 @@ def split_respecting_brackets(s: str, delimiters: str = ',') -> list[str]:
     return parts
 
 
-def find_delimiter_outside_brackets(s: str) -> int:
-    """Return the index of the first space outside ``[…]``, or ``-1``."""
+def find_delimiter_outside_brackets(s: str, any_whitespace: bool = False) -> int:
+    """Return the index of the first space outside ``[…]``, or ``-1``.
+
+    With *any_whitespace*, a newline or tab ends the run as well.
+    """
     depth = 0
     i = 0
     while i < len(s):
@@ -71,7 +74,7 @@ def find_delimiter_outside_brackets(s: str) -> int:
         elif c == ']':
             if depth > 0:
                 depth -= 1
-        elif c == ' ' and depth == 0:
+        elif depth == 0 and (c == ' ' or (any_whitespace and c.isspace())):
             return i
         i += 1
     return -1
@@ -124,6 +127,20 @@ def match_prefix(text: str, prefix: str) -> tuple[str, dict[str, str | None]] | 
     return None
 
 
+def parse_chat_spec(body: str) -> tuple[str, dict[str, str | None], str]:
+    """Split a ``/chat`` body into the model it names, its overrides and the prompt.
+
+    The body opens with ``<model>[,overrides]``, where the model is a prefix or
+    ``<endpoint>/<name>``, and the prompt follows after a space or on the next line.
+    """
+    idx = find_delimiter_outside_brackets(body, any_whitespace=True)
+    spec, prompt = (body, '') if idx == -1 else (body[:idx], body[idx + 1 :].lstrip())
+    head, _, flags = spec.partition(',')
+    return head, parse_overrides(flags), prompt
+
+
+API_TYPES = ('openai', 'openai_legacy', 'anthropic')
+
 THINKING_DEFAULTS: dict[str, str] = {
     'openai': 'high',
     'openai_legacy': 'high',
@@ -136,9 +153,21 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
     if not overrides:
         return model
     replacements: dict[str, Any] = {}
+    # the backend comes first, since a bare `t` takes its default effort from it
+    api_type = next((v for k, v in overrides.items() if OVERRIDE_ALIASES.get(k, k) == 'api_type'), None)
+    if api_type is not None and api_type not in API_TYPES:
+        raise ValueError(f'api_type must be one of {", ".join(API_TYPES)}')
+    if api_type is not None:
+        model = model._replace(api_type=api_type)
     for key, value in overrides.items():
         field = OVERRIDE_ALIASES.get(key, key)
-        if field == 'thinking':
+        if field == 'api_type':
+            if value is None:
+                raise ValueError('api_type needs a value')
+        elif field == 'suffix':
+            # bare key (|suffix) takes the endpoint's default, explicit empty (|suffix=) none
+            replacements['suffix'] = value
+        elif field == 'thinking':
             if value is None:
                 # bare key (e.g. |t) — use api_type default
                 replacements['thinking'] = THINKING_DEFAULTS.get(model.api_type)
@@ -158,17 +187,17 @@ def apply_overrides(model: Model, overrides: dict[str, str | None]) -> Model:
             replacements['richtext'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
         elif field == 'dummy_tool':
             # bare key (|dt) enables, explicit empty (|dt=) disables
-            enabled = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
-            if enabled and model.api_type != 'openai':
-                raise ValueError('dt needs api_type openai')
-            replacements['dummy_tool'] = enabled
+            replacements['dummy_tool'] = value is None or (value != '' and value.lower() not in ('0', 'false', 'no'))
         elif field == 'system_prompt':
             replacements['system_prompt'] = value
         elif field == 'system_prompt_append':
             replacements['system_prompt_append'] = value
         else:
             raise ValueError(f'Unknown override key: {key}')
-    return model._replace(**replacements)
+    model = model._replace(**replacements)
+    if model.dummy_tool and model.api_type != 'openai':
+        raise ValueError('dt needs api_type openai')
+    return model
 
 
 _THINK_BLOCK = re.compile(r'\A<think>(.*?)</think>', re.DOTALL)
@@ -190,7 +219,7 @@ def parse_manipulation(body: str) -> tuple[str | None, str]:
 
 
 # commands that read the rest of the message, and those that must be the whole of it
-COMMANDS_WITH_BODY = frozenset({'manipulate', 'import', 'regenerate', 'export'})
+COMMANDS_WITH_BODY = frozenset({'chat', 'manipulate', 'import', 'regenerate', 'export'})
 COMMANDS_WITHOUT_BODY = frozenset({'ping', 'help', 'models', 'abort', 'navigate', 'linearize'})
 # short spellings, read as the command they stand for
 COMMAND_ALIASES = {'re': 'regenerate', 'mani': 'manipulate'}

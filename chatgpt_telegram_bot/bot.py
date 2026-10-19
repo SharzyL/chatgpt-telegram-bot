@@ -62,6 +62,7 @@ from chatgpt_telegram_bot.utils import (
     match_prefix,
     message_link,
     pack_html_sections,
+    parse_chat_spec,
     parse_command,
     parse_import,
     parse_manipulation,
@@ -123,6 +124,7 @@ REGENERATE_USAGE = """[!] `/regenerate` answers a prompt again in place, so it h
 `/regenerate <prefix>` — the same prompt, another model
 `/regenerate <new prompt>` — another prompt, the same model
 `/regenerate <prefix> <new prompt>` — both
+`/regenerate <endpoint>/<model>[,flags] [new prompt]` — a model not in /models, as /chat names it
 
 `/re` is short for `/regenerate`.
 
@@ -146,7 +148,21 @@ or, to supply a chain of thought too:
 `/mani` is short for `/manipulate`."""
 
 
+CHAT_USAGE = """[!] `/chat` starts a new conversation with the model you name:
+
+`/chat <prefix>[,flags] <message>`
+
+or, for a model not in /models:
+
+`/chat <endpoint>/<model>[,suffix=<path>][,api_type=<type>][,flags] <message>`
+
+Sent as a reply, it brings in the media of the message replied to but always starts afresh."""
+
+
 class ChatGPTTelegramBot:
+    # this bot's username, read once connected; None until then
+    username: str | None = None
+
     def __init__(self, config_path: str, data_dir: str) -> None:
         self.config_path: str = config_path
         self.data_dir: str = data_dir
@@ -198,26 +214,8 @@ class ChatGPTTelegramBot:
             suffix = model.suffix if model.suffix is not None else endpoint_by_name[ep].default_suffix
             client_triples.add((ep, model.api_type, suffix))
 
-        for ep_name, api_type, suffix in client_triples:
-            endpoint = endpoint_by_name[ep_name]
-            url = endpoint.url + suffix
-            api_key = os.environ[f'OPENAI_API_KEY_{ep_name}']
-            if api_type in ('openai', 'openai_legacy'):
-                self.clients[(ep_name, api_type, suffix)] = openai.AsyncOpenAI(
-                    api_key=api_key,
-                    base_url=url,
-                    max_retries=0,
-                    timeout=300,
-                )
-            elif api_type == 'anthropic':
-                self.clients[(ep_name, api_type, suffix)] = anthropic.AsyncAnthropic(
-                    api_key=api_key,
-                    base_url=url,
-                    max_retries=0,
-                    timeout=300,
-                )
-            else:
-                raise ValueError(f'Unknown api_type: {api_type}')
+        for triple in client_triples:
+            self.clients[triple] = self._make_client(*triple)
 
         # a streaming reply settles at one edit per TELEGRAM_MIN_INTERVAL; the first
         # TELEGRAM_BURST_WINDOW seconds may go at TELEGRAM_BURST_INTERVAL instead
@@ -271,9 +269,65 @@ class ChatGPTTelegramBot:
             proxy=parse_proxy(),  # pyright: ignore[reportArgumentType]  # telethon proxy type is broader at runtime
         )
 
+    def _make_client(self, ep_name: str, api_type: str, suffix: str) -> Any:
+        url = self.endpoint_by_name[ep_name].url + suffix
+        api_key = os.environ.get(f'OPENAI_API_KEY_{ep_name}')
+        if api_key is None:
+            raise ValueError(f'No API key for endpoint "{ep_name}": set OPENAI_API_KEY_{ep_name}')
+        if api_type in ('openai', 'openai_legacy'):
+            return openai.AsyncOpenAI(api_key=api_key, base_url=url, max_retries=0, timeout=300)
+        if api_type == 'anthropic':
+            return anthropic.AsyncAnthropic(api_key=api_key, base_url=url, max_retries=0, timeout=300)
+        raise ValueError(f'Unknown api_type: {api_type}')
+
     def get_client(self, endpoint: str, model: Model) -> Any:
+        """The SDK client for *model*, made on first use for a combination no configured model has."""
         suffix = model.suffix if model.suffix is not None else self.endpoint_by_name[endpoint].default_suffix
-        return self.clients[(endpoint, model.api_type, suffix)]
+        key = (endpoint, model.api_type, suffix)
+        if key not in self.clients:
+            self.clients[key] = self._make_client(*key)
+        return self.clients[key]
+
+    def _configured_model(self, prefix: str) -> Model | None:
+        return next((m for m in self.models if m.prefix == prefix), None)
+
+    def _spec_model(self, spec: str) -> Model:
+        """The model behind an ``<endpoint>/<name>`` spec. Raises ValueError, for the user."""
+        endpoint, sep, name = spec.partition('/')
+        if not sep or not endpoint or not name:
+            raise ValueError(f'`{spec}` is neither a model prefix nor `<endpoint>/<model>`; /models lists both')
+        if endpoint not in self.endpoint_by_name:
+            raise ValueError(f'Unknown endpoint `{endpoint}`; /models lists the endpoints')
+        return Model(prefix=spec, name=name, endpoint=endpoint)
+
+    def _stored_model(self, msg_info: MsgInfo) -> Model | None:
+        """The model a stored turn names, overrides applied, or None if it names none we know."""
+        base: Model | None = None
+        if msg_info.prefix:
+            base = self._configured_model(msg_info.prefix)
+        elif spec := getattr(msg_info, 'model_spec', None):
+            try:
+                base = self._spec_model(spec)
+            except ValueError:  # its endpoint has left the config since
+                return None
+        if base is None:
+            return None
+        return apply_overrides(base, getattr(msg_info, 'overrides', None) or {})
+
+    def _chat_model(self, head: str, overrides: dict[str, str | None]) -> tuple[Model, str | None]:
+        """The model a /chat names, and the spec to store for it when no prefix stands for it.
+
+        A configured prefix is read first, so one written like a spec (``o/gf``) means the
+        model it is configured as. Raises ValueError, for the user.
+        """
+        model = self._configured_model(head)
+        spec = None
+        if model is None:
+            model, spec = self._spec_model(head), head
+        model = apply_overrides(model, overrides)
+        # made now, so a missing API key is reported here rather than as a failed generation
+        _ = self.get_client(model.endpoint or self.default_endpoint, model)
+        return model, spec
 
     def get_msg_info(self, chat_id: int, msg_id: int) -> MsgInfo | None:
         key = f'msg_info_{chat_id}_{msg_id}'
@@ -294,6 +348,7 @@ class ChatGPTTelegramBot:
         logger.info('Bot started')
         self.bot.parse_mode = None  # pyright: ignore[reportAttributeAccessIssue]  # telethon supports this at runtime
         me: Any = await self.bot.get_me()  # telethon stubs type as InputPeerUser but returns User at runtime
+        self.username = me.username
 
         @self.bot.on(events.NewMessage)  # pyright: ignore[reportArgumentType]  # telethon accepts event class at runtime
         async def _process(event: events.NewMessage.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
@@ -318,6 +373,8 @@ class ChatGPTTelegramBot:
                 await self.help_handler(event.message)
             elif name == 'models':
                 await self.models_handler(event.message)
+            elif name == 'chat':
+                await self.chat_handler(event.message, body)
             elif name == 'manipulate':
                 await self.manipulate_handler(event.message, body)
             elif name == 'import':
@@ -459,11 +516,8 @@ class ChatGPTTelegramBot:
 
             # the walk runs newest to oldest, so the first prefix found is the most recent
             # one the user named; an earlier prefix only applies until a reply replaces it
-            if model_of_history is None and msg_info.prefix:
-                for model in self.models:
-                    if model.prefix == msg_info.prefix:
-                        overrides = getattr(msg_info, 'overrides', None) or {}
-                        model_of_history = apply_overrides(model, overrides)
+            if model_of_history is None:
+                model_of_history = self._stored_model(msg_info)
 
             # likewise for the prompt, which a switch of model brings along with it
             if system_prompt is None and msg_info.system_prompt is not None:
@@ -496,6 +550,8 @@ class ChatGPTTelegramBot:
             flags = ', '.join(self._model_flags(m))
             suffix = f' ({flags})' if flags else ''
             lines.append(f'  <code>{m.prefix}</code> → <code>{m.name}</code>{suffix}')
+        endpoints = ', '.join(f'<code>{e.name}</code>' for e in self.endpoints)
+        lines.append(f'\nEndpoints, for <code>/chat &lt;endpoint&gt;/&lt;model&gt;</code>: {endpoints}')
         return '\n'.join(lines)
 
     def _build_help_sections(self) -> list[str]:
@@ -513,6 +569,9 @@ class ChatGPTTelegramBot:
             '  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt',
             '  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt',
             '  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt',
+            '  <code>&lt;prefix&gt;,suffix=/v1 &lt;message&gt;</code>  — another path on the endpoint',
+            '  <code>&lt;prefix&gt;,api_type=openai_legacy &lt;message&gt;</code>  — another API'
+            + ' (<code>openai</code>, <code>openai_legacy</code>, <code>anthropic</code>)',
             'Reply to a bot message to continue; reply to an older one to fork.',
             'Reply to a photo or file with a prefix to talk about it.',
             'A prefix on a reply switches the model from there on.',
@@ -529,10 +588,15 @@ class ChatGPTTelegramBot:
             '  <code>/linearize</code>  — delete every other branch, after confirming',
             '  <code>/export [title]</code>  — save it as JSON that <code>/import</code> reads',
             'Typed, not in the command menu, as they act on their arguments:',
+            '  <code>/chat &lt;prefix&gt;[,flags] &lt;message&gt;</code>',
+            '  <code>/chat &lt;endpoint&gt;/&lt;model&gt;[,flags] &lt;message&gt;</code>',
+            '    Start a new conversation, with any model an endpoint serves, configured or not.'
+            + " As a reply it takes the media replied to, a bot reply's included, and never continues a thread.",
             '  <code>/regenerate [prefix] [new prompt]</code>, or <code>/re</code>',
             '    Reply to a bot message to answer its prompt again, over the old reply.'
-            + ' A prefix switches the model and new text replaces the prompt;'
-            + ' a first word that is a prefix is read as one.',
+            + ' A prefix, or <code>&lt;endpoint&gt;/&lt;model&gt;</code> as in <code>/chat</code>,'
+            + ' switches the model and new text replaces the prompt;'
+            + ' a first word that is either is read as one.',
             '  <code>/manipulate &lt;text&gt;</code>, or <code>/mani</code>',
             '    Reply to a bot message to rewrite what it said; later turns build on yours.'
             + ' Lead with <code>&lt;think&gt;…&lt;/think&gt;</code> to supply its reasoning, sent under dt.',
@@ -727,15 +791,7 @@ class ChatGPTTelegramBot:
         self.set_msg_info(
             chat_id,
             target_id,
-            MsgInfo(
-                sent_by_bot=True,
-                message=new_parts,
-                reply_id=target_info.reply_id,
-                prefix=target_info.prefix,
-                system_prompt=target_info.system_prompt,
-                overrides=target_info.overrides,
-                part_ids=getattr(target_info, 'part_ids', None),
-            ),
+            target_info._replace(message=new_parts),
         )
         await self.edit_message(chat_id, bodies[0], target_id)
         logger.info(f'Manipulated {chat_id=}, {target_id=}, has_thinking={thinking is not None}')
@@ -1222,9 +1278,11 @@ class ChatGPTTelegramBot:
             return
 
         # the argument parses exactly as a message prefix does, so the text left over after
-        # the prefix and its overrides is the new prompt; an argument that opens with no
-        # prefix is all prompt, and keeps the model the turn was on
+        # the prefix and its overrides is the new prompt; failing a prefix, a first word of
+        # the form <endpoint>/<model> names a model as /chat does. An argument that opens
+        # with neither is all prompt, and keeps the model the turn was on
         model: Model | None = None
+        model_spec: str | None = None
         overrides: dict[str, str | None] = {}
         new_prompt = body.strip()
         if new_prompt:
@@ -1238,6 +1296,16 @@ class ChatGPTTelegramBot:
                         _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
                         return
                     break
+            else:
+                head, spec_overrides, rest = parse_chat_spec(new_prompt)
+                endpoint, sep, _ = head.partition('/')
+                if sep and endpoint in self.endpoint_by_name:
+                    try:
+                        model, model_spec = self._chat_model(head, spec_overrides)
+                    except ValueError as e:
+                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+                        return
+                    overrides, new_prompt = spec_overrides, rest
 
         # a named model and a new prompt both belong to the turn being answered, so they are
         # recorded on its prompt exactly as sending it afresh with that prefix would
@@ -1245,18 +1313,15 @@ class ChatGPTTelegramBot:
             parts = list(prompt_info.message)
             if new_prompt:
                 parts = replace_text_part(parts, new_prompt)
-            self.set_msg_info(
-                chat_id,
-                prompt_id,
-                MsgInfo(
-                    sent_by_bot=False,
-                    message=parts,
-                    reply_id=prompt_info.reply_id,
-                    prefix=model.prefix if model is not None else prompt_info.prefix,
-                    system_prompt=self._system_prompt_for(model) if model is not None else prompt_info.system_prompt,
-                    overrides=(overrides or None) if model is not None else prompt_info.overrides,
-                ),
-            )
+            info = prompt_info._replace(message=parts)
+            if model is not None:
+                info = info._replace(
+                    prefix=model.prefix if model_spec is None else None,
+                    system_prompt=self._system_prompt_for(model),
+                    overrides=overrides or None,
+                    model_spec=model_spec,
+                )
+            self.set_msg_info(chat_id, prompt_id, info)
 
         # every part of the old reply is written over, and a shorter one deletes the rest
         adopt = list(getattr(target_info, 'part_ids', None) or [target_id])
@@ -1312,6 +1377,16 @@ class ChatGPTTelegramBot:
         return images, files
 
     @only_allowed
+    async def chat_handler(self, message: Any, body: str) -> None:
+        """Start a thread with the model *body* names, which need not be configured."""
+        logger.info(f'New chat: {message.chat_id=}, {message.sender_id=}, {message.id=}, {body=}')
+        if not body.strip():
+            _ = await self.send_message(message.chat_id, CHAT_USAGE, message.id)
+            return
+        own_media = [message] if self._media_kind(message) is not None else []
+        await self._user_turn(message, [message.id], body, own_media, chat=True)
+
+    @only_allowed
     async def reply_handler(self, message: Any) -> None:
         logger.info(
             f'New message to reply: {message.chat_id=}, {message.sender_id=}, {message.id=}, {message.message=},'
@@ -1323,7 +1398,9 @@ class ChatGPTTelegramBot:
         own_media = [message] if self._media_kind(message) is not None else []
         await self._user_turn(message, [message.id], message.message or '', own_media)
 
-    async def _user_turn(self, first: Any, msg_ids: list[int], text: str, own_media: list[Any]) -> None:
+    async def _user_turn(
+        self, first: Any, msg_ids: list[int], text: str, own_media: list[Any], chat: bool = False
+    ) -> None:
         """Record a user's turn and answer it: one message, or the messages of an album.
 
         *first* is the message whose reply header counts, *own_media* the messages whose photos
@@ -1331,18 +1408,28 @@ class ChatGPTTelegramBot:
         a bot reply, brings that media in as well -- a forwarded image, a file sent on its own
         beforehand, or a file the bot sent outside any thread -- but not its caption, and
         opens a thread. A bot message that is a stored turn is continued, media or not.
+
+        With *chat*, *text* is a /chat body, which names the model itself, and the turn opens
+        a thread whatever it replies to; a replied message only lends its media.
         """
         chat_id = first.chat_id
         sender_id = first.sender_id
         msg_id = msg_ids[0]
         reply_to_id: int | None = None
         model_by_prefix: Model | None = None
+        model_spec: str | None = None
         replied_media: list[Any] = []
 
         # a message sitting in a forum topic carries a reply header too, so what counts as a
         # reply is decided by replied_message_id rather than by the header being present
         replied_id = replied_message_id(first)
-        if replied_id is not None:
+        if replied_id is not None and chat:
+            # a bot turn with media included, which is what /chat is for: replying normally
+            # would continue that turn's thread
+            reply_to_message = await first.get_reply_message()
+            if reply_to_message is not None and self._media_kind(reply_to_message) is not None:
+                replied_media = await self._album_of(reply_to_message)
+        elif replied_id is not None:
             if first.reply_to.quote_text is not None:
                 logger.debug(f'Reply contains quote text {chat_id=}, {msg_id=}')
                 return
@@ -1370,22 +1457,30 @@ class ChatGPTTelegramBot:
         # missing prefix is an error there; on a reply the prefix is optional and switches
         # the model for this turn and the ones after it
         overrides: dict[str, str | None] = {}
-        for m in self.models:
-            match = match_prefix(text, m.prefix)
-            if match is not None:
-                text, overrides = match
-                try:
-                    model_by_prefix = apply_overrides(m, overrides)
-                except ValueError as e:
-                    _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
-                    return
-                break
-        else:  # no matching prefix
-            if reply_to_id is None:
-                if chat_id == sender_id:  # in private chat, point at /models and /help
-                    _ = await self.send_message(chat_id, self._no_prefix_text(), msg_id)
+        if chat:
+            head, overrides, text = parse_chat_spec(text)
+            try:
+                model_by_prefix, model_spec = self._chat_model(head, overrides)
+            except ValueError as e:
+                _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
                 return
-            # continuing a thread: model and prompt carry over from the message replied to
+        else:
+            for m in self.models:
+                match = match_prefix(text, m.prefix)
+                if match is not None:
+                    text, overrides = match
+                    try:
+                        model_by_prefix = apply_overrides(m, overrides)
+                    except ValueError as e:
+                        _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
+                        return
+                    break
+            else:  # no matching prefix
+                if reply_to_id is None:
+                    if chat_id == sender_id:  # in private chat, point at /models and /help
+                        _ = await self.send_message(chat_id, self._no_prefix_text(), msg_id)
+                    return
+                # continuing a thread: model and prompt carry over from the message replied to
 
         try:
             replied_images, replied_files = await self._read_media(chat_id, replied_media)
@@ -1405,14 +1500,16 @@ class ChatGPTTelegramBot:
         system_prompt = self._system_prompt_for(model_by_prefix)
 
         # prefix and system_prompt stay None on a reply that named no model, which is what
-        # lets construct_chat_history fall back to the ones already in the chain
+        # lets construct_chat_history fall back to the ones already in the chain; a model /chat
+        # named by its endpoint is stored as that spec instead of a prefix
         msg_info = MsgInfo(
             sent_by_bot=False,
             message=new_message,
             reply_id=reply_to_id,
-            prefix=model_by_prefix and model_by_prefix.prefix,
+            prefix=model_by_prefix.prefix if model_by_prefix is not None and model_spec is None else None,
             system_prompt=system_prompt,
             overrides=overrides or None,
+            model_spec=model_spec,
         )
         for mid in msg_ids:
             self.set_msg_info(chat_id, mid, msg_info)
@@ -1525,8 +1622,8 @@ class ChatGPTTelegramBot:
                             # into a response `store=false` never kept, and drops the item on
                             # replay whichever way it is sent -- observed by the reasoning
                             # tokens never reaching the next turn's input, and by the model
-                            # reinventing numbers it had picked. A <think> block in the
-                            # message is ordinary input and cannot be ignored.
+                            # reinventing numbers it had picked. As text it goes back as a
+                            # plain reasoning item under dt, and is dropped otherwise.
                             reply_parts.append(make_thinking_text_part(chain_of_thought))
                         else:
                             reply_parts.append(make_reasoning_part(model.name, item))
@@ -1590,7 +1687,12 @@ class ChatGPTTelegramBot:
             logger.debug(f'Album has no photos or files {chat_id=}, {first.id=}')
             return
         # every message of the album is stored, so a reply to any of them continues the thread
-        await self._user_turn(first, [m.id for m in event.messages], text, own_media)
+        msg_ids = [m.id for m in event.messages]
+        command = parse_command(text, self.username)
+        if command is not None and command[0] == 'chat':
+            await self._user_turn(first, msg_ids, command[1], own_media, chat=True)
+        else:
+            await self._user_turn(first, msg_ids, text, own_media)
 
     async def command_argument_error(self, message: Any, name: str) -> None:
         """Refuse an argument given to a command that takes none, such as ``/ping now``."""

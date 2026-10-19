@@ -82,6 +82,8 @@ Overrides go between the prefix and the message, separated by commas:
 | `gpt,[be terse] hello` | replace the system prompt for this conversation |
 | `gpt,+[be terse] hello` | append to the default system prompt |
 | `gpt,[] hello` | send no system prompt at all |
+| `gpt,suffix=/v2 hello` | call another path on the endpoint (`suffix=` for none) |
+| `gpt,api_type=openai_legacy hello` | use another backend: `openai`, `openai_legacy` or `anthropic` |
 
 Several can be combined (`gpt,t=high,s hello`), and brackets may contain spaces and escaped
 brackets (`\[`, `\]`).
@@ -94,13 +96,31 @@ for DeepSeek models on the Responses API (`api_type = "openai"`, the default) an
 other backends; OpenAI models carry their own encrypted reasoning without it. A chain of thought supplied
 with `/manipulate` also reaches the model only under `dt`.
 
+`/chat` starts a conversation with a model you name, even one that is not in `bot.toml`:
+
+```
+/chat gpt,t=high hello
+/chat openrouter/vendor/some-model,suffix=/api/v1,api_type=openai_legacy hello
+```
+
+The first word is either a prefix, read with its overrides as usual, or `<endpoint>/<model>`:
+an endpoint from `bot.toml` (`/models` lists them) and the model name sent to it, which may
+itself contain `/`. A configured prefix wins, so a prefix spelt like a spec, say `o/gf`, means
+the model it is configured as. The model and its flags are remembered for the conversation,
+so a plain reply continues on it. `/chat` always starts a new conversation, also when sent as a
+reply: the photos and files of the message it replies to come along, even those of a bot reply,
+but the thread that message belongs to does not. That is the way to talk about media
+the bot sent in a reply, since a plain reply to it would just continue its thread.
+
 Commands (picking one from Telegram's command menu sends it at once, so the menu holds only
-those safe to send bare; type `/regenerate`, `/manipulate` and `/import`, and see `/help` for
+those safe to send bare; type `/chat`, `/regenerate`, `/manipulate` and `/import`, and see `/help` for
 all of them):
 
 - `/help` — the override syntax, the commands and the current system prompt
-- `/models` — every model prefix and the model behind it
+- `/models` — every model prefix and the model behind it, and the endpoints `/chat` can name
 - `/ping` — chat id, user id, and whether the chat is allowed
+- `/chat <prefix>[,flags] <message>`, or `/chat <endpoint>/<model>[,flags] <message>` — start
+  a new conversation with the model named, configured or not (see above)
 - `/manipulate <text>`, or `/manipulate <think>reasoning</think> <text>` — reply to a bot
   message with this to rewrite what it is recorded as having said. `/mani` is short for
   `/manipulate`
@@ -108,7 +128,8 @@ all of them):
   conversation into the chat
 - `/regenerate`, `/regenerate <prefix>`, `/regenerate <new prompt>`,
   `/regenerate <prefix> <new prompt>` — reply to a bot message to answer its prompt again,
-  writing over the reply in place. A first word that is a model prefix is read as one.
+  writing over the reply in place. A first word that is a model prefix is read as one, and so
+  is `<endpoint>/<model>[,flags]` on an endpoint from `bot.toml`, as `/chat` takes it.
   `/re` is short for `/regenerate`
 - `/abort` — stop whatever is generating in this chat; the reply keeps what it had, marked
   `[!aborted]`, and can still be replied to

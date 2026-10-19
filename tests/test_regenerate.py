@@ -63,8 +63,11 @@ def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = Non
         sent.append(body)
         return 999
 
-    async def run_completion(chat_id: int, msg_id: int, adopt: list[int] | None = None) -> None:
+    async def run_completion(
+        chat_id: int, msg_id: int, adopt: list[int] | None = None, error_reply_to: int | None = None
+    ) -> None:
         assert chat_id == CHAT
+        assert error_reply_to == COMMAND_ID, 'failures are reported to the command'
         runs.append((msg_id, adopt))
 
     bot.send_message = send_message  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub
@@ -367,3 +370,20 @@ def test_a_second_regenerate_of_the_same_reply_is_refused():
     _ = _regenerate(bot)
     assert bot.runs == []
     assert bot.sent[0] == '[!] That reply is already being generated'
+
+
+def test_an_imported_turn_with_no_model_reports_to_the_command():
+    # an import without a prefix records no model, and its prompt lives under a negative id
+    bot = _recording_bot()
+    bot.db.clear()
+    bot.set_msg_info(CHAT, -50, MsgInfo(False, [make_text_part('imported prompt')], None, None, None))
+    bot.set_msg_info(CHAT, 50, MsgInfo(True, [make_text_part('imported answer')], -50, None, None, None, [50]))
+    replies: list[int] = []
+
+    async def send_message(_chat_id: int, _body: Any, reply_to: int) -> int:
+        replies.append(reply_to)
+        return 999
+
+    bot.send_message = send_message
+    asyncio.run(ChatGPTTelegramBot._run_completion(bot, CHAT, -50, adopt=[50], error_reply_to=COMMAND_ID))  # pyright: ignore[reportPrivateUsage]  # exercising the real path
+    assert replies == [COMMAND_ID]

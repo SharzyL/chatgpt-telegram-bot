@@ -1212,7 +1212,9 @@ class ChatGPTTelegramBot:
         # every part of the old reply is written over, and a shorter one deletes the rest
         adopt = list(target_info.part_ids or [target_id])
         logger.info(f'Regenerating {chat_id=}, {prompt_id=}, {adopt=}, reprompted={bool(new_prompt)}')
-        await self._run_completion(chat_id, prompt_id, adopt=adopt)
+        # an error that leaves no reply to write over answers the command: the prompt of an
+        # imported turn is stored under a negative id, which is no message to reply to
+        await self._run_completion(chat_id, prompt_id, adopt=adopt, error_reply_to=msg_id)
 
     @staticmethod
     def _media_kind(message: Any) -> str | None:
@@ -1399,11 +1401,16 @@ class ChatGPTTelegramBot:
 
         await self._run_completion(chat_id, msg_id)
 
-    async def _run_completion(self, chat_id: int, msg_id: int, adopt: list[int] | None = None) -> None:
-        """Answer *msg_id*, recorded as in flight so /abort can reach it."""
+    async def _run_completion(
+        self, chat_id: int, msg_id: int, adopt: list[int] | None = None, error_reply_to: int | None = None
+    ) -> None:
+        """Answer *msg_id*, recorded as in flight so /abort can reach it.
+
+        *error_reply_to* is where a failure before any reply exists is reported; *msg_id* by default.
+        """
         self.generating[(chat_id, msg_id)] = False
         try:
-            await self._generate(chat_id, msg_id, adopt)
+            await self._generate(chat_id, msg_id, adopt, error_reply_to or msg_id)
         finally:
             _ = self.generating.pop((chat_id, msg_id), None)
 
@@ -1471,12 +1478,12 @@ class ChatGPTTelegramBot:
         for mid in (*part_ids, *dropped):
             self.set_msg_info(chat_id, mid, info)
 
-    async def _generate(self, chat_id: int, msg_id: int, adopt: list[int] | None = None) -> None:
+    async def _generate(self, chat_id: int, msg_id: int, adopt: list[int] | None, error_reply_to: int) -> None:
         try:
             chat_history, model, system_prompt = self.construct_chat_history(chat_id, msg_id)
         except RuntimeError as e:
             logger.exception(e)
-            _ = await self.send_message(chat_id, f'[!] Error on resolving conversation: {e}', msg_id)
+            _ = await self.send_message(chat_id, f'[!] Error on resolving conversation: {e}', error_reply_to)
             return
 
         error_cnt = 0

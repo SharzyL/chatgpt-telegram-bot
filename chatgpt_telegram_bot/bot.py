@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 import diskcache
+import httpx
+import httpx2
 import openai
 from loguru import logger
 from telethon import Button, TelegramClient, errors, events, functions, types
@@ -88,6 +90,48 @@ from chatgpt_telegram_bot.utils import (
     retry,
     save_photo,
 )
+
+# failures the same request may well not meet again: the connection (timeouts included, which
+# subclass APIConnectionError), the provider's load, and its rate limit. A stream that drops
+# mid-reply surfaces as the SDK's HTTP library's own error, unwrapped: httpx for openai,
+# httpx2 for anthropic.
+RETRYABLE_ERRORS = (
+    openai.APIConnectionError,
+    openai.InternalServerError,
+    openai.RateLimitError,
+    anthropic.APIConnectionError,
+    anthropic.InternalServerError,
+    anthropic.RateLimitError,
+    httpx.TransportError,
+    httpx2.TransportError,
+    TimeoutError,
+)
+# a rate limit with no Retry-After is waited out for this long, and a Retry-After is capped
+RATE_LIMIT_WAIT = 20.0
+RATE_LIMIT_MAX_WAIT = 60.0
+
+
+def _retry_after(response: Any) -> float | None:
+    """The seconds a response's Retry-After header asks for, if it gives a number."""
+    try:
+        return float(response.headers['retry-after'])
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def retry_delay(e: BaseException, interval: float) -> float | None:
+    """How long to wait before generating again after *e*; None when a retry would fail the same way."""
+    if isinstance(e, (openai.RateLimitError, anthropic.RateLimitError)):
+        return min(_retry_after(e.response) or RATE_LIMIT_WAIT, RATE_LIMIT_MAX_WAIT)
+    if isinstance(e, RETRYABLE_ERRORS):
+        return interval
+    # Anthropic reports overload met mid-stream as an `error` event, which the SDK raises as a
+    # bare APIStatusError carrying the stream's 200 rather than as the 529 it stands for
+    if isinstance(e, anthropic.APIStatusError) and isinstance(e.body, dict):
+        error: Any = e.body.get('error')
+        if isinstance(error, dict) and error.get('type') in ('overloaded_error', 'api_error'):
+            return interval
+    return None
 
 
 class ChatGPTTelegramBot:
@@ -1480,24 +1524,18 @@ class ChatGPTTelegramBot:
                 except Exception as e:  # noqa: BLE001  # the retry loop handles every completion failure
                     error_cnt += 1
                     logger.exception(f'Error on generating exception({chat_id=}, {msg_id=}, {error_cnt=})')
-                    retryable_errors = (
-                        openai.APITimeoutError,
-                        openai.InternalServerError,
-                        anthropic.APITimeoutError,
-                        anthropic.InternalServerError,
-                        TimeoutError,
-                    )
-                    will_retry = isinstance(e, retryable_errors) and error_cnt <= self.OPENAI_MAX_RETRY
+                    delay = retry_delay(e, self.OPENAI_RETRY_INTERVAL)
+                    if error_cnt > self.OPENAI_MAX_RETRY:
+                        delay = None
                     error_msg = f'[!] Error: {traceback.format_exception_only(e)[-1].strip()}'
-                    if will_retry:
-                        error_msg += f'\nRetrying ({error_cnt}/{self.OPENAI_MAX_RETRY})...'
+                    if delay is not None:
+                        error_msg += f'\nRetrying in {delay:.0f}s ({error_cnt}/{self.OPENAI_MAX_RETRY})...'
                     if reply:
                         error_msg = reply + '\n\n' + error_msg
                     await replymsgs.update(error_msg)
-                    if will_retry:
-                        await asyncio.sleep(self.OPENAI_RETRY_INTERVAL)
-                    if not will_retry:
+                    if delay is None:
                         break
+                    await asyncio.sleep(delay)
 
     async def album_handler(self, event: events.Album.Event) -> None:
         chat_id: int = event.chat_id  # pyright: ignore[reportAssignmentType]  # checked for None in process_album

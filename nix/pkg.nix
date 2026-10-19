@@ -4,6 +4,8 @@
 , python-socks
 , openai
 , anthropic
+, httpx
+, httpx2
 , cryptg
 , diskcache
 , loguru
@@ -30,6 +32,8 @@ buildPythonPackage {
     diskcache
     openai
     anthropic
+    httpx
+    httpx2
     loguru
     mistune
     systemd-python

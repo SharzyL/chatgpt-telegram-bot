@@ -181,6 +181,47 @@ def parse_manipulation(body: str) -> tuple[str | None, str]:
     return (thinking or None), text
 
 
+# commands that read the rest of the message, and those that must be the whole of it
+COMMANDS_WITH_BODY = frozenset({'manipulate', 'import', 'regenerate', 'export'})
+COMMANDS_WITHOUT_BODY = frozenset({'ping', 'help', 'abort', 'navigate', 'linearize'})
+
+_COMMAND_TOKEN = re.compile(r'/(\w+)(?:@(\w+))?')
+
+
+def parse_command(text: str, username: str | None) -> tuple[str, str] | None:
+    """Read a bot command from the start of a message, as ``(name, body)``.
+
+    The command is the first token, optionally addressed as ``/name@username``, and the body
+    is the rest of the message, which may start on the next line. A command in
+    ``COMMANDS_WITHOUT_BODY`` given a body anyway is still returned with it, so the caller can
+    report the misuse. ``None`` means the message is not a command for this bot.
+    """
+    tokens = text.split(maxsplit=1)
+    if not tokens:
+        return None
+    match = _COMMAND_TOKEN.fullmatch(tokens[0])
+    if match is None:
+        return None
+    name, addressee = match.group(1), match.group(2)
+    if addressee is not None and addressee != username:
+        return None
+    return name, tokens[1] if len(tokens) > 1 else ''
+
+
+def is_foreign_command(text: str, username: str | None) -> bool:
+    """Whether a message opens with a command addressed to another bot (``/start@other_bot``).
+
+    Usernames are case-insensitive, so a mis-cased mention of this bot is not foreign.
+    """
+    tokens = text.split(maxsplit=1)
+    if not tokens:
+        return False
+    match = _COMMAND_TOKEN.fullmatch(tokens[0])
+    if match is None or match.group(2) is None:
+        return False
+    return username is None or match.group(2).lower() != username.lower()
+
+
 def parse_proxy():
     proxy_env = os.getenv('ALL_PROXY')
     if proxy_env:

@@ -43,16 +43,19 @@ from chatgpt_telegram_bot.reply import (
     format_reply,
 )
 from chatgpt_telegram_bot.utils import (
+    COMMANDS_WITHOUT_BODY,
     PendingReplyManager,
     Throttle,
     apply_overrides,
     decode_text_file,
     export_filename,
     format_export,
+    is_foreign_command,
     linearize_plan,
     load_photo,
     match_prefix,
     message_link,
+    parse_command,
     parse_import,
     parse_manipulation,
     parse_proxy,
@@ -291,30 +294,29 @@ class ChatGPTTelegramBot:
             if event.message.message is None:
                 return
             text = event.message.message
-            # a /manipulate body may start on the next line, so the command is the first token
-            command_parts = text.split(maxsplit=1)
-            command = command_parts[0] if command_parts else ''
-            if text == '/ping' or text == f'/ping@{me.username}':
+            if is_foreign_command(text, me.username):
+                return
+            command = parse_command(text, me.username)
+            name, body = command if command is not None else ('', '')
+            if name in COMMANDS_WITHOUT_BODY and body:
+                await self.command_argument_error(event.message, name)
+            elif name == 'ping':
                 await self.ping(event.message)
-            elif text == '/help' or text == f'/help@{me.username}':
+            elif name == 'help':
                 await self.help_handler(event.message)
-            elif command in ('/manipulate', f'/manipulate@{me.username}'):
-                body = command_parts[1] if len(command_parts) > 1 else ''
+            elif name == 'manipulate':
                 await self.manipulate_handler(event.message, body)
-            elif command in ('/import', f'/import@{me.username}'):
-                body = command_parts[1] if len(command_parts) > 1 else ''
+            elif name == 'import':
                 await self.import_handler(event.message, body)
-            elif command in ('/regenerate', f'/regenerate@{me.username}'):
-                body = command_parts[1] if len(command_parts) > 1 else ''
+            elif name == 'regenerate':
                 await self.regenerate_handler(event.message, body)
-            elif text == '/abort' or text == f'/abort@{me.username}':
+            elif name == 'abort':
                 await self.abort_handler(event.message)
-            elif text == '/navigate' or text == f'/navigate@{me.username}':
+            elif name == 'navigate':
                 await self.navigate_handler(event.message)
-            elif text == '/linearize' or text == f'/linearize@{me.username}':
+            elif name == 'linearize':
                 await self.linearize_handler(event.message)
-            elif command in ('/export', f'/export@{me.username}'):
-                body = command_parts[1] if len(command_parts) > 1 else ''
+            elif name == 'export':
                 await self.export_handler(event.message, body)
             else:
                 await self.reply_handler(event.message)
@@ -1564,6 +1566,14 @@ class ChatGPTTelegramBot:
             self.set_msg_info(chat_id, mid, msg_info)
 
         await self._run_completion(chat_id, msg_id)
+
+    async def command_argument_error(self, message: Any, name: str) -> None:
+        """Refuse an argument given to a command that takes none, such as ``/ping now``."""
+        # /ping answers in any chat, so its misuse is reported in any chat too; the other
+        # commands are allowlisted, and stay as silent elsewhere as they would when used right
+        if name != 'ping' and not self.is_allowed(message.chat_id):
+            return
+        _ = await self.send_message(message.chat_id, f'[!] `/{name}` takes no argument', message.id)
 
     async def ping(self, message: Any) -> None:
         _ = await self.send_message(

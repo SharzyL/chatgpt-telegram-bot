@@ -25,6 +25,13 @@ def test_a_command_with_a_body_takes_the_rest():
     assert parse_command('/import', ME) == ('import', '')
 
 
+def test_aliases_stand_for_their_command():
+    assert parse_command('/re g be brief', ME) == ('regenerate', 'g be brief')
+    assert parse_command('/re@my_bot', ME) == ('regenerate', '')
+    assert parse_command('/mani\nnew text', ME) == ('manipulate', 'new text')
+    assert parse_command('/rege', ME) == ('rege', ''), 'only the listed spellings, not any prefix'
+
+
 def test_a_body_may_start_on_the_next_line():
     assert parse_command('/manipulate\n<think>x</think> y', ME) == ('manipulate', '<think>x</think> y')
 

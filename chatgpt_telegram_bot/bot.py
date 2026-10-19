@@ -81,11 +81,10 @@ ENTITY_PROMPT_APPEND = (
 )
 
 
-# /manipulate is deliberately not registered as a bot command: it needs both a reply target
-# and a body, so picking it from the command palette could only ever fail
 # Commands offered in the palette. BotCommand carries only a name and a description, with no
 # way to say that an argument is required, so picking one that needs a body sends it empty and
-# gets its usage text back -- which is a fair trade for being discoverable.
+# gets its usage text back -- which is a fair trade for being discoverable. The aliases
+# (/re, /mani) are left out, so the palette lists each command once.
 BOT_COMMANDS = [
     ('ping', 'Test bot connectivity'),
     ('help', 'Show available models and usage'),
@@ -120,6 +119,8 @@ REGENERATE_USAGE = """[!] `/regenerate` answers a prompt again in place, so it h
 `/regenerate <new prompt>` — another prompt, the same model
 `/regenerate <prefix> <new prompt>` — both
 
+`/re` is short for `/regenerate`.
+
 A first word that is a model prefix is read as one, so a new prompt that happens to start with a prefix needs the model named in front of it."""
 
 IMPORT_USAGE = """[!] `/import` needs an exported conversation as a JSON file, either attached to the command or replied to.
@@ -135,7 +136,9 @@ MANIPULATE_USAGE = """[!] `/manipulate` rewrites a bot reply, so it has to reply
 
 or, to supply a chain of thought too:
 
-`/manipulate <think>your cot</think> <text>`"""
+`/manipulate <think>your cot</think> <text>`
+
+`/mani` is short for `/manipulate`."""
 
 
 class ChatGPTTelegramBot:
@@ -501,7 +504,7 @@ class ChatGPTTelegramBot:
         lines.append('  Each turn becomes a message you can reply to to continue from there.')
         lines.append('')
         lines.append('<b>Regeneration</b>')
-        lines.append('  Reply to a bot message with:')
+        lines.append('  Reply to a bot message with (<code>/re</code> for short):')
         lines.append('  <code>/regenerate</code>  — same prompt and model')
         lines.append('  <code>/regenerate &lt;prefix&gt;</code>  — another model')
         lines.append('  <code>/regenerate &lt;new prompt&gt;</code>  — another prompt')
@@ -513,7 +516,7 @@ class ChatGPTTelegramBot:
         lines.append('  <code>/linearize</code> deletes every other branch, after confirmation.')
         lines.append('')
         lines.append('<b>Manipulation</b>')
-        lines.append('  Reply to a bot message with:')
+        lines.append('  Reply to a bot message with (<code>/mani</code> for short):')
         lines.append('  <code>/manipulate &lt;text&gt;</code>')
         lines.append('  <code>/manipulate &lt;think&gt;cot&lt;/think&gt; &lt;text&gt;</code>')
         lines.append('  The stored reply becomes yours, and later turns build on it.')

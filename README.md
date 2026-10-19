@@ -88,12 +88,14 @@ Commands:
 - `/help` — the model list, the override syntax and the current system prompt
 - `/ping` — chat id, user id, and whether the chat is allowed
 - `/manipulate <text>`, or `/manipulate <think>reasoning</think> <text>` — reply to a bot
-  message with this to rewrite what it is recorded as having said
+  message with this to rewrite what it is recorded as having said. `/mani` is short for
+  `/manipulate`
 - `/import`, or `/import <prefix>` — attach a JSON export (or reply to one) to replay a
   conversation into the chat
 - `/regenerate`, `/regenerate <prefix>`, `/regenerate <new prompt>`,
   `/regenerate <prefix> <new prompt>` — reply to a bot message to answer its prompt again,
-  writing over the reply in place. A first word that is a model prefix is read as one
+  writing over the reply in place. A first word that is a model prefix is read as one.
+  `/re` is short for `/regenerate`
 - `/abort` — stop whatever is generating in this chat; the reply keeps what it had, marked
   `[!aborted]`, and can still be replied to
 - `/navigate` — reply to a message to list the turns of its thread, one line each, paged with

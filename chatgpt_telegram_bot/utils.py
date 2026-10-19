@@ -184,6 +184,8 @@ def parse_manipulation(body: str) -> tuple[str | None, str]:
 # commands that read the rest of the message, and those that must be the whole of it
 COMMANDS_WITH_BODY = frozenset({'manipulate', 'import', 'regenerate', 'export'})
 COMMANDS_WITHOUT_BODY = frozenset({'ping', 'help', 'abort', 'navigate', 'linearize'})
+# short spellings, read as the command they stand for
+COMMAND_ALIASES = {'re': 'regenerate', 'mani': 'manipulate'}
 
 _COMMAND_TOKEN = re.compile(r'/(\w+)(?:@(\w+))?')
 
@@ -192,7 +194,8 @@ def parse_command(text: str, username: str | None) -> tuple[str, str] | None:
     """Read a bot command from the start of a message, as ``(name, body)``.
 
     The command is the first token, optionally addressed as ``/name@username``, and the body
-    is the rest of the message, which may start on the next line. A command in
+    is the rest of the message, which may start on the next line. An alias in
+    ``COMMAND_ALIASES`` is returned under the name it stands for. A command in
     ``COMMANDS_WITHOUT_BODY`` given a body anyway is still returned with it, so the caller can
     report the misuse. ``None`` means the message is not a command for this bot.
     """
@@ -205,7 +208,7 @@ def parse_command(text: str, username: str | None) -> tuple[str, str] | None:
     name, addressee = match.group(1), match.group(2)
     if addressee is not None and addressee != username:
         return None
-    return name, tokens[1] if len(tokens) > 1 else ''
+    return COMMAND_ALIASES.get(name, name), tokens[1] if len(tokens) > 1 else ''
 
 
 def is_foreign_command(text: str, username: str | None) -> bool:

@@ -83,7 +83,9 @@ Overrides go between the prefix and the message, separated by commas:
 Several can be combined (`gpt,t=high,s hello`), and brackets may contain spaces and escaped
 brackets (`\[`, `\]`).
 
-Commands:
+Commands (picking one from Telegram's command menu sends it at once, so the menu holds only
+those safe to send bare; type `/regenerate`, `/manipulate` and `/import`, and see `/help` for
+all of them):
 
 - `/help` — the model list, the override syntax and the current system prompt
 - `/ping` — chat id, user id, and whether the chat is allowed

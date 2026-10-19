@@ -35,7 +35,13 @@ from chatgpt_telegram_bot.models import (
     make_text_part,
     make_thinking_text_part,
 )
-from chatgpt_telegram_bot.render import ENTITY_RENDERER, SERVER_MARKDOWN_RENDERER, Rendered, Renderer
+from chatgpt_telegram_bot.render import (
+    ENTITY_RENDERER,
+    PLAIN_LENGTH_LIMIT,
+    SERVER_MARKDOWN_RENDERER,
+    Rendered,
+    Renderer,
+)
 from chatgpt_telegram_bot.reply import (
     format_imported_turn,
     format_linearize_listing,
@@ -55,6 +61,7 @@ from chatgpt_telegram_bot.utils import (
     load_photo,
     match_prefix,
     message_link,
+    pack_html_sections,
     parse_command,
     parse_import,
     parse_manipulation,
@@ -81,20 +88,17 @@ ENTITY_PROMPT_APPEND = (
 )
 
 
-# Commands offered in the palette. BotCommand carries only a name and a description, with no
-# way to say that an argument is required, so picking one that needs a body sends it empty and
-# gets its usage text back -- which is a fair trade for being discoverable. The aliases
-# (/re, /mani) are left out, so the palette lists each command once.
+# Commands offered in the palette: only those that are safe to send bare, since picking one
+# sends it at once. /export qualifies, its title being optional and the export harmless; a bare
+# /regenerate would write over a reply before the user could add the argument they meant, and
+# /manipulate or /import could only fail. Those are typed, and /help describes them.
 BOT_COMMANDS = [
     ('ping', 'Test bot connectivity'),
-    ('help', 'Show available models and usage'),
-    ('regenerate', 'Answer the replied-to prompt again'),
+    ('help', 'Show available models and commands'),
     ('abort', 'Stop whatever is generating in this chat'),
     ('navigate', 'List the turns of the replied-to thread'),
-    ('export', 'Save the replied-to thread as JSON'),
     ('linearize', 'Delete every branch except the line to the replied message'),
-    ('manipulate', 'Rewrite the replied-to bot reply'),
-    ('import', 'Replay a conversation from a JSON export'),
+    ('export', 'Save the replied-to thread as JSON'),
 ]
 
 LINEARIZE_USAGE = """[!] `/linearize` prunes a thread, so it has to reply to a message in one.
@@ -476,64 +480,69 @@ class ChatGPTTelegramBot:
 
         return history[::-1], model_of_history, system_prompt
 
-    def _build_help_text(self, error: str | None = None) -> str:
-        lines: list[str] = []
+    def _build_help_sections(self, error: str | None = None) -> list[str]:
+        """The help page as HTML sections, which `help_handler` packs into as few messages as fit."""
+        models: list[str] = []
         if error:
-            lines.append(f'⚠️ {error}\n')
-        lines.append('<b>Models</b>')
+            models.append(f'⚠️ {error}\n')
+        models.append('<b>Models</b>')
         for m in self.models:
             flags = ', '.join(self._model_flags(m))
             suffix = f' ({flags})' if flags else ''
-            lines.append(f'  <code>{m.prefix}</code> → <code>{m.name}</code>{suffix}')
-        lines.append('')
-        lines.append('<b>Usage</b>')
-        lines.append('  <code>&lt;prefix&gt; &lt;message&gt;</code>')
-        lines.append('  <code>&lt;prefix&gt;,t &lt;message&gt;</code>  — enable thinking')
-        lines.append('  <code>&lt;prefix&gt;,t=high &lt;message&gt;</code>  — set thinking effort')
-        lines.append('  <code>&lt;prefix&gt;,t= &lt;message&gt;</code>  — disable thinking')
-        lines.append('  <code>&lt;prefix&gt;,s &lt;message&gt;</code>  — enable search')
-        lines.append('  <code>&lt;prefix&gt;,r &lt;message&gt;</code>  — let Telegram render the markdown')
-        lines.append('  <code>&lt;prefix&gt;,r= &lt;message&gt;</code>  — render to entities instead')
-        lines.append('  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt')
-        lines.append('  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt')
-        lines.append('  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt')
-        lines.append('')
-        lines.append('<b>Import</b>')
-        lines.append('  Attach an exported conversation as JSON, or reply to one:')
-        lines.append('  <code>/import</code> or <code>/import &lt;prefix&gt;</code>')
-        lines.append('  Each turn becomes a message you can reply to to continue from there.')
-        lines.append('')
-        lines.append('<b>Regeneration</b>')
-        lines.append('  Reply to a bot message with (<code>/re</code> for short):')
-        lines.append('  <code>/regenerate</code>  — same prompt and model')
-        lines.append('  <code>/regenerate &lt;prefix&gt;</code>  — another model')
-        lines.append('  <code>/regenerate &lt;new prompt&gt;</code>  — another prompt')
-        lines.append('  <code>/regenerate &lt;prefix&gt; &lt;new prompt&gt;</code>  — another prompt too')
-        lines.append('  The reply is written over in place.')
-        lines.append('  <code>/abort</code> stops whatever is generating in this chat.')
-        lines.append('  <code>/navigate</code> lists the turns of the replied-to thread.')
-        lines.append('  <code>/export [title]</code> saves it as JSON that <code>/import</code> reads.')
-        lines.append('  <code>/linearize</code> deletes every other branch, after confirmation.')
-        lines.append('')
-        lines.append('<b>Manipulation</b>')
-        lines.append('  Reply to a bot message with (<code>/mani</code> for short):')
-        lines.append('  <code>/manipulate &lt;text&gt;</code>')
-        lines.append('  <code>/manipulate &lt;think&gt;cot&lt;/think&gt; &lt;text&gt;</code>')
-        lines.append('  The stored reply becomes yours, and later turns build on it.')
-        lines.append('')
-        lines.append('Reply to a bot message to continue the conversation.')
-        lines.append('A prefix on that reply switches the model from there on.')
-        lines.append('')
-        lines.append(f'<b>Default system prompt</b>\n<code>{html_escape(self.system_prompt)}</code>')
-        lines.append('')
-        lines.append('Formatting guidance is appended to it, depending on <code>richtext</code>:')
-        lines.append(f'  on → <code>{html_escape(RICHTEXT_PROMPT_APPEND)}</code>')
-        lines.append(f'  off → <code>{html_escape(ENTITY_PROMPT_APPEND)}</code>')
-        return '\n'.join(lines)
+            models.append(f'  <code>{m.prefix}</code> → <code>{m.name}</code>{suffix}')
+
+        usage = [
+            '<b>Usage</b>',
+            '  <code>&lt;prefix&gt; &lt;message&gt;</code>  — start a conversation',
+            '  <code>&lt;prefix&gt;,t &lt;message&gt;</code>  — enable thinking',
+            '  <code>&lt;prefix&gt;,t=high &lt;message&gt;</code>  — set thinking effort',
+            '  <code>&lt;prefix&gt;,t= &lt;message&gt;</code>  — disable thinking',
+            '  <code>&lt;prefix&gt;,s &lt;message&gt;</code>  — enable search',
+            '  <code>&lt;prefix&gt;,r &lt;message&gt;</code>  — let Telegram render the markdown',
+            '  <code>&lt;prefix&gt;,r= &lt;message&gt;</code>  — render to entities instead',
+            '  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt',
+            '  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt',
+            '  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt',
+            'Reply to a bot message to continue; reply to an older one to fork.',
+            'A prefix on a reply switches the model from there on.',
+        ]
+
+        commands = [
+            '<b>Commands</b>',
+            '  <code>/help</code>  — this page',
+            '  <code>/ping</code>  — chat id, and whether the bot answers here',
+            '  <code>/abort</code>  — stop whatever is generating in this chat',
+            'Sent as a reply to a message in a conversation:',
+            '  <code>/navigate</code>  — list its turns, one line each, paged',
+            '  <code>/linearize</code>  — delete every other branch, after confirming',
+            '  <code>/export [title]</code>  — save it as JSON that <code>/import</code> reads',
+            'Typed, not in the command menu, as they act on their arguments:',
+            '  <code>/regenerate [prefix] [new prompt]</code>, or <code>/re</code>',
+            '    Reply to a bot message to answer its prompt again, over the old reply.'
+            + ' A prefix switches the model and new text replaces the prompt;'
+            + ' a first word that is a prefix is read as one.',
+            '  <code>/manipulate &lt;text&gt;</code>, or <code>/mani</code>',
+            '    Reply to a bot message to rewrite what it said; later turns build on yours.'
+            + ' Lead with <code>&lt;think&gt;…&lt;/think&gt;</code> to supply its reasoning.',
+            '  <code>/import [prefix]</code>',
+            '    Attach an exported JSON file, or reply to one, to replay it as messages to reply to.'
+            + ' Without a prefix, the first reply chooses the model.',
+        ]
+
+        prompt = [
+            f'<b>Default system prompt</b>\n<code>{html_escape(self.system_prompt)}</code>',
+            '',
+            'Formatting guidance is appended to it, depending on <code>richtext</code>:',
+            f'  on → <code>{html_escape(RICHTEXT_PROMPT_APPEND)}</code>',
+            f'  off → <code>{html_escape(ENTITY_PROMPT_APPEND)}</code>',
+        ]
+        return ['\n'.join(section) for section in (models, usage, commands, prompt)]
 
     @only_allowed
     async def help_handler(self, message: Any, error: str | None = None) -> None:
-        _ = await self.send_message_html(message.chat_id, self._build_help_text(error), message.id)
+        reply_to = message.id
+        for text in pack_html_sections(self._build_help_sections(error), PLAIN_LENGTH_LIMIT):
+            reply_to = await self.send_message_html(message.chat_id, text, reply_to)
 
     @staticmethod
     def _sent_message_id(result: Any) -> int:

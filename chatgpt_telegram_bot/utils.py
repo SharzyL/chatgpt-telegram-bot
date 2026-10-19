@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import diskcache
 from loguru import logger
 from telethon import errors
+from telethon.extensions import html as telethon_html
 
 from chatgpt_telegram_bot.models import (
     OVERRIDE_ALIASES,
@@ -489,6 +490,25 @@ def replied_message_id(message: Any) -> int | None:
 def telegram_len(s: str) -> int:
     """Length in UTF-16 code units, matching Telegram's counting."""
     return len(s.encode('utf-16-le')) // 2
+
+
+def pack_html_sections(sections: list[str], limit: int) -> list[str]:
+    """Join HTML sections, a blank line apart, into as few messages as fit under ``limit``.
+
+    Telegram's limit applies to the text left once the tags are parsed out, so that is what is
+    measured. Sections are never cut: one that is too long on its own gets a message to itself,
+    and its send fails as it would have unsplit.
+    """
+    messages: list[str] = []
+    for section in sections:
+        if messages:
+            joined = f'{messages[-1]}\n\n{section}'
+            text, _ = telethon_html.parse(joined)
+            if telegram_len(text) <= limit:
+                messages[-1] = joined
+                continue
+        messages.append(section)
+    return messages
 
 
 class PendingReplyManager:

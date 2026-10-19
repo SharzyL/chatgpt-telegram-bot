@@ -125,7 +125,7 @@ A first word that is a model prefix is read as one, so a new prompt that happens
 
 IMPORT_USAGE = """[!] `/import` needs an exported conversation as a JSON file, either attached to the command or replied to.
 
-`/import` — continue the imported chat with the first configured model
+`/import` — record no model; the first reply names one with a prefix
 `/import <prefix>` — continue it with that model, overrides allowed
 
 The file holds a `messages` array of `{role, content}` objects, alternating user and assistant."""

@@ -58,10 +58,14 @@ DUMMY_TOOL_RESULT = 'This tool does nothing. Answer the user directly.'
 # a model that calls the dummy tool anyway is told it did nothing and asked again, this many
 # requests in all before the turn gives up
 DUMMY_TOOL_ROUNDS = 3
-# only a name: every word of the definition lands in the model's context on every request, and
-# the name already says what the tool does. A description and empty parameters would add 23
-# tokens; the ~225 DeepSeek adds for having tools at all are not ours to trim.
-DUMMY_TOOL_RESPONSES: dict[str, Any] = {'type': 'function', 'name': DUMMY_TOOL_NAME}
+# every word of the definition lands in the model's context on every request, so it is a name
+# and a few words saying to leave it alone, with no parameters; the ~225 tokens DeepSeek adds
+# for having tools at all are not ours to trim
+DUMMY_TOOL_RESPONSES: dict[str, Any] = {
+    'type': 'function',
+    'name': DUMMY_TOOL_NAME,
+    'description': 'For testing, ignore.',
+}
 _DUMMY_TOOL_LOOP_ERROR = '\n\n[!] Error: the model kept calling the dummy tool'
 
 

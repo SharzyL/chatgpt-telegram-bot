@@ -1435,9 +1435,21 @@ class ChatGPTTelegramBot:
             usage['TPS'] = f'{out_tokens / (end - first_token):.1f}'
 
     def _store_reply(
-        self, chat_id: int, prompt_id: int, model: Model, part_ids: list[int], reply: str, carry: list[dict[str, Any]]
+        self,
+        chat_id: int,
+        prompt_id: int,
+        model: Model,
+        part_ids: list[int],
+        reply: str,
+        carry: list[dict[str, Any]],
+        dropped: list[int],
     ) -> None:
-        """Record a finished reply under every message it occupies, with what it carries forward."""
+        """Record a finished reply under every message it occupies, with what it carries forward.
+
+        *dropped* are the parts of the reply it replaced that it no longer needs. Their messages
+        are gone, but a later turn may have replied to one of them, and its history passes
+        through that row, so it is written over too rather than left holding the old answer.
+        """
         # reasoning first: replaying it requires the order the provider emitted
         parts: list[MsgPartInHistory] = []
         for item in carry:
@@ -1456,7 +1468,7 @@ class ChatGPTTelegramBot:
         info = MsgInfo(
             sent_by_bot=True, message=parts, reply_id=prompt_id, prefix=None, system_prompt=None, part_ids=part_ids
         )
-        for mid in part_ids:
+        for mid in (*part_ids, *dropped):
             self.set_msg_info(chat_id, mid, info)
 
     async def _generate(self, chat_id: int, msg_id: int, adopt: list[int] | None = None) -> None:
@@ -1517,7 +1529,8 @@ class ChatGPTTelegramBot:
                     await replymsgs.update(final, bool(thinking))
                     await replymsgs.finalize()
                     part_ids = [bot_msg_id for bot_msg_id, _ in replymsgs.replied_msgs]
-                    self._store_reply(chat_id, msg_id, model, part_ids, reply, stream_meta.carry_items)
+                    dropped = [mid for mid in adopt or [] if mid not in part_ids]
+                    self._store_reply(chat_id, msg_id, model, part_ids, reply, stream_meta.carry_items, dropped)
                     return
 
                 # handling completion errors

@@ -350,6 +350,17 @@ def test_a_shorter_answer_deletes_the_surplus_and_records_only_what_is_left(monk
     assert rows[REPLY_IDS[0]].message[-1].text == 'a short answer'
 
 
+def test_a_later_turn_on_a_deleted_part_continues_from_the_new_answer(monkeypatch: pytest.MonkeyPatch):
+    # the thread went on from the last part of the old answer, which the shorter one deletes
+    bot, _ = _regenerate_for_real(monkeypatch, REPLY_IDS, 'a short answer')
+    later = 900
+    bot.set_msg_info(CHAT, later, MsgInfo(False, [make_text_part('and then?')], REPLY_IDS[-1], None, None))
+    history, _, _ = bot.construct_chat_history(CHAT, later)
+    assert [parts[-1].text for parts in history] == ['the original prompt', 'a short answer', 'and then?']
+    # navigating from there jumps to the part that still exists
+    assert bot.get_msg_info(CHAT, REPLY_IDS[-1]).part_ids == [REPLY_IDS[0]]
+
+
 def test_a_second_regenerate_of_the_same_reply_is_refused():
     bot = _bot()
     bot.generating[(CHAT, PROMPT_ID)] = False

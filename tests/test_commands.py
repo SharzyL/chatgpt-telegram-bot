@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
-from chatgpt_telegram_bot.utils import is_foreign_command, parse_command
+from chatgpt_telegram_bot.commands import is_foreign_command, parse_command
 
 ME = 'my_bot'
 

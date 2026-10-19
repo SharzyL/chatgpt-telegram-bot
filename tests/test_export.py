@@ -17,7 +17,8 @@ from chatgpt_telegram_bot.models import (
     make_text_part,
     make_thinking_text_part,
 )
-from chatgpt_telegram_bot.utils import PendingReplyManager, export_filename, format_export, parse_import
+from chatgpt_telegram_bot.transfer import export_filename, format_export, parse_import
+from chatgpt_telegram_bot.utils import PendingReplyManager
 
 CHAT = -1001234567890
 WHEN = datetime.datetime(2026, 1, 2, 3, 4, 5, 678000, tzinfo=datetime.UTC)

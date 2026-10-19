@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from chatgpt_telegram_bot.models import Model
-from chatgpt_telegram_bot.utils import (
+from chatgpt_telegram_bot.commands import (
     apply_overrides,
     find_delimiter_outside_brackets,
     match_prefix,
     parse_overrides,
     split_respecting_brackets,
 )
+from chatgpt_telegram_bot.models import Model
 
 # ---------------------------------------------------------------------------
 # split_respecting_brackets

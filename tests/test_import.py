@@ -10,7 +10,7 @@ import pytest
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
 from chatgpt_telegram_bot.models import Model, MsgInfo, make_text_part
-from chatgpt_telegram_bot.utils import parse_import
+from chatgpt_telegram_bot.transfer import parse_import
 
 TWO_TURNS: dict[str, Any] = {
     'title': 'A chat',

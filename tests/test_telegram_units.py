@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from chatgpt_telegram_bot.utils import telegram_len, telegram_truncate
+from chatgpt_telegram_bot.markdown import telegram_len, telegram_truncate
 
 
 def test_len_counts_astral_as_two():

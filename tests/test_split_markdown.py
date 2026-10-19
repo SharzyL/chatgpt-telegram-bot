@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from chatgpt_telegram_bot.utils import balance_fences, split_markdown, telegram_len
+from chatgpt_telegram_bot.markdown import balance_fences, split_markdown, telegram_len
 
 
 def test_short_text_is_one_part():

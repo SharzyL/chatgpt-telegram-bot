@@ -18,14 +18,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, override
 
-from chatgpt_telegram_bot.richtext import RichText
-from chatgpt_telegram_bot.utils import (
+from chatgpt_telegram_bot.markdown import (
     neutralize_images,
     split_markdown,
     telegram_len,
     telegram_truncate,
     utf16_prefix,
 )
+from chatgpt_telegram_bot.richtext import RichText
 
 # a plain message body, and the `message` field of a rich one, are capped here
 PLAIN_LENGTH_LIMIT = 4096

@@ -248,8 +248,8 @@ class FakeBot:
 
 
 def _flush(adopt: list[int], text: str) -> list[tuple[str, int]]:
-    from chatgpt_telegram_bot.bot import BotReplyMessages
     from chatgpt_telegram_bot.render import ENTITY_RENDERER
+    from chatgpt_telegram_bot.reply_messages import BotReplyMessages
 
     fake = FakeBot()
 

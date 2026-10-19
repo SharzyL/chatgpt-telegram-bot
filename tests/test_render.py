@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from chatgpt_telegram_bot.markdown import telegram_len
 from chatgpt_telegram_bot.render import (
     ENTITY_RENDERER,
     PLAIN_LENGTH_LIMIT,
@@ -11,7 +12,6 @@ from chatgpt_telegram_bot.render import (
     Rendered,
 )
 from chatgpt_telegram_bot.reply import format_reply
-from chatgpt_telegram_bot.utils import telegram_len
 
 PREFIX = '🤖 `gpt`\n\n'
 

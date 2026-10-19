@@ -7,9 +7,7 @@ import time
 import tomllib
 import traceback
 from collections.abc import Sequence
-from html import escape as html_escape
-from types import TracebackType
-from typing import Any, Self
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -19,7 +17,17 @@ from loguru import logger
 from telethon import Button, TelegramClient, errors, events, functions, types
 from telethon.tl.custom import Message
 
+from chatgpt_telegram_bot.commands import (
+    COMMANDS_WITHOUT_BODY,
+    apply_overrides,
+    is_foreign_command,
+    match_prefix,
+    parse_chat_spec,
+    parse_command,
+    parse_manipulation,
+)
 from chatgpt_telegram_bot.completion import completion, reasoning_text_of, thinking_text_of
+from chatgpt_telegram_bot.markdown import preview_line
 from chatgpt_telegram_bot.models import (
     EndPoint,
     Model,
@@ -49,117 +57,37 @@ from chatgpt_telegram_bot.reply import (
     format_navigation_page,
     format_reply,
 )
+from chatgpt_telegram_bot.reply_messages import BotReplyMessages
+from chatgpt_telegram_bot.texts import (
+    BOT_COMMANDS,
+    CHAT_USAGE,
+    ENTITY_PROMPT_APPEND,
+    EXPORT_USAGE,
+    IMPORT_USAGE,
+    LINEARIZE_USAGE,
+    MANIPULATE_USAGE,
+    NAVIGATE_USAGE,
+    NO_STORED_TEXT,
+    REGENERATE_USAGE,
+    RICHTEXT_PROMPT_APPEND,
+    help_sections,
+)
+from chatgpt_telegram_bot.throttle import Throttle
+from chatgpt_telegram_bot.transfer import export_filename, format_export, parse_import
 from chatgpt_telegram_bot.utils import (
-    COMMANDS_WITHOUT_BODY,
     PendingReplyManager,
-    Throttle,
-    apply_overrides,
     decode_text_file,
-    export_filename,
-    format_export,
-    is_foreign_command,
     linearize_plan,
     load_photo,
-    match_prefix,
     message_link,
     pack_html_sections,
-    parse_chat_spec,
-    parse_command,
-    parse_import,
-    parse_manipulation,
     parse_proxy,
     plan_digest,
-    preview_line,
     replace_text_part,
     replied_message_id,
     retry,
     save_photo,
 )
-
-# Formatting guidance depends on which renderer the reply goes through, so it is appended to
-# the default system prompt rather than baked into it. A custom prompt (`,[…]`) is left exactly
-# as the user wrote it.
-RICHTEXT_PROMPT_APPEND = (
-    'Format the reply in Markdown; headings, tables, horizontal rules and LaTeX math all render.'
-    + ' Delimit math with $...$ inline and $$...$$ on its own line.'
-)
-ENTITY_PROMPT_APPEND = (
-    'Format the reply in Markdown, but do not use tables or LaTeX math: they do not render and'
-    + ' would reach the user as raw source. Bold, italic, strikethrough, inline code, code blocks,'
-    + ' links, blockquotes and lists all render.'
-)
-
-
-# Commands offered in the palette: only those that are safe to send bare, since picking one
-# sends it at once. /export qualifies, its title being optional and the export harmless; a bare
-# /regenerate would write over a reply before the user could add the argument they meant, and
-# /manipulate or /import could only fail. Those are typed, and /help describes them.
-BOT_COMMANDS = [
-    ('ping', 'Test bot connectivity'),
-    ('help', 'Show usage and commands'),
-    ('models', 'List the models and their prefixes'),
-    ('abort', 'Stop whatever is generating in this chat'),
-    ('navigate', 'List the turns of the replied-to thread'),
-    ('linearize', 'Delete every branch except the line to the replied message'),
-    ('export', 'Save the replied-to thread as JSON'),
-]
-
-LINEARIZE_USAGE = """[!] `/linearize` prunes a thread, so it has to reply to a message in one.
-
-It deletes every branch that grew from the same first message, keeping only the line down to the replied message — so anything after that message goes too. You confirm the list first."""
-
-EXPORT_USAGE = """[!] `/export` saves a thread as JSON, so it has to reply to a message in one.
-
-`/export` — titled after the first prompt
-`/export <title>` — with that title
-
-The file is in the format `/import` reads. Reply to a bot message to include its answer."""
-
-NAVIGATE_USAGE = """[!] `/navigate` lists the turns of a thread, so it has to reply to a message in one.
-
-Reply to a bot message to include its answer; the listing opens on the last page."""
-
-REGENERATE_USAGE = """[!] `/regenerate` answers a prompt again in place, so it has to reply to a bot message:
-
-`/regenerate` — the same prompt and model
-`/regenerate <prefix>` — the same prompt, another model
-`/regenerate <new prompt>` — another prompt, the same model
-`/regenerate <prefix> <new prompt>` — both
-`/regenerate <endpoint>/<model>[,flags] [new prompt]` — a model not in /models, as /chat names it
-
-`/re` is short for `/regenerate`.
-
-A first word that is a model prefix is read as one, so a new prompt that happens to start with a prefix needs the model named in front of it."""
-
-IMPORT_USAGE = """[!] `/import` needs an exported conversation as a JSON file, either attached to the command or replied to.
-
-`/import` — record no model; the first reply names one with a prefix
-`/import <prefix>` — continue it with that model, overrides allowed
-
-The file holds a `messages` array of `{role, content}` objects, alternating user and assistant."""
-
-MANIPULATE_USAGE = """[!] `/manipulate` rewrites a bot reply, so it has to reply to one:
-
-`/manipulate <text>`
-
-or, to supply a chain of thought too:
-
-`/manipulate <think>your cot</think> <text>`
-
-`/mani` is short for `/manipulate`."""
-
-
-NO_STORED_TEXT = '[!] No stored conversation for that message'
-
-CHAT_USAGE = """[!] `/chat` starts a new conversation with the model you name:
-
-`/chat <prefix>[,flags] <message>`
-
-or, for a model not in /models:
-
-`/chat <endpoint>/<model>[,suffix=<path>][,api_type=<type>][,flags] <message>`
-
-Sent as a reply, it brings in the media of the message replied to but always starts afresh."""
 
 
 class ChatGPTTelegramBot:
@@ -543,70 +471,10 @@ class ChatGPTTelegramBot:
         lines.append(f'\nEndpoints, for <code>/chat &lt;endpoint&gt;/&lt;model&gt;</code>: {endpoints}')
         return '\n'.join(lines)
 
-    def _build_help_sections(self) -> list[str]:
-        """The help page as HTML sections, which `help_handler` packs into as few messages as fit."""
-        usage = [
-            '<b>Usage</b>  — <code>/models</code> lists the prefixes',
-            '  <code>&lt;prefix&gt; &lt;message&gt;</code>  — start a conversation',
-            '  <code>&lt;prefix&gt;,t &lt;message&gt;</code>  — enable thinking',
-            '  <code>&lt;prefix&gt;,t=high &lt;message&gt;</code>  — set thinking effort',
-            '  <code>&lt;prefix&gt;,t= &lt;message&gt;</code>  — disable thinking',
-            '  <code>&lt;prefix&gt;,s &lt;message&gt;</code>  — enable search',
-            '  <code>&lt;prefix&gt;,r &lt;message&gt;</code>  — let Telegram render the markdown',
-            '  <code>&lt;prefix&gt;,r= &lt;message&gt;</code>  — render to entities instead',
-            '  <code>&lt;prefix&gt;,dt &lt;message&gt;</code>  — dummy tool: pass earlier thinking back (DeepSeek)',
-            '  <code>&lt;prefix&gt;,[custom prompt] &lt;message&gt;</code>  — custom system prompt',
-            '  <code>&lt;prefix&gt;,+[extra prompt] &lt;message&gt;</code>  — append to default prompt',
-            '  <code>&lt;prefix&gt;,[] &lt;message&gt;</code>  — clear system prompt',
-            '  <code>&lt;prefix&gt;,suffix=/v1 &lt;message&gt;</code>  — another path on the endpoint',
-            '  <code>&lt;prefix&gt;,api_type=openai_legacy &lt;message&gt;</code>  — another API'
-            + ' (<code>openai</code>, <code>openai_legacy</code>, <code>anthropic</code>)',
-            'Reply to a bot message to continue; reply to an older one to fork.',
-            'Reply to a photo or file with a prefix to talk about it.',
-            'A prefix on a reply switches the model from there on.',
-        ]
-
-        commands = [
-            '<b>Commands</b>',
-            '  <code>/help</code>  — this page',
-            '  <code>/models</code>  — the models and their prefixes',
-            '  <code>/ping</code>  — chat id, and whether the bot answers here',
-            '  <code>/abort</code>  — stop whatever is generating in this chat',
-            'Sent as a reply to a message in a conversation:',
-            '  <code>/navigate</code>  — list its turns, one line each, paged',
-            '  <code>/linearize</code>  — delete every other branch, after confirming',
-            '  <code>/export [title]</code>  — save it as JSON that <code>/import</code> reads',
-            'Typed, not in the command menu, as they act on their arguments:',
-            '  <code>/chat &lt;prefix&gt;[,flags] &lt;message&gt;</code>',
-            '  <code>/chat &lt;endpoint&gt;/&lt;model&gt;[,flags] &lt;message&gt;</code>',
-            '    Start a new conversation, with any model an endpoint serves, configured or not.'
-            + " As a reply it takes the media replied to, a bot reply's included, and never continues a thread.",
-            '  <code>/regenerate [prefix] [new prompt]</code>, or <code>/re</code>',
-            '    Reply to a bot message to answer its prompt again, over the old reply.'
-            + ' A prefix, or <code>&lt;endpoint&gt;/&lt;model&gt;</code> as in <code>/chat</code>,'
-            + ' switches the model and new text replaces the prompt;'
-            + ' a first word that is either is read as one.',
-            '  <code>/manipulate &lt;text&gt;</code>, or <code>/mani</code>',
-            '    Reply to a bot message to rewrite what it said; later turns build on yours.'
-            + ' Lead with <code>&lt;think&gt;…&lt;/think&gt;</code> to supply its reasoning, sent under dt.',
-            '  <code>/import [prefix]</code>',
-            '    Attach an exported JSON file, or reply to one, to replay it as messages to reply to.'
-            + ' Without a prefix, the first reply chooses the model.',
-        ]
-
-        prompt = [
-            f'<b>Default system prompt</b>\n<code>{html_escape(self.system_prompt)}</code>',
-            '',
-            'Formatting guidance is appended to it, depending on <code>richtext</code>:',
-            f'  on → <code>{html_escape(RICHTEXT_PROMPT_APPEND)}</code>',
-            f'  off → <code>{html_escape(ENTITY_PROMPT_APPEND)}</code>',
-        ]
-        return ['\n'.join(section) for section in (usage, commands, prompt)]
-
     @only_allowed
     async def help_handler(self, message: Any) -> None:
         reply_to = message.id
-        for text in pack_html_sections(self._build_help_sections(), PLAIN_LENGTH_LIMIT):
+        for text in pack_html_sections(help_sections(self.system_prompt), PLAIN_LENGTH_LIMIT):
             reply_to = await self.send_message_html(message.chat_id, text, reply_to)
 
     @only_allowed
@@ -1676,88 +1544,3 @@ is_allowed={self.is_allowed(message.chat_id)}
 """,
             message.id,
         )
-
-
-class BotReplyMessages:
-    def __init__(
-        self,
-        cbot: ChatGPTTelegramBot,
-        chat_id: int,
-        orig_msg_id: int,
-        prefix: str,
-        renderer: Renderer,
-        adopt: list[int] | None = None,
-    ) -> None:
-        self.cbot: ChatGPTTelegramBot = cbot
-        self.prefix: str = prefix
-        self.renderer: Renderer = renderer
-        self.chat_id: int = chat_id
-        self.orig_msg_id: int = orig_msg_id
-        # messages a regeneration writes over: seeding them as already-sent parts makes
-        # `_apply` edit them, and delete the ones a shorter reply no longer needs. Their
-        # recorded text is empty so the first flush always counts as a change.
-        self.replied_msgs: list[tuple[int, Rendered]] = [(mid, Rendered(text='')) for mid in adopt or []]
-        for mid in adopt or []:
-            cbot.pending_reply_manager.add((chat_id, mid))
-        self.text: str = ''
-        self.collapse_first_quote: bool = False
-        self.throttle: Throttle = Throttle(
-            cbot.TELEGRAM_MIN_INTERVAL, cbot.TELEGRAM_BURST_INTERVAL, cbot.TELEGRAM_BURST_WINDOW
-        )
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(
-        self, type_: type[BaseException] | None, value: BaseException | None, tb: TracebackType | None
-    ) -> None:
-        await self.finalize()
-        for msg_id, _ in self.replied_msgs:
-            self.cbot.pending_reply_manager.remove((self.chat_id, msg_id))
-
-    async def _force_update(self, text: str) -> None:
-        # how the reply is cut, and how long a part may be, are the renderer's business
-        try:
-            await self._apply(self.renderer.render(text, self.prefix, self.collapse_first_quote))
-        except errors.BadRequestError as e:
-            # the server renderer rejects constructs it cannot lay out (an image with no
-            # media, an unsupported block); rendering to entities instead keeps the reply
-            if self.renderer is ENTITY_RENDERER or 'RICH_MESSAGE' not in str(e):
-                raise
-            logger.warning(f'Rich rendering rejected, falling back to entities ({self.chat_id=}): {e}')
-            self.renderer = ENTITY_RENDERER
-            await self._apply(self.renderer.render(text, self.prefix, self.collapse_first_quote))
-
-    async def _apply(self, bodies: list[Rendered]) -> None:
-        for i in range(min(len(bodies), len(self.replied_msgs))):
-            msg_id, previous = self.replied_msgs[i]
-            if bodies[i] != previous:
-                await self.cbot.edit_message(self.chat_id, bodies[i], msg_id)
-                self.replied_msgs[i] = (msg_id, bodies[i])
-        if len(bodies) > len(self.replied_msgs):
-            for i in range(len(self.replied_msgs), len(bodies)):
-                if i == 0:
-                    reply_to = self.orig_msg_id
-                else:
-                    reply_to, _ = self.replied_msgs[i - 1]
-                msg_id = await self.cbot.send_message(self.chat_id, bodies[i], reply_to)
-                self.replied_msgs.append((msg_id, bodies[i]))
-                self.cbot.pending_reply_manager.add((self.chat_id, msg_id))
-        if len(self.replied_msgs) > len(bodies):
-            for i in range(len(bodies), len(self.replied_msgs)):
-                msg_id, _ = self.replied_msgs[i]
-                await self.cbot.delete_message(self.chat_id, msg_id)
-                self.cbot.pending_reply_manager.remove((self.chat_id, msg_id))
-            self.replied_msgs = self.replied_msgs[: len(bodies)]
-
-    async def update(self, text: str, collapse_first_quote: bool = False) -> None:
-        self.text = text
-        self.collapse_first_quote = collapse_first_quote
-        if self.throttle.take(time.time()):
-            await self._force_update(self.text)
-            # timed from the end of the flush: one tick can edit several messages when a
-            # cut shifts, and starting the clock before that would shorten the next gap
-            self.throttle.flushed(time.time())
-
-    async def finalize(self) -> None:
-        await self._force_update(self.text)

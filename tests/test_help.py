@@ -4,15 +4,12 @@ from typing import Any
 
 from telethon.extensions import html
 
-from chatgpt_telegram_bot.bot import BOT_COMMANDS, ChatGPTTelegramBot
+from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
+from chatgpt_telegram_bot.commands import COMMAND_ALIASES, COMMANDS_WITH_BODY, COMMANDS_WITHOUT_BODY
+from chatgpt_telegram_bot.markdown import telegram_len
 from chatgpt_telegram_bot.models import EndPoint, Model
-from chatgpt_telegram_bot.utils import (
-    COMMAND_ALIASES,
-    COMMANDS_WITH_BODY,
-    COMMANDS_WITHOUT_BODY,
-    pack_html_sections,
-    telegram_len,
-)
+from chatgpt_telegram_bot.texts import BOT_COMMANDS, help_sections
+from chatgpt_telegram_bot.utils import pack_html_sections
 
 
 def _bot() -> Any:
@@ -25,7 +22,7 @@ def _bot() -> Any:
 
 
 def _help_text() -> str:
-    return '\n\n'.join(html.parse(s)[0] for s in _bot()._build_help_sections())
+    return '\n\n'.join(html.parse(s)[0] for s in help_sections(_bot().system_prompt))
 
 
 def test_the_palette_offers_only_commands_safe_to_send_bare():

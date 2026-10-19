@@ -2,7 +2,7 @@ from itertools import pairwise
 
 import pytest
 
-from chatgpt_telegram_bot.utils import Throttle
+from chatgpt_telegram_bot.throttle import Throttle
 
 
 def schedule(duration: float, tick: float = 0.05) -> list[float]:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from chatgpt_telegram_bot.utils import normalize_math
+from chatgpt_telegram_bot.markdown import normalize_math
 
 
 def test_inline_paren_becomes_dollar():

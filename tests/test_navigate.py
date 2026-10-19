@@ -8,9 +8,10 @@ from telethon import errors
 from telethon.tl.types import MessageReplyHeader
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
+from chatgpt_telegram_bot.markdown import preview_line
 from chatgpt_telegram_bot.models import MsgInfo, ThreadTurn, make_image_part, make_text_part
 from chatgpt_telegram_bot.reply import format_navigation_page
-from chatgpt_telegram_bot.utils import PendingReplyManager, message_link, preview_line
+from chatgpt_telegram_bot.utils import PendingReplyManager, message_link
 
 GROUP = -1001234567890
 PRIVATE = 629325599
@@ -322,7 +323,7 @@ def test_pressing_the_page_already_shown_is_not_an_error():
 
 @pytest.mark.parametrize('turns', [1, 8, 9, 64])
 def test_every_page_fits_in_one_message(turns: int):
-    from chatgpt_telegram_bot.utils import telegram_len
+    from chatgpt_telegram_bot.markdown import telegram_len
 
     bot = _bot()
     long_prompt = '很长的提问' * 40

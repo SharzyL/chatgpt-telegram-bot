@@ -6,6 +6,7 @@ from typing import Any, Self
 
 import pytest
 
+from chatgpt_telegram_bot.commands import apply_overrides
 from chatgpt_telegram_bot.completion import (
     DUMMY_TOOL_NAME,
     DUMMY_TOOL_RESPONSES,
@@ -24,7 +25,6 @@ from chatgpt_telegram_bot.models import (
     make_text_part,
     make_thinking_text_part,
 )
-from chatgpt_telegram_bot.utils import apply_overrides
 
 HISTORY: list[list[MsgPartInHistory]] = [
     [make_text_part('pick a number')],

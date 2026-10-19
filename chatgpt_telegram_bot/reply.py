@@ -2,8 +2,8 @@ from collections.abc import Callable
 from html import escape as html_escape
 from typing import Any
 
+from chatgpt_telegram_bot.markdown import balance_fences, normalize_math, preview_line
 from chatgpt_telegram_bot.models import MsgInfo, ThreadTurn, text_of
-from chatgpt_telegram_bot.utils import balance_fences, normalize_math, preview_line
 
 
 def _blockquote_markdown(text: str) -> str:

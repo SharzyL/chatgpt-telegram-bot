@@ -1,3 +1,4 @@
+from chatgpt_telegram_bot.commands import parse_manipulation
 from chatgpt_telegram_bot.completion import drop_thinking_text, thinking_text_of
 from chatgpt_telegram_bot.models import (
     MsgPartInHistory,
@@ -6,7 +7,6 @@ from chatgpt_telegram_bot.models import (
     make_text_part,
     make_thinking_text_part,
 )
-from chatgpt_telegram_bot.utils import parse_manipulation
 
 
 def test_plain_body_is_all_text():

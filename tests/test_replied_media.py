@@ -10,14 +10,9 @@ import pytest
 from telethon.tl.types import MessageReplyHeader
 
 from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
+from chatgpt_telegram_bot.commands import apply_overrides, parse_chat_spec, parse_command
 from chatgpt_telegram_bot.models import EndPoint, Model, MsgInfo, make_text_part
-from chatgpt_telegram_bot.utils import (
-    PendingReplyManager,
-    apply_overrides,
-    image_media_type,
-    parse_chat_spec,
-    parse_command,
-)
+from chatgpt_telegram_bot.utils import PendingReplyManager, image_media_type
 
 CHAT = -100
 BOT_ID = 7

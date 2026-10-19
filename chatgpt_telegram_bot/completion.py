@@ -9,6 +9,7 @@ import anthropic
 import openai
 from loguru import logger
 
+from chatgpt_telegram_bot.commands import THINKING_DEFAULTS
 from chatgpt_telegram_bot.models import (
     Model,
     MsgPartInHistory,
@@ -18,7 +19,7 @@ from chatgpt_telegram_bot.models import (
     StreamMeta,
     ThinkingDelta,
 )
-from chatgpt_telegram_bot.utils import THINKING_DEFAULTS, image_media_type
+from chatgpt_telegram_bot.utils import image_media_type
 
 LoadImage = Callable[[str], Awaitable[bytes | None]]
 # a backend's shape for a text part (role, text) and an image part (media type, base64 data)

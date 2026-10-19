@@ -94,7 +94,8 @@ ENTITY_PROMPT_APPEND = (
 # /manipulate or /import could only fail. Those are typed, and /help describes them.
 BOT_COMMANDS = [
     ('ping', 'Test bot connectivity'),
-    ('help', 'Show available models and commands'),
+    ('help', 'Show usage and commands'),
+    ('models', 'List the models and their prefixes'),
     ('abort', 'Stop whatever is generating in this chat'),
     ('navigate', 'List the turns of the replied-to thread'),
     ('linearize', 'Delete every branch except the line to the replied message'),
@@ -313,6 +314,8 @@ class ChatGPTTelegramBot:
                 await self.ping(event.message)
             elif name == 'help':
                 await self.help_handler(event.message)
+            elif name == 'models':
+                await self.models_handler(event.message)
             elif name == 'manipulate':
                 await self.manipulate_handler(event.message, body)
             elif name == 'import':
@@ -482,19 +485,19 @@ class ChatGPTTelegramBot:
 
         return history[::-1], model_of_history, system_prompt
 
-    def _build_help_sections(self, error: str | None = None) -> list[str]:
-        """The help page as HTML sections, which `help_handler` packs into as few messages as fit."""
-        models: list[str] = []
-        if error:
-            models.append(f'⚠️ {error}\n')
-        models.append('<b>Models</b>')
+    def _build_models_text(self) -> str:
+        """The /models page: every prefix, the model behind it and what it overrides."""
+        lines = ['<b>Models</b>  — start a message with a prefix to talk to one']
         for m in self.models:
             flags = ', '.join(self._model_flags(m))
             suffix = f' ({flags})' if flags else ''
-            models.append(f'  <code>{m.prefix}</code> → <code>{m.name}</code>{suffix}')
+            lines.append(f'  <code>{m.prefix}</code> → <code>{m.name}</code>{suffix}')
+        return '\n'.join(lines)
 
+    def _build_help_sections(self) -> list[str]:
+        """The help page as HTML sections, which `help_handler` packs into as few messages as fit."""
         usage = [
-            '<b>Usage</b>',
+            '<b>Usage</b>  — <code>/models</code> lists the prefixes',
             '  <code>&lt;prefix&gt; &lt;message&gt;</code>  — start a conversation',
             '  <code>&lt;prefix&gt;,t &lt;message&gt;</code>  — enable thinking',
             '  <code>&lt;prefix&gt;,t=high &lt;message&gt;</code>  — set thinking effort',
@@ -513,6 +516,7 @@ class ChatGPTTelegramBot:
         commands = [
             '<b>Commands</b>',
             '  <code>/help</code>  — this page',
+            '  <code>/models</code>  — the models and their prefixes',
             '  <code>/ping</code>  — chat id, and whether the bot answers here',
             '  <code>/abort</code>  — stop whatever is generating in this chat',
             'Sent as a reply to a message in a conversation:',
@@ -539,13 +543,25 @@ class ChatGPTTelegramBot:
             f'  on → <code>{html_escape(RICHTEXT_PROMPT_APPEND)}</code>',
             f'  off → <code>{html_escape(ENTITY_PROMPT_APPEND)}</code>',
         ]
-        return ['\n'.join(section) for section in (models, usage, commands, prompt)]
+        return ['\n'.join(section) for section in (usage, commands, prompt)]
 
     @only_allowed
-    async def help_handler(self, message: Any, error: str | None = None) -> None:
+    async def help_handler(self, message: Any) -> None:
         reply_to = message.id
-        for text in pack_html_sections(self._build_help_sections(error), PLAIN_LENGTH_LIMIT):
+        for text in pack_html_sections(self._build_help_sections(), PLAIN_LENGTH_LIMIT):
             reply_to = await self.send_message_html(message.chat_id, text, reply_to)
+
+    @only_allowed
+    async def models_handler(self, message: Any) -> None:
+        _ = await self.send_message_html(message.chat_id, self._build_models_text(), message.id)
+
+    def _no_prefix_text(self) -> str:
+        """The short answer to a message that opens a thread without naming a model."""
+        example = self.models[0].prefix if self.models else 'prefix'
+        return (
+            f'[!] Start a conversation with a model prefix, such as `{example} hello`.'
+            + ' /models lists the prefixes; /help covers the rest.'
+        )
 
     @staticmethod
     def _sent_message_id(result: Any) -> int:
@@ -1347,8 +1363,8 @@ class ChatGPTTelegramBot:
                 break
         else:  # no matching prefix
             if reply_to_id is None:
-                if chat_id == sender_id:  # in private chat, show help with error
-                    await self.help_handler(first, error='Unknown prefix. Use one of the prefixes below.')
+                if chat_id == sender_id:  # in private chat, point at /models and /help
+                    _ = await self.send_message(chat_id, self._no_prefix_text(), msg_id)
                 return
             # continuing a thread: model and prompt carry over from the message replied to
 

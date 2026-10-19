@@ -1,3 +1,5 @@
+import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 from telethon.extensions import html
@@ -36,6 +38,41 @@ def test_help_describes_every_command_and_alias():
     text = _help_text()
     for name in COMMANDS_WITH_BODY | COMMANDS_WITHOUT_BODY | COMMAND_ALIASES.keys():
         assert f'/{name}' in text, name
+
+
+def test_help_leaves_the_models_to_their_own_command():
+    text = _help_text()
+    assert 'gpt-test' not in text
+    assert '/models' in text
+
+
+def test_models_lists_every_prefix_and_flag():
+    bot = _bot()
+    bot.models = [Model(prefix='g', name='gpt-test'), Model(prefix='gs', name='gpt-test', search=True)]
+    text, _ = html.parse(bot._build_models_text())
+    assert 'g → gpt-test' in text
+    assert 'gs → gpt-test (search)' in text
+
+
+def test_a_message_without_a_prefix_gets_a_short_pointer():
+    bot = _bot()
+    bot.sent = []
+
+    async def send_message(_chat_id: int, body: str, _reply_to: int) -> None:
+        bot.sent.append(body)
+
+    async def run_completion(*_args: Any) -> None:
+        raise AssertionError('nothing to answer without a model')
+
+    bot.send_message = send_message
+    bot._run_completion = run_completion
+    bot.allowed_chats = {1}
+    message = SimpleNamespace(chat_id=1, sender_id=1, id=5, message='hello', photo=None, document=None, reply_to=None)
+    asyncio.run(bot.reply_handler(message))
+    assert len(bot.sent) == 1
+    assert bot.sent[0].startswith('[!] Start a conversation with a model prefix, such as `g hello`.')
+    assert '/models' in bot.sent[0]
+    assert '/help' in bot.sent[0]
 
 
 def test_sections_share_a_message_while_they_fit():

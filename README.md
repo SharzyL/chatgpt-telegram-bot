@@ -88,7 +88,8 @@ Commands (picking one from Telegram's command menu sends it at once, so the menu
 those safe to send bare; type `/regenerate`, `/manipulate` and `/import`, and see `/help` for
 all of them):
 
-- `/help` — the model list, the override syntax and the current system prompt
+- `/help` — the override syntax, the commands and the current system prompt
+- `/models` — every model prefix and the model behind it
 - `/ping` — chat id, user id, and whether the chat is allowed
 - `/manipulate <text>`, or `/manipulate <think>reasoning</think> <text>` — reply to a bot
   message with this to rewrite what it is recorded as having said. `/mani` is short for

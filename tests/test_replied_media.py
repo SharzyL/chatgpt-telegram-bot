@@ -92,12 +92,8 @@ def _bot(*neighbours: FakeMessage) -> Any:
         assert adopt is None
         bot.completions.append((chat_id, msg_id))
 
-    async def help_handler(_message: Any, error: str | None = None) -> None:
-        bot.sent.append(f'help: {error}')
-
     bot.send_message = send_message
     bot._run_completion = run_completion
-    bot.help_handler = help_handler
     return bot
 
 

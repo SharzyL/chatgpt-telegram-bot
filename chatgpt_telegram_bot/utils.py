@@ -184,7 +184,7 @@ def parse_manipulation(body: str) -> tuple[str | None, str]:
 
 # commands that read the rest of the message, and those that must be the whole of it
 COMMANDS_WITH_BODY = frozenset({'manipulate', 'import', 'regenerate', 'export'})
-COMMANDS_WITHOUT_BODY = frozenset({'ping', 'help', 'abort', 'navigate', 'linearize'})
+COMMANDS_WITHOUT_BODY = frozenset({'ping', 'help', 'models', 'abort', 'navigate', 'linearize'})
 # short spellings, read as the command they stand for
 COMMAND_ALIASES = {'re': 'regenerate', 'mani': 'manipulate'}
 

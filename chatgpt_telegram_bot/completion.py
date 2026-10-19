@@ -18,9 +18,15 @@ from chatgpt_telegram_bot.models import (
     StreamMeta,
     ThinkingDelta,
 )
-from chatgpt_telegram_bot.utils import image_media_type
+from chatgpt_telegram_bot.utils import THINKING_DEFAULTS, image_media_type
 
 LoadImage = Callable[[str], Awaitable[bytes | None]]
+# a backend's shape for a text part (role, text) and an image part (media type, base64 data)
+TextPart = Callable[[str, str], dict[str, Any]]
+ImagePart = Callable[[str, str], dict[str, Any]]
+
+# the history alternates, starting with the user
+ROLES = ('user', 'assistant')
 
 # Request features an endpoint has already rejected, keyed by (base url, model). Endpoints
 # implement the Responses API to different depths, and without this every turn would repeat
@@ -118,6 +124,44 @@ def read_reasoning_part(part: MsgPartInHistory, model_name: str) -> dict[str, An
     return item
 
 
+async def convert_history(
+    chat_history: list[list[MsgPartInHistory]], load_image: LoadImage, text_part: TextPart, image_part: ImagePart
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Each message's role and its text and images in a backend's shapes.
+
+    An image no longer in the cache is left out. Other part types are the caller's business.
+    """
+    messages: list[tuple[str, list[dict[str, Any]]]] = []
+    for i, msg_parts in enumerate(chat_history):
+        role = ROLES[i % len(ROLES)]
+        content: list[dict[str, Any]] = []
+        for part in msg_parts:
+            if part.type_ == 'text':
+                content.append(text_part(role, part.text or ''))
+            elif part.type_ == 'image':
+                assert part.hash is not None
+                blob = await load_image(part.hash)
+                if blob is not None:
+                    content.append(image_part(image_media_type(blob), base64.b64encode(blob).decode()))
+        messages.append((role, content))
+    return messages
+
+
+def as_message(role: str, content: list[dict[str, Any]]) -> dict[str, Any]:
+    """A message, its content a bare string when it is one text part.
+
+    That is the shape sent before images and reasoning replay existed, so untouched
+    conversations keep hitting the prompt cache.
+    """
+    if len(content) == 1 and 'text' in content[0]:
+        return {'role': role, 'content': content[0]['text']}
+    return {'role': role, 'content': content}
+
+
+def _data_url(media_type: str, data: str) -> str:
+    return f'data:{media_type};base64,{data}'
+
+
 async def build_input_openai(
     chat_history: list[list[MsgPartInHistory]],
     load_image: LoadImage,
@@ -133,39 +177,22 @@ async def build_input_openai(
     *dummy_tool* a stored plain chain of thought goes the same way, as a
     `reasoning_text_item()`.
     """
+    converted = await convert_history(
+        chat_history,
+        load_image,
+        lambda role, text: {'type': 'output_text' if role == 'assistant' else 'input_text', 'text': text},
+        lambda media_type, data: {'type': 'input_image', 'image_url': _data_url(media_type, data)},
+    )
     items: list[dict[str, Any]] = []
-    roles = ['user', 'assistant']
-    for i, msg_parts in enumerate(chat_history):
-        role = roles[i % len(roles)]
-        text_type = 'output_text' if role == 'assistant' else 'input_text'
-        content: list[dict[str, Any]] = []
-        reasoning: list[dict[str, Any]] = []
-        for part in msg_parts:
-            if part.type_ == 'text':
-                content.append({'type': text_type, 'text': part.text})
-            elif part.type_ == 'image':
-                assert part.hash is not None
-                blob = await load_image(part.hash)
-                if blob is None:
-                    continue
-                blob_base64 = base64.b64encode(blob).decode()
-                data_url = f'data:{image_media_type(blob)};base64,{blob_base64}'
-                content.append({'type': 'input_image', 'image_url': data_url})
-            elif part.type_ == 'reasoning' and replay_reasoning:
-                item = read_reasoning_part(part, model_name)
-                if item is not None:
-                    reasoning.append(item)
+    for (role, content), msg_parts in zip(converted, chat_history, strict=True):
+        if replay_reasoning:
+            stored = (read_reasoning_part(p, model_name) for p in msg_parts if p.type_ == 'reasoning')
+            items.extend(item for item in stored if item is not None)
         if dummy_tool and role == 'assistant':
             chain_of_thought = thinking_text_of(msg_parts)
             if chain_of_thought:
-                reasoning.append(reasoning_text_item(chain_of_thought))
-        items.extend(reasoning)
-        # a lone text part still goes out as a bare string, the shape sent before reasoning
-        # replay existed, so untouched conversations keep hitting the prompt cache
-        if len(content) == 1 and content[0]['type'] == text_type:
-            items.append({'role': role, 'content': content[0]['text']})
-        else:
-            items.append({'role': role, 'content': content})
+                items.append(reasoning_text_item(chain_of_thought))
+        items.append(as_message(role, content))
     return items
 
 
@@ -175,31 +202,6 @@ def has_reasoning_items(items: list[dict[str, Any]]) -> bool:
 
 def strip_reasoning_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [item for item in items if item.get('type') != 'reasoning']
-
-
-async def convert_history_anthropic(
-    chat_history: list[list[MsgPartInHistory]], load_image: LoadImage
-) -> list[list[dict[str, Any]]]:
-    result: list[list[dict[str, Any]]] = []
-    for msg_parts in chat_history:
-        converted: list[dict[str, Any]] = []
-        for part in msg_parts:
-            if part.type_ == 'text':
-                converted.append({'type': 'text', 'text': part.text})
-            elif part.type_ == 'image':
-                assert part.hash is not None
-                blob = await load_image(part.hash)
-                if blob is None:
-                    continue
-                blob_base64 = base64.b64encode(blob).decode()
-                converted.append(
-                    {
-                        'type': 'image',
-                        'source': {'type': 'base64', 'media_type': image_media_type(blob), 'data': blob_base64},
-                    }
-                )
-        result.append(converted)
-    return result
 
 
 async def completion_openai(
@@ -237,7 +239,7 @@ async def completion_openai(
     if system_prompt and not model.no_system_prompt:
         kwargs['instructions'] = system_prompt
     if model.thinking is not None:
-        effort = model.thinking if isinstance(model.thinking, str) else 'high'
+        effort = model.thinking if isinstance(model.thinking, str) else THINKING_DEFAULTS[model.api_type]
         kwargs['reasoning'] = {'effort': effort}
         if 'reasoning_summary' not in unsupported:
             kwargs['reasoning']['summary'] = 'detailed'
@@ -417,25 +419,13 @@ async def completion_openai_legacy(
     messages: list[dict[str, Any]] = []
     if system_prompt and not model.no_system_prompt:
         messages.append({'role': 'system', 'content': system_prompt})
-    roles = ['user', 'assistant']
-    for i, msg_parts in enumerate(chat_history):
-        role = roles[i % len(roles)]
-        parts: list[dict[str, Any]] = []
-        for part in msg_parts:
-            if part.type_ == 'text':
-                parts.append({'type': 'text', 'text': part.text})
-            elif part.type_ == 'image':
-                assert part.hash is not None
-                blob = await load_image(part.hash)
-                if blob is None:
-                    continue
-                blob_base64 = base64.b64encode(blob).decode()
-                data_url = f'data:{image_media_type(blob)};base64,{blob_base64}'
-                parts.append({'type': 'image_url', 'image_url': {'url': data_url}})
-        content: Any = parts
-        if len(parts) == 1 and parts[0]['type'] == 'text':
-            content = parts[0]['text']
-        messages.append({'role': role, 'content': content})
+    converted = await convert_history(
+        chat_history,
+        load_image,
+        lambda _role, text: {'type': 'text', 'text': text},
+        lambda media_type, data: {'type': 'image_url', 'image_url': {'url': _data_url(media_type, data)}},
+    )
+    messages.extend(as_message(role, content) for role, content in converted)
 
     kwargs: dict[str, Any] = {
         'model': model.name,
@@ -444,7 +434,7 @@ async def completion_openai_legacy(
         'stream_options': {'include_usage': True},
     }
     if model.thinking is not None:
-        effort = model.thinking if isinstance(model.thinking, str) else 'high'
+        effort = model.thinking if isinstance(model.thinking, str) else THINKING_DEFAULTS[model.api_type]
         kwargs['reasoning_effort'] = effort
         kwargs['extra_body'] = {'thinking': {'type': 'enabled'}}
 
@@ -494,15 +484,16 @@ async def completion_anthropic(
     msg_id: int,
     load_image: LoadImage,
 ) -> AsyncGenerator[StreamEvent, None]:
-    converted = await convert_history_anthropic(chat_history, load_image)
-    messages: list[Any] = []
-    roles = ['user', 'assistant']
-    for i, msg in enumerate(converted):
-        role = roles[i % len(roles)]
-        content: Any = msg
-        if len(msg) == 1 and msg[0]['type'] == 'text':
-            content = msg[0]['text']
-        messages.append({'role': role, 'content': content})
+    converted = await convert_history(
+        chat_history,
+        load_image,
+        lambda _role, text: {'type': 'text', 'text': text},
+        lambda media_type, data: {
+            'type': 'image',
+            'source': {'type': 'base64', 'media_type': media_type, 'data': data},
+        },
+    )
+    messages = [as_message(role, content) for role, content in converted]
 
     kwargs: dict[str, Any] = {
         'model': model.name,

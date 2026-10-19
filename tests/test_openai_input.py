@@ -3,7 +3,9 @@ import json
 from typing import Any
 
 from chatgpt_telegram_bot.completion import (
+    as_message,
     build_input_openai,
+    convert_history,
     has_reasoning_items,
     reasoning_text_of,
     strip_reasoning_items,
@@ -131,3 +133,33 @@ def test_missing_or_malformed_content_reads_as_empty():
     assert reasoning_text_of({'content': []}) == ''
     assert reasoning_text_of({'content': ['not a dict']}) == ''
     assert reasoning_text_of({'content': [{'type': 'reasoning_text'}]}) == ''
+
+
+def test_converted_history_alternates_roles_and_skips_missing_images():
+    async def load(key: str) -> bytes | None:
+        return b'\x89PNG\r\n\x1a\n' if key == 'kept' else None
+
+    history = [
+        [make_text_part('look'), make_image_part('kept'), make_image_part('evicted')],
+        [make_text_part('a cat')],
+        [make_image_part('evicted')],
+    ]
+    converted = asyncio.run(
+        convert_history(
+            history,
+            load,
+            lambda role, text: {'type': role, 'text': text},
+            lambda media_type, data: {'type': media_type, 'data': data},
+        )
+    )
+    assert converted == [
+        ('user', [{'type': 'user', 'text': 'look'}, {'type': 'image/png', 'data': 'iVBORw0KGgo='}]),
+        ('assistant', [{'type': 'assistant', 'text': 'a cat'}]),
+        ('user', []),
+    ]
+
+
+def test_lone_text_part_is_sent_as_a_string():
+    assert as_message('user', [{'type': 'text', 'text': 'hi'}]) == {'role': 'user', 'content': 'hi'}
+    image = {'type': 'image_url', 'image_url': {'url': 'data:'}}
+    assert as_message('user', [image]) == {'role': 'user', 'content': [image]}

@@ -7,7 +7,7 @@ authors = [
     {name = "zzh1996", email = "zhengzihan1996@gmail.com"},
 ]
 dependencies = [
-    "Telethon<2.0.0,>=1.44.0",  # rich_message on SendMessageRequest/EditMessageRequest
+    "Telethon<2.0.0,>=1.45.0",  # rich_message on SendMessageRequest/EditMessageRequest; KeyboardInlineButton
     "python-socks>=2.4.4,<3.0.1",
     "cryptg<1.0.0,>=0.4.0",
     "anthropic>=0.109.0,<1.12.2",

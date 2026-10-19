@@ -32,8 +32,8 @@ class MsgPartInHistory(NamedTuple):
     """
 
     type_: str
-    hash: str | None  # must present when str == "img"
-    text: str | None  # must present unless str == "image"
+    hash: str | None  # present when type_ == "image"
+    text: str | None  # present unless type_ == "image"
 
 
 def make_image_part(_hash: str) -> MsgPartInHistory:
@@ -48,9 +48,9 @@ def make_thinking_text_part(text: str) -> MsgPartInHistory:
     """
     Store a chain of thought as plain text rather than as an opaque provider item.
 
-    Used for a chain of thought supplied by the user (see the /manipulate command) and for
-    one the provider returns in the clear, which `merge_thinking_text()` folds into the
-    message as a <think> block so that every backend replays it.
+    Used for a chain of thought the provider returns in the clear, one supplied with
+    /manipulate, and one carried by an import. It is sent back only under `dt`, as a
+    reasoning item; every other request drops it.
     """
     return MsgPartInHistory(type_='thinking_text', hash=None, text=text)
 
@@ -70,20 +70,23 @@ class MsgInfo(NamedTuple):
     message: list[MsgPartInHistory]
     reply_id: int | None
 
-    """only present for head of conversation"""
+    # prefix, system_prompt, overrides and model_spec are set on a user turn that names a
+    # model -- the head of a thread, or a reply switching to another -- and None elsewhere
+
+    """the configured prefix the turn named"""
     prefix: str | None
 
-    """only present for head of conversation"""
+    """the system prompt that came with the model"""
     system_prompt: str | None
 
-    """only present for head of conversation, stores inline parameter overrides"""
+    """inline parameter overrides given with the prefix"""
     overrides: dict[str, str | None] | None = None
 
     """every message id this reply occupies, so a regeneration can reuse all of them"""
     part_ids: list[int] | None = None
 
-    """only present for head of conversation, a model named as ``<endpoint>/<name>`` by /chat
-    rather than by a configured prefix; `prefix` is None then"""
+    """a model named as ``<endpoint>/<name>`` (by /chat or /regenerate) rather than by a
+    configured prefix; `prefix` is None then"""
     model_spec: str | None = None
 
 

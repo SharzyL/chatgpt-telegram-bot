@@ -201,21 +201,15 @@ class ChatGPTTelegramBot:
                     + f' got api_type="{model.api_type}" for model "{model.prefix}"'
                 )
 
-        # map (endpoint_name, api_type, suffix) to SDK client
+        # SDK clients by (endpoint, api_type, suffix); the configured models' are made now, so
+        # a missing API key stops startup rather than a first generation
         self.endpoint_by_name: dict[str, EndPoint] = {e.name: e for e in self.endpoints}
         self.clients: dict[tuple[str, str, str], Any] = {}
-        endpoint_by_name = self.endpoint_by_name
-
-        # collect unique (endpoint, api_type, suffix) triples from models
-        client_triples: set[tuple[str, str, str]] = set()
         for model in self.models:
             ep = model.endpoint or self.default_endpoint
-            assert ep in endpoint_by_name, f'Unknown endpoint: {ep}'
-            suffix = model.suffix if model.suffix is not None else endpoint_by_name[ep].default_suffix
-            client_triples.add((ep, model.api_type, suffix))
-
-        for triple in client_triples:
-            self.clients[triple] = self._make_client(*triple)
+            if ep not in self.endpoint_by_name:
+                raise ValueError(f'Unknown endpoint "{ep}" for model "{model.prefix}"')
+            _ = self.get_client(ep, model)
 
         # a streaming reply settles at one edit per TELEGRAM_MIN_INTERVAL; the first
         # TELEGRAM_BURST_WINDOW seconds may go at TELEGRAM_BURST_INTERVAL instead
@@ -261,7 +255,6 @@ class ChatGPTTelegramBot:
         _ = atexit.register(self.image_cache.close)
 
         self.bot_id: int = int(self.TELEGRAM_BOT_TOKEN.split(':')[0])
-        self.pending_reply_manager = PendingReplyManager()
         self.bot: TelegramClient = TelegramClient(
             os.path.join(data_dir, 'bot'),
             self.TELEGRAM_API_ID,
@@ -305,14 +298,14 @@ class ChatGPTTelegramBot:
         base: Model | None = None
         if msg_info.prefix:
             base = self._configured_model(msg_info.prefix)
-        elif spec := getattr(msg_info, 'model_spec', None):
+        elif spec := msg_info.model_spec:
             try:
                 base = self._spec_model(spec)
             except ValueError:  # its endpoint has left the config since
                 return None
         if base is None:
             return None
-        return apply_overrides(base, getattr(msg_info, 'overrides', None) or {})
+        return apply_overrides(base, msg_info.overrides or {})
 
     def _chat_model(self, head: str, overrides: dict[str, str | None]) -> tuple[Model, str | None]:
         """The model a /chat names, and the spec to store for it when no prefix stands for it.
@@ -407,21 +400,9 @@ class ChatGPTTelegramBot:
             await self.album_handler(event)
 
         admin_input_peer = await self.bot.get_input_entity(self.admin_id)
-        _ = await self.bot(
-            functions.bots.SetBotCommandsRequest(
-                scope=types.BotCommandScopePeer(admin_input_peer),
-                lang_code='',
-                commands=[types.BotCommand(command, description) for command, description in BOT_COMMANDS],
-            )
-        )
-
-        _ = await self.bot(
-            functions.bots.SetBotCommandsRequest(
-                scope=types.BotCommandScopeDefault(),
-                lang_code='',
-                commands=[types.BotCommand(command, description) for command, description in BOT_COMMANDS],
-            )
-        )
+        commands = [types.BotCommand(command, description) for command, description in BOT_COMMANDS]
+        for scope in (types.BotCommandScopePeer(admin_input_peer), types.BotCommandScopeDefault()):
+            _ = await self.bot(functions.bots.SetBotCommandsRequest(scope=scope, lang_code='', commands=commands))
         logger.info('Bot commands registered')
 
         _ = await self.bot.run_until_disconnected()  # pyright: ignore[reportGeneralTypeIssues]  # telethon's run_until_disconnected() is awaitable at runtime
@@ -478,16 +459,6 @@ class ChatGPTTelegramBot:
         if model.dummy_tool:
             flags.append('dummy_tool')
         return flags
-
-    @staticmethod
-    def only_admin(func):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
-        async def new_func(self, message):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
-            if message.sender_id != self.admin_id:
-                _ = await self.send_message(message.chat_id, 'Only admin can use this command', message.id)
-                return
-            await func(self, message)
-
-        return new_func
 
     @staticmethod
     def only_allowed(func):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
@@ -957,8 +928,7 @@ class ChatGPTTelegramBot:
                 turns.append(ThreadTurn(prompt=text, response=None, msg_id=mid))
             elif turns and turns[-1].response is None:
                 # jump to the start of a split answer rather than whichever part the chain names
-                part_ids = getattr(info, 'part_ids', None)
-                turns[-1] = turns[-1]._replace(response=text, msg_id=part_ids[0] if part_ids else mid)
+                turns[-1] = turns[-1]._replace(response=text, msg_id=info.part_ids[0] if info.part_ids else mid)
         return turns
 
     def _navigation(self, chat_id: int, anchor_id: int, page: int | None) -> tuple[str, Any] | None:
@@ -1324,7 +1294,7 @@ class ChatGPTTelegramBot:
             self.set_msg_info(chat_id, prompt_id, info)
 
         # every part of the old reply is written over, and a shorter one deletes the rest
-        adopt = list(getattr(target_info, 'part_ids', None) or [target_id])
+        adopt = list(target_info.part_ids or [target_id])
         logger.info(f'Regenerating {chat_id=}, {prompt_id=}, {adopt=}, reprompted={bool(new_prompt)}')
         await self._run_completion(chat_id, prompt_id, adopt=adopt)
 

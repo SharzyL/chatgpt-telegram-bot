@@ -276,15 +276,16 @@ def parse_proxy():
 
 
 def retry(max_retry: int = 30, interval: int = 10):
+    """Sit out Telegram's flood waits, up to *max_retry* attempts in all.
+
+    Nothing else is retried: any other error would recur on an immediate second attempt.
+    """
+
     def decorator(func):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
         async def new_func(*args, **kwargs):  # pyright: ignore[reportMissingParameterType]  # generic decorator wrapper
             for _ in range(max_retry - 1):
                 try:
                     return await func(*args, **kwargs)
-                except AssertionError as e:
-                    logger.exception(e)
-                except ValueError as e:
-                    logger.exception(e)
                 except errors.FloodWaitError as e:
                     # Telegram states how long to wait; sleeping less just floods again
                     wait = getattr(e, 'seconds', None) or interval

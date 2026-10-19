@@ -1,6 +1,6 @@
 import base64
 import json
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any
@@ -210,7 +210,7 @@ async def completion_openai(
     chat_id: int,
     msg_id: int,
     load_image: LoadImage,
-) -> AsyncIterator[StreamEvent]:
+) -> AsyncGenerator[StreamEvent, None]:
     # replaying reasoning to a turn that has reasoning switched off is not meaningful,
     # and the API rejects reasoning items when no reasoning is requested
     replay_reasoning = model.thinking is not None
@@ -493,7 +493,7 @@ async def completion_anthropic(
     chat_id: int,
     msg_id: int,
     load_image: LoadImage,
-) -> AsyncIterator[StreamEvent]:
+) -> AsyncGenerator[StreamEvent, None]:
     converted = await convert_history_anthropic(chat_history, load_image)
     messages: list[Any] = []
     roles = ['user', 'assistant']
@@ -582,7 +582,7 @@ async def completion(
     generation early, which unwinds the backend and releases the HTTP stream.
     """
     assert len(chat_history) % 2 == 1
-    # a stored chain of thought goes back only under dt, as reasoning behind the dummy tool
+    # a stored chain of thought goes back only under dt, as reasoning behind the dummy
     # tool; anything else would have to inline it as text, which the model then imitates
     if not model.dummy_tool:
         chat_history = [drop_thinking_text(parts) for parts in chat_history]

@@ -95,6 +95,7 @@ def _bot() -> Any:
     bot.IMPORT_MIN_INTERVAL = 0.001
     bot.IMPORT_BURST_INTERVAL = 0.001
     bot.IMPORT_BURST_WINDOW = 0.001
+    bot.TELEGRAM_GROUP_INTERVAL = 0.001
     bot.allowed_chats = {1}
     sent: list[tuple[int, Any, int | None]] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture

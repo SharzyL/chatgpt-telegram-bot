@@ -9,7 +9,7 @@ from loguru import logger
 from telethon import errors
 
 from chatgpt_telegram_bot.render import ENTITY_RENDERER, Rendered, Renderer
-from chatgpt_telegram_bot.throttle import Throttle
+from chatgpt_telegram_bot.throttle import Throttle, chat_throttle
 from chatgpt_telegram_bot.utils import PendingReplyManager
 
 
@@ -19,6 +19,7 @@ class ReplyTransport(Protocol):
     TELEGRAM_MIN_INTERVAL: float
     TELEGRAM_BURST_INTERVAL: float
     TELEGRAM_BURST_WINDOW: float
+    TELEGRAM_GROUP_INTERVAL: float
     pending_reply_manager: PendingReplyManager
 
     async def send_message(self, chat_id: int, body: Rendered | str, reply_to_message_id: int) -> int: ...
@@ -54,8 +55,12 @@ class BotReplyMessages:
         self.collapse_first_quote: bool = False
         # inline buttons under every part, sent with each send and edit, which would drop them
         self.markup: Any = markup
-        self.throttle: Throttle = Throttle(
-            cbot.TELEGRAM_MIN_INTERVAL, cbot.TELEGRAM_BURST_INTERVAL, cbot.TELEGRAM_BURST_WINDOW
+        self.throttle: Throttle = chat_throttle(
+            chat_id,
+            cbot.TELEGRAM_MIN_INTERVAL,
+            cbot.TELEGRAM_BURST_INTERVAL,
+            cbot.TELEGRAM_BURST_WINDOW,
+            cbot.TELEGRAM_GROUP_INTERVAL,
         )
 
     async def __aenter__(self) -> Self:

@@ -80,7 +80,7 @@ from chatgpt_telegram_bot.texts import (
     RICHTEXT_PROMPT_APPEND,
     help_sections,
 )
-from chatgpt_telegram_bot.throttle import Throttle
+from chatgpt_telegram_bot.throttle import chat_throttle
 from chatgpt_telegram_bot.transfer import export_filename, format_export, parse_import
 from chatgpt_telegram_bot.utils import (
     PendingReplyManager,
@@ -206,8 +206,12 @@ class ChatGPTTelegramBot:
         self.TELEGRAM_MIN_INTERVAL: float = 3.0
         self.TELEGRAM_BURST_INTERVAL: float = 1.0
         self.TELEGRAM_BURST_WINDOW: float = 15.0
-        # an import sends a run of messages rather than editing one, and Telegram's guidance
-        # for a group is around 20 messages a minute; a short import still goes out at once
+        # in a group, which allows 20 calls a minute however they are spaced, one every 4s and
+        # no burst: 15 a minute leaves room for the extra send or edit of a tick that cuts a
+        # reply into a new message (see chat_throttle)
+        self.TELEGRAM_GROUP_INTERVAL: float = 4.0
+        # an import sends a run of messages rather than editing one; in a private chat a
+        # short import still goes out at once, and a group is paced as a reply is
         self.IMPORT_MIN_INTERVAL: float = 3.0
         self.IMPORT_BURST_INTERVAL: float = 1.0
         self.IMPORT_BURST_WINDOW: float = 10.0
@@ -815,7 +819,13 @@ class ChatGPTTelegramBot:
             _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
             return
 
-        throttle = Throttle(self.IMPORT_MIN_INTERVAL, self.IMPORT_BURST_INTERVAL, self.IMPORT_BURST_WINDOW)
+        throttle = chat_throttle(
+            chat_id,
+            self.IMPORT_MIN_INTERVAL,
+            self.IMPORT_BURST_INTERVAL,
+            self.IMPORT_BURST_WINDOW,
+            self.TELEGRAM_GROUP_INTERVAL,
+        )
         turns = f'{len(chat.turns)} turn' + ('s' if len(chat.turns) != 1 else '')
         note = f'Importing a chat titled "{chat.title}" — {turns}, '
         note += (
@@ -826,7 +836,7 @@ class ChatGPTTelegramBot:
         if chat.trailing_prompt is not None:
             note += '\nThe last prompt has no response and was left out.'
         # the pacing below makes a long export take minutes, which is worth saying up front
-        eta = (len(chat.turns) - throttle.capacity) * self.IMPORT_MIN_INTERVAL
+        eta = (len(chat.turns) - throttle.capacity) * throttle.interval
         if eta > 60:
             note += f'\nSending is paced, so this takes about {round(eta / 60)} minutes.'
         _ = await self.send_message(chat_id, note, msg_id)

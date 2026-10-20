@@ -247,6 +247,7 @@ class FakeBot:
         self.TELEGRAM_MIN_INTERVAL: float = 0.001
         self.TELEGRAM_BURST_INTERVAL: float = 0.001
         self.TELEGRAM_BURST_WINDOW: float = 0.001
+        self.TELEGRAM_GROUP_INTERVAL: float = 0.001
         self.pending_reply_manager: PendingReplyManager = PendingReplyManager()
         self.calls: list[tuple[str, int]] = []
         self.next_id: int = 100
@@ -303,6 +304,7 @@ def _recording_bot() -> Any:
     bot.TELEGRAM_MIN_INTERVAL = 0.001
     bot.TELEGRAM_BURST_INTERVAL = 0.001
     bot.TELEGRAM_BURST_WINDOW = 0.001
+    bot.TELEGRAM_GROUP_INTERVAL = 0.001
     calls: list[tuple[str, int]] = []
     bot.calls = calls
     bodies: list[str] = []

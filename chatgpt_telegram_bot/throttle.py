@@ -63,3 +63,18 @@ class Throttle:
     def flushed(self, now: float) -> None:
         """Record that a message landed; spacing is measured from here, not from take()."""
         self.last_flush = now
+
+
+def chat_throttle(
+    chat_id: int, interval: float, burst_interval: float, burst_window: float, group_interval: float
+) -> Throttle:
+    """The pacing for traffic to one chat: the given schedule, or for a group a steady *group_interval*.
+
+    A group allows a bot 20 messages a minute, edits counted, over a rolling minute: a probe
+    editing every 1.5s was stopped at its 21st call, 28.5s in, and told to wait the 31s left of
+    that minute. A burst can only spend that minute early, so a group gets none. A private chat
+    took 80 edits back to back without complaint. Telethon marks a group's id negative.
+    """
+    if chat_id < 0:
+        return Throttle(group_interval, group_interval, 0.0)
+    return Throttle(interval, burst_interval, burst_window)

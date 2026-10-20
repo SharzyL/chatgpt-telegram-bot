@@ -42,6 +42,7 @@ def _bot() -> Any:
     bot.TELEGRAM_MIN_INTERVAL = 0.001
     bot.TELEGRAM_BURST_INTERVAL = 0.001
     bot.TELEGRAM_BURST_WINDOW = 0.001
+    bot.TELEGRAM_GROUP_INTERVAL = 0.001
     sent: list[Any] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
 

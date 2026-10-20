@@ -2,7 +2,7 @@ from itertools import pairwise
 
 import pytest
 
-from chatgpt_telegram_bot.throttle import Throttle
+from chatgpt_telegram_bot.throttle import Throttle, chat_throttle
 
 
 def schedule(duration: float, tick: float = 0.05) -> list[float]:
@@ -112,3 +112,26 @@ def test_waiting_longer_than_the_run_needs_restores_the_burst():
         _ = throttle.reserve(0.0)
     assert throttle.reserve(0.0) > 0.0, 'the bucket should be empty by now'
     assert throttle.reserve(120.0) == 0.0, 'two minutes idle should refill it'
+
+
+def _flushes(throttle: Throttle, seconds: float, tick: float = 0.1) -> list[float]:
+    """When a stream ticking every *tick* seconds gets to flush, each flush landing at once."""
+    times: list[float] = []
+    for i in range(round(seconds / tick)):
+        now = i * tick
+        if throttle.take(now):
+            throttle.flushed(now)
+            times.append(now)
+    return times
+
+
+def test_a_group_never_passes_fifteen_flushes_in_a_rolling_minute():
+    # Telegram allows a group 20 calls a minute, and a tick that cuts a reply makes two
+    times = _flushes(chat_throttle(-100, 3.0, 1.0, 15.0, 4.0), 300)
+    assert max(sum(1 for t in times if start <= t < start + 60) for start in times) == 15
+    assert times[:3] == pytest.approx([0.0, 4.0, 8.0]), 'no burst at the start'
+
+
+def test_a_private_chat_keeps_its_burst():
+    times = _flushes(chat_throttle(42, 3.0, 1.0, 15.0, 4.0), 30)
+    assert times[:3] == pytest.approx([0.0, 1.0, 2.0])

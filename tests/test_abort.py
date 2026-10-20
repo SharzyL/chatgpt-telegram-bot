@@ -39,10 +39,10 @@ def _bot() -> Any:
     bot.streaming = {}
     bot.default_endpoint = 'openai'
     bot.OPENAI_MAX_RETRY = 3
-    bot.TELEGRAM_MIN_INTERVAL = 0.001
-    bot.TELEGRAM_BURST_INTERVAL = 0.001
-    bot.TELEGRAM_BURST_WINDOW = 0.001
+    bot.TELEGRAM_PRIVATE_INTERVAL = 0.001
     bot.TELEGRAM_GROUP_INTERVAL = 0.001
+    bot.TELEGRAM_GROUP_LIMITS = []
+    bot.chat_limits = {}
     sent: list[Any] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture
 

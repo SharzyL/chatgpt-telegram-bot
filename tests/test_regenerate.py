@@ -1,6 +1,7 @@
 """Answering a prompt again in place."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 from typing import Any, final
 from zoneinfo import ZoneInfo
@@ -244,13 +245,14 @@ class FakeBot:
     """Just the transport BotReplyMessages drives."""
 
     def __init__(self) -> None:
-        self.TELEGRAM_MIN_INTERVAL: float = 0.001
-        self.TELEGRAM_BURST_INTERVAL: float = 0.001
-        self.TELEGRAM_BURST_WINDOW: float = 0.001
+        self.TELEGRAM_PRIVATE_INTERVAL: float = 0.001
         self.TELEGRAM_GROUP_INTERVAL: float = 0.001
         self.pending_reply_manager: PendingReplyManager = PendingReplyManager()
         self.calls: list[tuple[str, int]] = []
         self.next_id: int = 100
+
+    def has_room(self, _chat_id: int, _calls: int) -> bool:
+        return True
 
     async def edit_message(self, _chat_id: int, _body: Any, message_id: int) -> None:
         self.calls.append(('edit', message_id))
@@ -301,10 +303,10 @@ def _recording_bot() -> Any:
     bot = _bot()
     bot.default_endpoint = 'openai'
     bot.OPENAI_MAX_RETRY = 3
-    bot.TELEGRAM_MIN_INTERVAL = 0.001
-    bot.TELEGRAM_BURST_INTERVAL = 0.001
-    bot.TELEGRAM_BURST_WINDOW = 0.001
+    bot.TELEGRAM_PRIVATE_INTERVAL = 0.001
     bot.TELEGRAM_GROUP_INTERVAL = 0.001
+    bot.TELEGRAM_GROUP_LIMITS = []
+    bot.chat_limits = {}
     calls: list[tuple[str, int]] = []
     bot.calls = calls
     bodies: list[str] = []
@@ -631,3 +633,59 @@ def test_regenerate_while_regenerating_starts_over_once_more(monkeypatch: pytest
     info = bot.get_msg_info(CHAT, REPLY_IDS[0])
     assert info.message[-1].text == 'a fresh answer'
     assert regeneration_edition(info) == 3
+
+
+def test_a_tick_with_no_room_under_the_chat_limit_is_dropped_but_the_end_is_not():
+    from chatgpt_telegram_bot.render import ENTITY_RENDERER
+    from chatgpt_telegram_bot.reply_messages import BotReplyMessages
+
+    fake = FakeBot()
+    fake.has_room = lambda _chat_id, _calls: False  # pyright: ignore[reportAttributeAccessIssue]  # a full limit
+
+    async def go() -> None:
+        async with BotReplyMessages(fake, CHAT, PROMPT_ID, '', ENTITY_RENDERER, [REPLY_IDS[0]]) as msgs:  # pyright: ignore[reportArgumentType]  # a stand-in for the transport
+            await msgs.update('streaming')
+            assert fake.calls == [], 'the stream is not held up waiting for room'
+            await msgs.update('the whole answer')
+
+    asyncio.run(go())
+    # the final flush always goes, paced by the transport itself
+    assert fake.calls == [('edit', REPLY_IDS[0])]
+
+
+def test_calls_to_a_group_wait_their_turn_and_share_one_limit():
+    bot = _recording_bot()
+    bot.TELEGRAM_GROUP_LIMITS = [(2, 0.2)]
+    del bot.edit_message  # the real one, which paces
+    sent: list[float] = []
+
+    async def call(_request: Any) -> Any:
+        sent.append(time.monotonic())
+
+    async def get_input_entity(_chat_id: int) -> Any:
+        return None
+
+    bot.bot = _Callable(call, get_input_entity)
+
+    async def go() -> None:
+        # three edits at once, as two replies streaming into one group make: the third waits
+        # until the first has left the window
+        _ = await asyncio.gather(*(bot.edit_message(CHAT, 'x', mid) for mid in (1, 2, 3)))
+
+    asyncio.run(go())
+    assert len(sent) == 3
+    assert sent[2] - sent[0] >= 0.19
+    assert not bot.has_room(CHAT, 2)
+    assert bot.has_room(42, 100), 'a private chat has no limit'
+
+
+@final
+class _Callable:
+    """Telethon's client, as far as edit_message uses it."""
+
+    def __init__(self, call: Any, get_input_entity: Any) -> None:
+        self._call: Any = call
+        self.get_input_entity: Any = get_input_entity
+
+    async def __call__(self, request: Any) -> Any:
+        return await self._call(request)

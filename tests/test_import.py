@@ -92,10 +92,10 @@ def _bot() -> Any:
     bot.timezone = ZoneInfo('UTC')
     # the real pacing would make these tests sleep for minutes; the schedule itself is
     # covered in test_throttle.py, so here the intervals are small enough to be invisible
-    bot.IMPORT_MIN_INTERVAL = 0.001
-    bot.IMPORT_BURST_INTERVAL = 0.001
-    bot.IMPORT_BURST_WINDOW = 0.001
+    bot.TELEGRAM_PRIVATE_INTERVAL = 0.001
     bot.TELEGRAM_GROUP_INTERVAL = 0.001
+    bot.TELEGRAM_GROUP_LIMITS = []
+    bot.chat_limits = {}
     bot.allowed_chats = {1}
     sent: list[tuple[int, Any, int | None]] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture

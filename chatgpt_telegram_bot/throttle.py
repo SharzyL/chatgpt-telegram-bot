@@ -65,16 +65,48 @@ class Throttle:
         self.last_flush = now
 
 
-def chat_throttle(
-    chat_id: int, interval: float, burst_interval: float, burst_window: float, group_interval: float
-) -> Throttle:
-    """The pacing for traffic to one chat: the given schedule, or for a group a steady *group_interval*.
+def chat_throttle(chat_id: int, private_interval: float, group_interval: float) -> Throttle:
+    """The steady pace of traffic to one chat: one message per interval, a group's or a private chat's.
 
-    A group allows a bot 20 messages a minute, edits counted, over a rolling minute: a probe
-    editing every 1.5s was stopped at its 21st call, 28.5s in, and told to wait the 31s left of
-    that minute. A burst can only spend that minute early, so a group gets none. A private chat
-    took 80 edits back to back without complaint. Telethon marks a group's id negative.
+    No burst: in a group it would only spend the minute's calls early (see `ChatLimit`) and
+    leave the reply stalled later, and a private chat needs none. Telethon marks a group's id
+    negative.
     """
-    if chat_id < 0:
-        return Throttle(group_interval, group_interval, 0.0)
-    return Throttle(interval, burst_interval, burst_window)
+    interval = group_interval if chat_id < 0 else private_interval
+    return Throttle(interval, interval, 0.0)
+
+
+class ChatLimit:
+    """The calls Telegram lets a bot make to one chat: at most *count* in any *window* seconds, for each limit.
+
+    Every send, edit and delete to the chat counts, whichever reply it is for, and a call is
+    recorded when it is made. Measured on a group, each stopped at the first call over:
+    20 in a rolling minute (the 21st was refused and told to wait until the oldest of them was
+    a minute old), and 5 in a few seconds (the 6th refused within 4s, waiting until about 7s
+    after the first). A private chat refused nothing at 4 calls a second.
+    """
+
+    def __init__(self, limits: list[tuple[int, float]]) -> None:
+        self.limits: list[tuple[int, float]] = limits
+        self.calls: list[float] = []
+
+    def wait(self, now: float, calls: int = 1) -> float:
+        """How long until *calls* more fit within every limit; 0 when they fit now."""
+        wait = 0.0
+        for count, window in self.limits:
+            if calls > count:
+                raise ValueError(f'{calls} calls can never fit in {count} per {window}s')
+            # the oldest call that has to leave the window before there is room for these
+            index = len(self.calls) - (count - calls) - 1
+            if index >= 0:
+                wait = max(wait, self.calls[index] + window - now)
+        return max(wait, 0.0)
+
+    def record(self, now: float) -> None:
+        if not self.limits:
+            return
+        self.calls.append(now)
+        # only the longest window's calls can matter again
+        horizon = now - max(window for _, window in self.limits)
+        while self.calls and self.calls[0] <= horizon:
+            _ = self.calls.pop(0)

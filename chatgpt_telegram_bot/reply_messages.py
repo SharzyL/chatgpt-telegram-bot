@@ -16,11 +16,11 @@ from chatgpt_telegram_bot.utils import PendingReplyManager
 class ReplyTransport(Protocol):
     """What a reply needs of the bot: its pacing, its pending replies, and the three message calls."""
 
-    TELEGRAM_MIN_INTERVAL: float
-    TELEGRAM_BURST_INTERVAL: float
-    TELEGRAM_BURST_WINDOW: float
+    TELEGRAM_PRIVATE_INTERVAL: float
     TELEGRAM_GROUP_INTERVAL: float
     pending_reply_manager: PendingReplyManager
+
+    def has_room(self, chat_id: int, calls: int) -> bool: ...
 
     async def send_message(self, chat_id: int, body: Rendered | str, reply_to_message_id: int) -> int: ...
 
@@ -55,13 +55,7 @@ class BotReplyMessages:
         self.collapse_first_quote: bool = False
         # inline buttons under every part, sent with each send and edit, which would drop them
         self.markup: Any = markup
-        self.throttle: Throttle = chat_throttle(
-            chat_id,
-            cbot.TELEGRAM_MIN_INTERVAL,
-            cbot.TELEGRAM_BURST_INTERVAL,
-            cbot.TELEGRAM_BURST_WINDOW,
-            cbot.TELEGRAM_GROUP_INTERVAL,
-        )
+        self.throttle: Throttle = chat_throttle(chat_id, cbot.TELEGRAM_PRIVATE_INTERVAL, cbot.TELEGRAM_GROUP_INTERVAL)
 
     async def __aenter__(self) -> Self:
         return self
@@ -115,7 +109,9 @@ class BotReplyMessages:
     async def update(self, text: str, collapse_first_quote: bool = False) -> None:
         self.text = text
         self.collapse_first_quote = collapse_first_quote
-        if self.throttle.take(time.time()):
+        # a tick that cuts the reply makes two calls; with no room for them it is dropped like any
+        # early tick, rather than holding up the stream while the chat's limit clears
+        if self.cbot.has_room(self.chat_id, 2) and self.throttle.take(time.time()):
             await self._force_update(self.text)
             # timed from the end of the flush: one tick can edit several messages when a
             # cut shifts, and starting the clock before that would shorten the next gap

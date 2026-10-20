@@ -80,7 +80,7 @@ from chatgpt_telegram_bot.texts import (
     RICHTEXT_PROMPT_APPEND,
     help_sections,
 )
-from chatgpt_telegram_bot.throttle import chat_throttle
+from chatgpt_telegram_bot.throttle import ChatLimit, chat_throttle
 from chatgpt_telegram_bot.transfer import export_filename, format_export, parse_import
 from chatgpt_telegram_bot.utils import (
     PendingReplyManager,
@@ -201,20 +201,14 @@ class ChatGPTTelegramBot:
                 raise ValueError(f'Unknown endpoint "{ep}" for model "{model.prefix}"')
             _ = self.get_client(model)
 
-        # a streaming reply settles at one edit per TELEGRAM_MIN_INTERVAL; the first
-        # TELEGRAM_BURST_WINDOW seconds may go at TELEGRAM_BURST_INTERVAL instead
-        self.TELEGRAM_MIN_INTERVAL: float = 3.0
-        self.TELEGRAM_BURST_INTERVAL: float = 1.0
-        self.TELEGRAM_BURST_WINDOW: float = 15.0
-        # in a group, which allows 20 calls a minute however they are spaced, one every 4s and
-        # no burst: 15 a minute leaves room for the extra send or edit of a tick that cuts a
-        # reply into a new message (see chat_throttle)
-        self.TELEGRAM_GROUP_INTERVAL: float = 4.0
-        # an import sends a run of messages rather than editing one; in a private chat a
-        # short import still goes out at once, and a group is paced as a reply is
-        self.IMPORT_MIN_INTERVAL: float = 3.0
-        self.IMPORT_BURST_INTERVAL: float = 1.0
-        self.IMPORT_BURST_WINDOW: float = 10.0
+        # the steady pace of a streaming reply or an import: a private chat refused nothing up
+        # to 4 calls a second, and Telegram asks for no more than 1 a chat; a group allows 20 a
+        # minute, and 3.5s keeps a reply at 17 (see chat_throttle)
+        self.TELEGRAM_PRIVATE_INTERVAL: float = 1.0
+        self.TELEGRAM_GROUP_INTERVAL: float = 3.5
+        # what every call to a group must fit, a margin under the 20 a minute and 5 in a few
+        # seconds Telegram enforces; shared by all replies in the chat (see ChatLimit)
+        self.TELEGRAM_GROUP_LIMITS: list[tuple[int, float]] = [(18, 60.0), (4, 8.0)]
         self.OPENAI_MAX_RETRY: int = 3
         self.OPENAI_RETRY_INTERVAL: int = 3
         self.TEXT_FILE_SIZE_LIMIT: int = 900_000
@@ -242,6 +236,8 @@ class ChatGPTTelegramBot:
         # (chat_id, prompt_id) of a reply a button press is acting on, with what it is doing to
         # it ('deleted', 'restarted'), so another press is refused until that is done
         self.busy_replies: dict[tuple[int, int], str] = {}
+        # the calls made to each group, against TELEGRAM_GROUP_LIMITS
+        self.chat_limits: dict[int, ChatLimit] = {}
 
         db_compression = _config.get('db_compression', True)
         if not isinstance(db_compression, bool):
@@ -602,9 +598,36 @@ class ChatGPTTelegramBot:
         """The bot's own short messages are given as markdown and always rendered server-side."""
         return body if isinstance(body, Rendered) else SERVER_MARKDOWN_RENDERER.render_one(body)
 
+    def _chat_limit(self, chat_id: int) -> ChatLimit | None:
+        """The limit calls to *chat_id* are counted against; a private chat has none."""
+        if chat_id >= 0:
+            return None
+        if chat_id not in self.chat_limits:
+            self.chat_limits[chat_id] = ChatLimit(self.TELEGRAM_GROUP_LIMITS)
+        return self.chat_limits[chat_id]
+
+    def has_room(self, chat_id: int, calls: int) -> bool:
+        """Whether *calls* more calls to *chat_id* would go out now, without waiting."""
+        limit = self._chat_limit(chat_id)
+        return limit is None or limit.wait(time.time(), calls) == 0
+
+    async def _pace(self, chat_id: int) -> None:
+        """Wait until one more call to *chat_id* fits Telegram's limit, and count it.
+
+        Nothing awaits between the check and the count, so concurrent callers queue properly.
+        """
+        limit = self._chat_limit(chat_id)
+        if limit is None:
+            return
+        while (wait := limit.wait(time.time())) > 0:
+            logger.info(f'Pacing calls to {chat_id=}: waiting {wait:.1f}s for its limit')
+            await asyncio.sleep(wait)
+        limit.record(time.time())
+
     @retry()
     async def send_message(self, chat_id: int, body: Rendered | str, reply_to_message_id: int) -> int:
         body = self._as_body(body)
+        await self._pace(chat_id)
         logger.debug(f'Sending message: {chat_id=}, {reply_to_message_id=}, text={body.text!r}')
         # telethon has no high-level wrapper for rich messages, so sendMessage is invoked directly
         peer = await self.bot.get_input_entity(chat_id)
@@ -625,6 +648,7 @@ class ChatGPTTelegramBot:
 
     @retry()
     async def send_message_html(self, chat_id: int, text: str, reply_to_message_id: int, buttons: Any = None) -> int:
+        await self._pace(chat_id)
         logger.debug(f'Sending message html: {chat_id=}, {reply_to_message_id=}, {text=}')
         msg = await self.bot.send_message(
             chat_id,
@@ -641,6 +665,7 @@ class ChatGPTTelegramBot:
     async def send_document(
         self, chat_id: int, data: bytes, filename: str, caption: str, reply_to_message_id: int
     ) -> int:
+        await self._pace(chat_id)
         logger.debug(f'Sending document: {chat_id=}, {reply_to_message_id=}, {filename=}, bytes={len(data)}')
         # a single file comes back as one Message; only an album would be a list
         msg: Any = await self.bot.send_file(
@@ -657,6 +682,7 @@ class ChatGPTTelegramBot:
     @retry()
     async def edit_message(self, chat_id: int, body: Rendered | str, message_id: int) -> None:
         body = self._as_body(body)
+        await self._pace(chat_id)
         logger.trace(f'Editing message: {chat_id=}, {message_id=}, text={body.text!r}')
         peer = await self.bot.get_input_entity(chat_id)
         try:
@@ -678,6 +704,7 @@ class ChatGPTTelegramBot:
 
     @retry()
     async def delete_message(self, chat_id: int, message_id: int) -> None:
+        await self._pace(chat_id)
         logger.debug(f'Deleting message: {chat_id=}, {message_id=}')
         _ = await self.bot.delete_messages(
             chat_id,
@@ -819,13 +846,7 @@ class ChatGPTTelegramBot:
             _ = await self.send_message(chat_id, f'[!] {e}', msg_id)
             return
 
-        throttle = chat_throttle(
-            chat_id,
-            self.IMPORT_MIN_INTERVAL,
-            self.IMPORT_BURST_INTERVAL,
-            self.IMPORT_BURST_WINDOW,
-            self.TELEGRAM_GROUP_INTERVAL,
-        )
+        throttle = chat_throttle(chat_id, self.TELEGRAM_PRIVATE_INTERVAL, self.TELEGRAM_GROUP_INTERVAL)
         turns = f'{len(chat.turns)} turn' + ('s' if len(chat.turns) != 1 else '')
         note = f'Importing a chat titled "{chat.title}" — {turns}, '
         note += (
@@ -1101,6 +1122,7 @@ class ChatGPTTelegramBot:
 
     @retry()
     async def delete_messages(self, chat_id: int, message_ids: list[int]) -> None:
+        await self._pace(chat_id)
         logger.debug(f'Deleting messages: {chat_id=}, count={len(message_ids)}')
         _ = await self.bot.delete_messages(chat_id, message_ids, revoke=True)
 

@@ -2,7 +2,7 @@ from itertools import pairwise
 
 import pytest
 
-from chatgpt_telegram_bot.throttle import Throttle, chat_throttle
+from chatgpt_telegram_bot.throttle import ChatLimit, Throttle, chat_throttle
 
 
 def schedule(duration: float, tick: float = 0.05) -> list[float]:
@@ -125,13 +125,61 @@ def _flushes(throttle: Throttle, seconds: float, tick: float = 0.1) -> list[floa
     return times
 
 
-def test_a_group_never_passes_fifteen_flushes_in_a_rolling_minute():
-    # Telegram allows a group 20 calls a minute, and a tick that cuts a reply makes two
-    times = _flushes(chat_throttle(-100, 3.0, 1.0, 15.0, 4.0), 300)
-    assert max(sum(1 for t in times if start <= t < start + 60) for start in times) == 15
-    assert times[:3] == pytest.approx([0.0, 4.0, 8.0]), 'no burst at the start'
+def test_a_group_and_a_private_chat_each_keep_a_steady_pace():
+    # to within one 0.1s tick
+    assert _flushes(chat_throttle(-100, 1.0, 3.5), 15)[:4] == pytest.approx([0.0, 3.5, 7.0, 10.5], abs=0.11)
+    assert _flushes(chat_throttle(42, 1.0, 3.5), 4) == pytest.approx([0.0, 1.0, 2.0, 3.0], abs=0.11)
 
 
-def test_a_private_chat_keeps_its_burst():
-    times = _flushes(chat_throttle(42, 3.0, 1.0, 15.0, 4.0), 30)
-    assert times[:3] == pytest.approx([0.0, 1.0, 2.0])
+def _limit() -> ChatLimit:
+    return ChatLimit([(18, 60.0), (4, 8.0)])
+
+
+def test_a_short_run_of_calls_waits_for_the_oldest_to_leave_the_window():
+    limit = _limit()
+    for t in (0.0, 0.1, 0.2, 0.3):
+        assert limit.wait(t) == 0
+        limit.record(t)
+    # Telegram refused the 6th of a fast run; the 5th is held back until the first is 8s old
+    assert limit.wait(0.4) == pytest.approx(7.6)
+    assert limit.wait(8.0) == 0
+
+
+def test_a_minute_holds_eighteen_calls_however_spaced():
+    limit = _limit()
+    t = 0.0
+    for _ in range(18):
+        t += limit.wait(t)
+        limit.record(t)
+        t += 2.0
+    # the 21st call within a minute was refused; this stops at the 19th, until the first is 60s old
+    assert limit.wait(t) == pytest.approx(60.0 - t)
+
+
+def test_room_for_two_calls_is_room_for_both_within_every_limit():
+    limit = _limit()
+    for t in (0.0, 1.0, 2.0):
+        limit.record(t)
+    assert limit.wait(3.0, calls=1) == 0
+    assert limit.wait(3.0, calls=2) == pytest.approx(5.0), 'the second would be the 5th within 8s'
+
+
+def test_every_schedule_a_reply_can_make_fits_the_measured_group_limits():
+    # whatever ticks a stream offers, calls paced through the limit never break Telegram's own
+    limit = _limit()
+    calls: list[float] = []
+    t = 0.0
+    while t < 600:
+        t += limit.wait(t)
+        limit.record(t)
+        calls.append(t)
+        t += 0.05
+    assert max(sum(1 for c in calls if s <= c < s + 60) for s in calls) <= 20
+    assert max(sum(1 for c in calls if s <= c < s + 7.2) for s in calls) <= 5
+
+
+def test_no_limits_means_no_waiting():
+    limit = ChatLimit([])
+    for t in range(100):
+        limit.record(float(t) / 100)
+    assert limit.wait(1.0, calls=50) == 0

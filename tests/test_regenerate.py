@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from telethon.tl.types import MessageReplyHeader
 
-from chatgpt_telegram_bot.bot import ChatGPTTelegramBot
+from chatgpt_telegram_bot.bot import LIVE_REPLY_MARKUP, ChatGPTTelegramBot
 from chatgpt_telegram_bot.models import (
     EndPoint,
     Model,
@@ -480,3 +480,56 @@ def test_an_edition_that_is_not_a_positive_number_reads_as_the_original():
     for value in (None, True, 0, -3, '2', 2.5):
         info = MsgInfo(True, [make_text_part('a')], 1, None, None, extra_metadata={'regeneration_edition': value})
         assert regeneration_edition(info) == 1, value
+
+
+def _generate_marked(monkeypatch: pytest.MonkeyPatch, live: bool) -> dict[int, list[Any]]:
+    """Answer the prompt afresh with a three-part reply; the markup each message was given, in order."""
+    bot = _recording_bot()
+    if live:
+        bot.store.update(CHAT, PROMPT_ID, _prompt(bot)._replace(overrides={'live': None}))
+    marks: dict[int, list[Any]] = {}
+    next_id = [300]
+
+    async def send_message(_chat_id: int, body: Any, _reply_to: int) -> int:
+        next_id[0] += 1
+        marks[next_id[0]] = [body.markup]
+        return next_id[0]
+
+    async def edit_message(_chat_id: int, body: Any, message_id: int) -> None:
+        marks[message_id].append(body.markup)
+
+    bot.send_message = send_message
+    bot.edit_message = edit_message
+
+    async def fake(*_args: Any, **_kwargs: Any) -> Any:
+        yield ResponseDelta(text='A' * 9000)
+
+    monkeypatch.setattr('chatgpt_telegram_bot.bot.completion', fake)
+    asyncio.run(ChatGPTTelegramBot._run_completion(bot, CHAT, PROMPT_ID))  # pyright: ignore[reportPrivateUsage]  # exercising the real path
+    return marks
+
+
+def test_every_part_of_a_live_reply_ends_with_the_buttons(monkeypatch: pytest.MonkeyPatch):
+    marks = _generate_marked(monkeypatch, live=True)
+    assert len(marks) == 3
+    assert all(seen[-1] is LIVE_REPLY_MARKUP for seen in marks.values())
+    # while it streams there is no stored turn for a press to act on
+    assert next(iter(marks.values()))[0] is None
+
+
+def test_a_reply_that_is_not_live_has_no_buttons(monkeypatch: pytest.MonkeyPatch):
+    marks = _generate_marked(monkeypatch, live=False)
+    assert all(mark is None for seen in marks.values() for mark in seen)
+
+
+def test_manipulating_a_live_reply_keeps_its_buttons():
+    bot = _recording_bot()
+    bot.store.update(CHAT, PROMPT_ID, _prompt(bot)._replace(overrides={'live': None}))
+    marks: list[Any] = []
+
+    async def edit_message(_chat_id: int, body: Any, _message_id: int) -> None:
+        marks.append(body.markup)
+
+    bot.edit_message = edit_message
+    asyncio.run(bot.manipulate_handler(FakeMessage(replied=FakeMessage(sender_id=BOT_ID), target=REPLY_IDS[0]), 'x'))
+    assert marks == [LIVE_REPLY_MARKUP]

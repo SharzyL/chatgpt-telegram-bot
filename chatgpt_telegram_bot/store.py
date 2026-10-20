@@ -323,6 +323,23 @@ class Store:
         )
         return [r[0] for r in rows]
 
+    def turn_messages(self, chat_id: int, msg_id: int) -> list[int]:
+        """Every message mapped to the turn *msg_id* shows, parts no longer live included."""
+        turn_id = self._turn_of(chat_id, msg_id)
+        if turn_id is None:
+            return []
+        rows = self.conn.execute('SELECT msg_id FROM message WHERE turn_id = ? ORDER BY msg_id', (turn_id,))
+        return [r[0] for r in rows]
+
+    def has_replies(self, chat_id: int, msg_ids: Iterable[int]) -> bool:
+        """Whether any stored turn replies to one of *msg_ids*."""
+        return any(
+            self.conn.execute(
+                'SELECT 1 FROM turn WHERE chat_id = ? AND reply_id = ? LIMIT 1', (chat_id, mid)
+            ).fetchone()
+            for mid in msg_ids
+        )
+
     def chat_nodes(self, chat_id: int) -> dict[int, MsgInfo]:
         """Every stored message of one chat, by id; the parts of a turn share one MsgInfo."""
         return self._nodes('t.chat_id = ?', (chat_id,))

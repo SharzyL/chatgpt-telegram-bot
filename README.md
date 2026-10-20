@@ -79,7 +79,7 @@ Overrides go between the prefix and the message, separated by commas:
 | `gpt,r= hello` | render to message entities on the client instead |
 | `gpt,dt hello` | dummy tool: pass earlier chains of thought back, the way DeepSeek needs (see below) |
 | `gpt,dt= hello` | no dummy tool, and earlier chains of thought dropped (the default) |
-| `gpt,live hello` | live: editing any prompt of this conversation answers it again, over its reply |
+| `gpt,live hello` | live: editing any prompt of this conversation answers it again, over its reply; replies get Regenerate and Delete buttons |
 | `gpt,[be terse] hello` | replace the system prompt for this conversation |
 | `gpt,+[be terse] hello` | append to the default system prompt |
 | `gpt,[] hello` | send no system prompt at all |
@@ -95,6 +95,11 @@ over the old reply, its header showing the next `version=`. This works for any p
 conversation, not only the first. A conversation has to be live already for an edit to count,
 so adding `,live` to a prompt by editing it does not make that edit regenerate. An answer still
 streaming when you edit is stopped, and the latest edit wins.
+
+Each reply in a live conversation carries two buttons once it is complete. **Regenerate** answers
+its prompt again, as `/regenerate` does. **Delete** removes every message of that reply, leaving
+your prompt (edit it to get a new answer); it is refused once the conversation has gone on from
+that reply, since a later turn would lose what it answered.
 
 A model's chain of thought is shown with each reply, but by default earlier ones are not sent
 back. With `dt` (dummy tool) they are, as reasoning: DeepSeek keeps a passed-back chain of

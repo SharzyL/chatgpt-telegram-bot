@@ -1,8 +1,9 @@
 """`BotReplyMessages`: one streaming reply, kept in step across however many messages it needs."""
 
 import time
+from dataclasses import replace
 from types import TracebackType
-from typing import Protocol, Self
+from typing import Any, Protocol, Self
 
 from loguru import logger
 from telethon import errors
@@ -50,6 +51,8 @@ class BotReplyMessages:
             cbot.pending_reply_manager.add((chat_id, mid))
         self.text: str = ''
         self.collapse_first_quote: bool = False
+        # inline buttons for every part; setting them makes the next flush edit each part
+        self.markup: Any = None
         self.throttle: Throttle = Throttle(
             cbot.TELEGRAM_MIN_INTERVAL, cbot.TELEGRAM_BURST_INTERVAL, cbot.TELEGRAM_BURST_WINDOW
         )
@@ -64,10 +67,14 @@ class BotReplyMessages:
         for msg_id, _ in self.replied_msgs:
             self.cbot.pending_reply_manager.remove((self.chat_id, msg_id))
 
+    def _render(self, text: str) -> list[Rendered]:
+        bodies = self.renderer.render(text, self.prefix, self.collapse_first_quote)
+        return [replace(body, markup=self.markup) for body in bodies] if self.markup is not None else bodies
+
     async def _force_update(self, text: str) -> None:
         # how the reply is cut, and how long a part may be, are the renderer's business
         try:
-            await self._apply(self.renderer.render(text, self.prefix, self.collapse_first_quote))
+            await self._apply(self._render(text))
         except errors.BadRequestError as e:
             # the server renderer rejects constructs it cannot lay out (an image with no
             # media, an unsupported block); rendering to entities instead keeps the reply
@@ -75,7 +82,7 @@ class BotReplyMessages:
                 raise
             logger.warning(f'Rich rendering rejected, falling back to entities ({self.chat_id=}): {e}')
             self.renderer = ENTITY_RENDERER
-            await self._apply(self.renderer.render(text, self.prefix, self.collapse_first_quote))
+            await self._apply(self._render(text))
 
     async def _apply(self, bodies: list[Rendered]) -> None:
         for i in range(min(len(bodies), len(self.replied_msgs))):

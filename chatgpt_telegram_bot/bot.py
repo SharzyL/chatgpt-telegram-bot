@@ -1,5 +1,6 @@
 import asyncio
 import atexit
+import dataclasses
 import datetime
 import dbm
 import os
@@ -115,6 +116,15 @@ RETRYABLE_ERRORS = (
 RATE_LIMIT_WAIT = 20.0
 RATE_LIMIT_MAX_WAIT = 60.0
 
+# under every part of a live thread's reply; a press finds its turn by the message it is under
+LIVE_REPLY_MARKUP = types.ReplyInlineMarkup(
+    rows=[
+        types.KeyboardInlineButtonRow(
+            buttons=[Button.inline('Regenerate', b'live:re'), Button.inline('Delete', b'live:del')]
+        )
+    ]
+)
+
 
 def _retry_after(response: Any) -> float | None:
     """The seconds a response's Retry-After header asks for, if it gives a number."""
@@ -222,6 +232,8 @@ class ChatGPTTelegramBot:
         self.generation_done: dict[tuple[int, int], asyncio.Event] = {}
         # (chat_id, anchor) of a /linearize being carried out, so a second press cannot run it twice
         self.linearizing: set[tuple[int, int]] = set()
+        # (chat_id, prompt_id) of a reply whose Delete button is being carried out
+        self.deleting_replies: set[tuple[int, int]] = set()
 
         db_compression = _config.get('db_compression', True)
         if not isinstance(db_compression, bool):
@@ -394,6 +406,10 @@ class ChatGPTTelegramBot:
         @self.bot.on(events.CallbackQuery(pattern=rb'^lin:'))
         async def _linearize_confirm(event: events.CallbackQuery.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
             await self.linearize_callback(event)
+
+        @self.bot.on(events.CallbackQuery(pattern=rb'^live:'))
+        async def _live_reply_button(event: events.CallbackQuery.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
+            await self.live_reply_callback(event)
 
         @self.bot.on(events.CallbackQuery(pattern=rb'^nav:'))
         async def _navigate_page(event: events.CallbackQuery.Event) -> None:  # pyright: ignore[reportUnusedFunction]  # registered by @bot.on decorator
@@ -592,6 +608,7 @@ class ChatGPTTelegramBot:
                 no_webpage=True,
                 entities=body.entities or None,
                 rich_message=self._rich_message(body),
+                reply_markup=body.markup,
             )
         )
         msg_id = self._sent_message_id(result)
@@ -643,6 +660,7 @@ class ChatGPTTelegramBot:
                     no_webpage=True,
                     entities=body.entities or None,
                     rich_message=self._rich_message(body),
+                    reply_markup=body.markup,
                 )
             )
         except errors.MessageNotModifiedError:
@@ -735,7 +753,9 @@ class ChatGPTTelegramBot:
             target_id,
             target_info._replace(message=new_parts),
         )
-        await self.edit_message(chat_id, bodies[0], target_id)
+        # an edit without its buttons would take a live reply's away
+        edited = dataclasses.replace(bodies[0], markup=LIVE_REPLY_MARKUP) if model.live else bodies[0]
+        await self.edit_message(chat_id, edited, target_id)
         logger.info(f'Manipulated {chat_id=}, {target_id=}, has_thinking={thinking is not None}')
 
     async def _import_document(self, message: Any) -> Any:
@@ -1141,6 +1161,67 @@ class ChatGPTTelegramBot:
             logger.info(f'Linearized {chat_id=}, {anchor_id=}, deleted={len(gone)}, kept={len(remaining)}')
         finally:
             self.linearizing.discard((chat_id, anchor_id))
+
+    async def live_reply_callback(self, event: Any) -> None:
+        """Regenerate or delete the live reply whose button was pressed."""
+        chat_id: int | None = event.chat_id
+        if chat_id is None or not self.is_allowed(chat_id):
+            await event.answer()
+            return
+        target_id: int = event.message_id
+        info = self.get_msg_info(chat_id, target_id)
+        if info is None or not info.sent_by_bot or info.reply_id is None:
+            await event.answer('That reply is no longer stored', alert=True)
+            return
+        key = (chat_id, info.reply_id)
+        if key in self.generating:
+            await event.answer('That reply is already being generated', alert=True)
+            return
+        if key in self.deleting_replies:
+            await event.answer('That reply is being deleted', alert=True)
+            return
+        if event.data == b'live:re':
+            logger.info(f'Regenerate pressed: {chat_id=}, {target_id=}')
+            # answered once the generation has claimed the prompt, which it does before its
+            # first await, so a second press of the button finds it claimed
+            answered = asyncio.ensure_future(event.answer())
+            await self._rewrite_reply(chat_id, info.reply_id, target_id, info, error_reply_to=target_id)
+            await answered
+        elif event.data == b'live:del':
+            await self._delete_reply(event, chat_id, target_id, info)
+        else:
+            await event.answer()
+
+    async def _delete_reply(self, event: Any, chat_id: int, target_id: int, info: MsgInfo) -> None:
+        """Delete every message of the reply *target_id* belongs to, if no later turn follows it."""
+        assert info.reply_id is not None
+        # parts a shrunken regeneration left mapped count too: a turn may have replied to one
+        msg_ids = self.store.turn_messages(chat_id, target_id)
+        if self.store.has_replies(chat_id, msg_ids):
+            await event.answer('A later turn follows this reply, so it cannot be deleted', alert=True)
+            return
+        key = (chat_id, info.reply_id)
+        self.deleting_replies.add(key)
+        try:
+            shown = list(info.part_ids or [target_id])
+            logger.info(f'Delete pressed: {chat_id=}, {target_id=}, {shown=}')
+            try:
+                await self.delete_messages(chat_id, shown)
+            except Exception:  # noqa: BLE001  # whatever failed is found by the check below
+                logger.exception(f'Could not delete a reply ({chat_id=}, {target_id=})')
+            # as under /linearize, only rows of messages confirmed gone are dropped
+            remaining = await self._still_there(chat_id, shown)
+            drop = [mid for mid in msg_ids if mid not in remaining]
+            # the prompt of an imported turn was shown by the reply's first message, and goes with it
+            if info.reply_id < 0 and -info.reply_id in drop:
+                drop.append(info.reply_id)
+            self.store.delete(chat_id, drop)
+        finally:
+            self.deleting_replies.discard(key)
+        if remaining:
+            await event.answer(f'{len(remaining)} of the messages could not be deleted', alert=True)
+        else:
+            await event.answer()
 
     @only_allowed
     async def abort_handler(self, message: Any) -> None:
@@ -1660,6 +1741,10 @@ class ChatGPTTelegramBot:
                         tool_calls=stream_meta.tool_calls or None,
                         usage=usage or None,
                     )
+                    # the reply is stored right after, so its buttons have a turn to act on; while
+                    # it streams there is none, and a press could only be refused
+                    if model.live:
+                        replymsgs.markup = LIVE_REPLY_MARKUP
                     await replymsgs.update(lead + final, bool(thinking))
                     await replymsgs.finalize()
                     part_ids = [bot_msg_id for bot_msg_id, _ in replymsgs.replied_msgs]

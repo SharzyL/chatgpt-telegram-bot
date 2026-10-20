@@ -42,6 +42,8 @@ class Rendered:
     text: str
     entities: list[Any] = field(default_factory=list)
     rich_markdown: str | None = None
+    # inline buttons under the message; an edit without them takes them away
+    markup: Any = None
 
 
 class Renderer(ABC):

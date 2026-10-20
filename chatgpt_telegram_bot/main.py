@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import asyncio
+import inspect
+import logging
 import os
 import sys
 from argparse import ArgumentParser
+from typing import override
 
 from loguru import logger
 
@@ -31,6 +34,35 @@ def _journal_sink(message) -> None:  # pyright: ignore[reportMissingParameterTyp
         CODE_LINE=record['line'],
         CODE_FUNC=record['function'],
     )
+
+
+class _ToLoguru(logging.Handler):
+    """Hand a stdlib log record to loguru, attributed to the code that logged it."""
+
+    @override
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level: str | int = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        # skip this frame and logging's own, so loguru reports the caller's file and line
+        frame, depth = inspect.currentframe(), 0
+        while frame is not None and (depth == 0 or frame.f_code.co_filename == logging.__file__):
+            frame = frame.f_back
+            depth += 1
+        logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+
+def _route_stdlib_logging() -> None:
+    """Send what libraries log through `logging` to loguru's sinks.
+
+    Without a handler, Python prints only warnings and up, so Telethon's INFO lines were lost --
+    among them the flood waits of up to `flood_sleep_threshold` (60s) it sleeps off inside a
+    call, which freeze a streaming reply with nothing in the log, and its reconnects. Telethon
+    is kept at INFO for those; other libraries (httpx logs every request at INFO) at WARNING.
+    """
+    logging.basicConfig(handlers=[_ToLoguru()], level=logging.WARNING, force=True)
+    logging.getLogger('telethon').setLevel(logging.INFO)
 
 
 def _default_data_dir() -> str:
@@ -76,6 +108,8 @@ async def async_main() -> None:
             format='<green>{time}</green> <level>{message}</level>',
             level=log_level,
         )
+
+    _route_stdlib_logging()
 
     data_dir: str = args.data_dir
     logger.info(f'Data directory: {data_dir}, config path: {args.config}')

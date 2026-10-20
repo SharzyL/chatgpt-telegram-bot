@@ -1699,7 +1699,12 @@ class ChatGPTTelegramBot:
             thinking_done = False
             stream_meta = StreamMeta()
             prefix = self._reply_prefix(model, edition=edition)
-            async with BotReplyMessages(self, chat_id, msg_id, prefix, self.get_renderer(model), adopt) as replymsgs:
+            # a live reply shows its buttons from the first message on; a press while it streams
+            # is refused, and one on a reply that failed finds no new turn to act on
+            markup = LIVE_REPLY_MARKUP if model.live else None
+            async with BotReplyMessages(
+                self, chat_id, msg_id, prefix, self.get_renderer(model), adopt, markup
+            ) as replymsgs:
                 try:
                     status: str | None = 'Generating...'
                     await replymsgs.update(lead + f'[{status}]')
@@ -1741,10 +1746,6 @@ class ChatGPTTelegramBot:
                         tool_calls=stream_meta.tool_calls or None,
                         usage=usage or None,
                     )
-                    # the reply is stored right after, so its buttons have a turn to act on; while
-                    # it streams there is none, and a press could only be refused
-                    if model.live:
-                        replymsgs.markup = LIVE_REPLY_MARKUP
                     await replymsgs.update(lead + final, bool(thinking))
                     await replymsgs.finalize()
                     part_ids = [bot_msg_id for bot_msg_id, _ in replymsgs.replied_msgs]

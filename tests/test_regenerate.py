@@ -509,12 +509,11 @@ def _generate_marked(monkeypatch: pytest.MonkeyPatch, live: bool) -> dict[int, l
     return marks
 
 
-def test_every_part_of_a_live_reply_ends_with_the_buttons(monkeypatch: pytest.MonkeyPatch):
+def test_every_part_of_a_live_reply_has_the_buttons_throughout(monkeypatch: pytest.MonkeyPatch):
     marks = _generate_marked(monkeypatch, live=True)
     assert len(marks) == 3
-    assert all(seen[-1] is LIVE_REPLY_MARKUP for seen in marks.values())
-    # while it streams there is no stored turn for a press to act on
-    assert next(iter(marks.values()))[0] is None
+    # from the first message sent, while it still streams
+    assert all(mark is LIVE_REPLY_MARKUP for seen in marks.values() for mark in seen)
 
 
 def test_a_reply_that_is_not_live_has_no_buttons(monkeypatch: pytest.MonkeyPatch):

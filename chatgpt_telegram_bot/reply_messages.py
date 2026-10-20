@@ -37,6 +37,7 @@ class BotReplyMessages:
         prefix: str,
         renderer: Renderer,
         adopt: list[int] | None = None,
+        markup: Any = None,
     ) -> None:
         self.cbot: ReplyTransport = cbot
         self.prefix: str = prefix
@@ -51,8 +52,8 @@ class BotReplyMessages:
             cbot.pending_reply_manager.add((chat_id, mid))
         self.text: str = ''
         self.collapse_first_quote: bool = False
-        # inline buttons for every part; setting them makes the next flush edit each part
-        self.markup: Any = None
+        # inline buttons under every part, sent with each send and edit, which would drop them
+        self.markup: Any = markup
         self.throttle: Throttle = Throttle(
             cbot.TELEGRAM_MIN_INTERVAL, cbot.TELEGRAM_BURST_INTERVAL, cbot.TELEGRAM_BURST_WINDOW
         )

@@ -96,7 +96,7 @@ conversation, not only the first. A conversation has to be live already for an e
 so adding `,live` to a prompt by editing it does not make that edit regenerate. An answer still
 streaming when you edit is stopped, and the latest edit wins.
 
-Each reply in a live conversation carries two buttons once it is complete. **Regenerate** answers
+Each reply in a live conversation carries two buttons, from its first streamed message on. **Regenerate** answers
 its prompt again, as `/regenerate` does. **Delete** removes every message of that reply, leaving
 your prompt (edit it to get a new answer); it is refused once the conversation has gone on from
 that reply, since a later turn would lose what it answered.

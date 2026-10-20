@@ -246,13 +246,13 @@ def _deleting_bot(refused: set[int] | None = None) -> Any:
 
     bot.delete_messages = delete_messages  # pyright: ignore[reportAttributeAccessIssue]  # test-only stub
     bot._still_there = still_there  # pyright: ignore[reportPrivateUsage]  # test-only stub
-    bot.deleting_replies = set()
+    bot.busy_replies = {}
     return bot
 
 
 def test_regenerate_answers_the_prompt_again_over_every_part():
     bot = _bot()
-    bot.deleting_replies = set()
+    bot.busy_replies = {}
     press = _press(bot, REPLY[1], b'live:re')
     assert bot.runs == [{'msg_id': PROMPT, 'adopt': REPLY, 'error_reply_to': REPLY[1], 'edition': 2}]
     assert press.answers == [(None, False)]
@@ -260,7 +260,7 @@ def test_regenerate_answers_the_prompt_again_over_every_part():
 
 def test_a_second_regenerate_press_finds_the_prompt_claimed():
     bot = _bot()
-    bot.deleting_replies = set()
+    bot.busy_replies = {}
 
     async def run_completion(chat_id: int, msg_id: int, **kwargs: Any) -> None:
         # claims the prompt before its first await, as the real one does
@@ -330,7 +330,7 @@ def test_presses_are_refused_while_the_reply_is_busy():
     assert _press(bot, REPLY[0], b'live:del').answers == [('That reply is already being generated', True)]
     assert _press(bot, REPLY[0], b'live:re').answers == [('That reply is already being generated', True)]
     del bot.generating[(CHAT, PROMPT)]
-    bot.deleting_replies.add((CHAT, PROMPT))
+    bot.busy_replies[(CHAT, PROMPT)] = 'deleted'
     assert _press(bot, REPLY[0], b'live:re').answers == [('That reply is being deleted', True)]
     assert bot.runs == []
     assert bot.deleted == []

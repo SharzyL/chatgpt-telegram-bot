@@ -100,7 +100,7 @@ Each reply in a live conversation carries two buttons, from its first streamed m
 its prompt again, as `/regenerate` does. **Delete** removes every message of that reply, leaving
 your prompt (edit it to get a new answer); it is refused once the conversation has gone on from
 that reply, since a later turn would lose what it answered. Pressed while the reply is still
-being written, Delete stops it first.
+being written, either button stops it first: Regenerate then starts the answer over.
 
 A model's chain of thought is shown with each reply, but by default earlier ones are not sent
 back. With `dt` (dummy tool) they are, as reasoning: DeepSeek keeps a passed-back chain of

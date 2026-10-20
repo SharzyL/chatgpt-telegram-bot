@@ -235,8 +235,9 @@ class ChatGPTTelegramBot:
         self.streaming: dict[tuple[int, int], BotReplyMessages] = {}
         # (chat_id, anchor) of a /linearize being carried out, so a second press cannot run it twice
         self.linearizing: set[tuple[int, int]] = set()
-        # (chat_id, prompt_id) of a reply whose Delete button is being carried out
-        self.deleting_replies: set[tuple[int, int]] = set()
+        # (chat_id, prompt_id) of a reply a button press is acting on, with what it is doing to
+        # it ('deleted', 'restarted'), so another press is refused until that is done
+        self.busy_replies: dict[tuple[int, int], str] = {}
 
         db_compression = _config.get('db_compression', True)
         if not isinstance(db_compression, bool):
@@ -1174,8 +1175,14 @@ class ChatGPTTelegramBot:
         target_id: int = event.message_id
         # a reply still streaming has no turn stored yet, or only the one it is writing over
         streaming = self._streaming_prompt(chat_id, target_id)
+        if streaming is not None and (doing := self.busy_replies.get((chat_id, streaming))) is not None:
+            await event.answer(f'That reply is being {doing}', alert=True)
+            return
         if event.data == b'live:del' and streaming is not None:
             await self._delete_streaming_reply(event, chat_id, target_id, streaming)
+            return
+        if event.data == b'live:re' and streaming is not None:
+            await self._restart_streaming_reply(event, chat_id, target_id, streaming)
             return
         info = self.get_msg_info(chat_id, target_id)
         if info is None or not info.sent_by_bot or info.reply_id is None:
@@ -1185,8 +1192,8 @@ class ChatGPTTelegramBot:
         if key in self.generating:
             await event.answer('That reply is already being generated', alert=True)
             return
-        if key in self.deleting_replies:
-            await event.answer('That reply is being deleted', alert=True)
+        if (doing := self.busy_replies.get(key)) is not None:
+            await event.answer(f'That reply is being {doing}', alert=True)
             return
         if event.data == b'live:re':
             logger.info(f'Regenerate pressed: {chat_id=}, {target_id=}')
@@ -1216,22 +1223,19 @@ class ChatGPTTelegramBot:
             await event.answer('A later turn follows this reply, so it cannot be deleted', alert=True)
             return
         key = (chat_id, info.reply_id)
-        self.deleting_replies.add(key)
+        self.busy_replies[key] = 'deleted'
         try:
             shown = list(info.part_ids or [target_id])
             logger.info(f'Delete pressed: {chat_id=}, {target_id=}, {shown=}')
             remaining = await self._remove_reply(chat_id, info.reply_id, shown, msg_ids)
         finally:
-            self.deleting_replies.discard(key)
+            _ = self.busy_replies.pop(key, None)
         await self._answer_deleted(event, remaining)
 
     async def _delete_streaming_reply(self, event: Any, chat_id: int, target_id: int, prompt_id: int) -> None:
         """Stop the reply streaming into *target_id*, then delete it as a stored one is."""
         key = (chat_id, prompt_id)
-        if key in self.deleting_replies:
-            await event.answer('That reply is being deleted', alert=True)
-            return
-        self.deleting_replies.add(key)
+        self.busy_replies[key] = 'deleted'
         try:
             shown = [mid for mid, _ in self.streaming[key].replied_msgs]
             logger.info(f'Delete pressed while streaming: {chat_id=}, {target_id=}, {shown=}')
@@ -1249,8 +1253,29 @@ class ChatGPTTelegramBot:
                     return
             remaining = await self._remove_reply(chat_id, prompt_id, shown, msg_ids)
         finally:
-            self.deleting_replies.discard(key)
+            _ = self.busy_replies.pop(key, None)
         await self._answer_deleted(event, remaining)
+
+    async def _restart_streaming_reply(self, event: Any, chat_id: int, target_id: int, prompt_id: int) -> None:
+        """Stop the reply streaming into *target_id*, then answer its prompt again over it."""
+        key = (chat_id, prompt_id)
+        self.busy_replies[key] = 'restarted'
+        # the stop can take until the stream's next event, longer than a press should spin
+        answered = asyncio.ensure_future(event.answer())
+        try:
+            logger.info(f'Regenerate pressed while streaming: {chat_id=}, {target_id=}')
+            # an aborted reply is stored, and is written over as the next edition; one that
+            # failed instead stored nothing, and the prompt is answered afresh
+            await self._stop_generation(chat_id, prompt_id)
+            info = self.get_msg_info(chat_id, target_id)
+        finally:
+            _ = self.busy_replies.pop(key, None)
+        # nothing awaits between here and the new generation claiming the prompt
+        if info is not None and info.sent_by_bot:
+            await self._rewrite_reply(chat_id, prompt_id, target_id, info, error_reply_to=target_id)
+        else:
+            await self._run_completion(chat_id, prompt_id)
+        await answered
 
     async def _remove_reply(self, chat_id: int, prompt_id: int, shown: list[int], msg_ids: list[int]) -> set[int]:
         """Delete the messages *shown*, and the rows *msg_ids* of those confirmed gone; what is left."""

@@ -537,21 +537,28 @@ def test_manipulating_a_live_reply_keeps_its_buttons():
 
 @final
 class FakePress:
-    def __init__(self, message_id: int) -> None:
+    def __init__(self, message_id: int, data: bytes) -> None:
         self.chat_id: int = CHAT
         self.message_id: int = message_id
-        self.data: bytes = b'live:del'
+        self.data: bytes = data
         self.answers: list[tuple[str | None, bool]] = []
 
     async def answer(self, message: str | None = None, alert: bool = False) -> None:
         self.answers.append((message, alert))
 
 
-def _delete_while_streaming(monkeypatch: pytest.MonkeyPatch, adopt: list[int] | None) -> tuple[Any, FakePress]:
-    """Press Delete under a live reply as soon as its first message is out, then let it all finish."""
+def _press_while_streaming(
+    monkeypatch: pytest.MonkeyPatch, adopt: list[int] | None, data: bytes = b'live:del'
+) -> tuple[Any, FakePress]:
+    """Press a button under a live reply as soon as its first message is out, then let it all finish.
+
+    The first generation streams until it is stopped; any later one answers at once.
+    """
     bot = _recording_bot()
     bot.store.update(CHAT, PROMPT_ID, _prompt(bot)._replace(overrides={'live': None}))
-    bot.deleting_replies = set()
+    bot.busy_replies = {}
+    # a restart generates again from inside the press, so it needs the real thing, not the stub
+    del bot._run_completion
     deleted: list[int] = []
     bot.deleted = deleted
 
@@ -564,7 +571,13 @@ def _delete_while_streaming(monkeypatch: pytest.MonkeyPatch, adopt: list[int] | 
     bot.delete_messages = delete_messages
     bot._still_there = still_there
 
+    started = [0]
+
     async def endless(*_args: Any, **_kwargs: Any) -> Any:
+        started[0] += 1
+        if started[0] > 1:
+            yield ResponseDelta(text='a fresh answer')
+            return
         while True:
             yield ResponseDelta(text='more ')
             await asyncio.sleep(0.001)
@@ -572,13 +585,11 @@ def _delete_while_streaming(monkeypatch: pytest.MonkeyPatch, adopt: list[int] | 
     monkeypatch.setattr('chatgpt_telegram_bot.bot.completion', endless)
 
     async def scenario() -> FakePress:
-        generation = asyncio.ensure_future(
-            ChatGPTTelegramBot._run_completion(bot, CHAT, PROMPT_ID, adopt=adopt, edition=2 if adopt else 1)  # pyright: ignore[reportPrivateUsage]  # exercising the real path
-        )
+        generation = asyncio.ensure_future(bot._run_completion(CHAT, PROMPT_ID, adopt=adopt, edition=2 if adopt else 1))
         while not bot.calls:
             await asyncio.sleep(0.001)
         first = bot.calls[0][1] if adopt else 201
-        press = FakePress(first)
+        press = FakePress(first, data)
         await asyncio.wait_for(bot.live_reply_callback(press), timeout=5)
         await asyncio.wait_for(generation, timeout=5)
         return press
@@ -587,7 +598,7 @@ def _delete_while_streaming(monkeypatch: pytest.MonkeyPatch, adopt: list[int] | 
 
 
 def test_delete_while_streaming_stops_the_reply_and_deletes_it(monkeypatch: pytest.MonkeyPatch):
-    bot, press = _delete_while_streaming(monkeypatch, adopt=None)
+    bot, press = _press_while_streaming(monkeypatch, adopt=None)
     assert bot.deleted == [201]
     assert bot.get_msg_info(CHAT, 201) is None, 'the aborted reply is stored, then deleted with its message'
     assert bot.store.answers_to(CHAT, PROMPT_ID) == [REPLY_IDS[0]], 'the earlier answer is untouched'
@@ -596,7 +607,25 @@ def test_delete_while_streaming_stops_the_reply_and_deletes_it(monkeypatch: pyte
 
 
 def test_delete_while_regenerating_deletes_the_turn_being_written_over(monkeypatch: pytest.MonkeyPatch):
-    bot, press = _delete_while_streaming(monkeypatch, adopt=[REPLY_IDS[0]])
+    bot, press = _press_while_streaming(monkeypatch, adopt=[REPLY_IDS[0]])
     assert bot.deleted == [REPLY_IDS[0]]
     assert bot.get_msg_info(CHAT, REPLY_IDS[0]) is None
     assert press.answers == [(None, False)]
+
+
+def test_regenerate_while_streaming_stops_the_reply_and_answers_again_over_it(monkeypatch: pytest.MonkeyPatch):
+    bot, press = _press_while_streaming(monkeypatch, adopt=None, data=b'live:re')
+    info = bot.get_msg_info(CHAT, 201)
+    assert info.message[-1].text == 'a fresh answer'
+    # the stopped reply was stored, so the new one is its next edition, written over its message
+    assert regeneration_edition(info) == 2
+    assert [kind for kind, _ in bot.calls].count('send') == 1
+    assert bot.generating == {} and bot.streaming == {} and bot.busy_replies == {}
+    assert press.answers == [(None, False)]
+
+
+def test_regenerate_while_regenerating_starts_over_once_more(monkeypatch: pytest.MonkeyPatch):
+    bot, _ = _press_while_streaming(monkeypatch, adopt=[REPLY_IDS[0]], data=b'live:re')
+    info = bot.get_msg_info(CHAT, REPLY_IDS[0])
+    assert info.message[-1].text == 'a fresh answer'
+    assert regeneration_edition(info) == 3

@@ -230,6 +230,9 @@ class ChatGPTTelegramBot:
         # set when the generation of the same key is over and its reply stored, for a live
         # edit that has to stop one before answering again
         self.generation_done: dict[tuple[int, int], asyncio.Event] = {}
+        # the reply each of those generations is streaming into, so a button pressed under a
+        # message of it finds the generation before any turn is stored
+        self.streaming: dict[tuple[int, int], BotReplyMessages] = {}
         # (chat_id, anchor) of a /linearize being carried out, so a second press cannot run it twice
         self.linearizing: set[tuple[int, int]] = set()
         # (chat_id, prompt_id) of a reply whose Delete button is being carried out
@@ -1169,6 +1172,11 @@ class ChatGPTTelegramBot:
             await event.answer()
             return
         target_id: int = event.message_id
+        # a reply still streaming has no turn stored yet, or only the one it is writing over
+        streaming = self._streaming_prompt(chat_id, target_id)
+        if event.data == b'live:del' and streaming is not None:
+            await self._delete_streaming_reply(event, chat_id, target_id, streaming)
+            return
         info = self.get_msg_info(chat_id, target_id)
         if info is None or not info.sent_by_bot or info.reply_id is None:
             await event.answer('That reply is no longer stored', alert=True)
@@ -1192,6 +1200,13 @@ class ChatGPTTelegramBot:
         else:
             await event.answer()
 
+    def _streaming_prompt(self, chat_id: int, msg_id: int) -> int | None:
+        """The prompt whose reply is streaming into *msg_id*, if one is."""
+        for (chat, prompt_id), replymsgs in self.streaming.items():
+            if chat == chat_id and any(mid == msg_id for mid, _ in replymsgs.replied_msgs):
+                return prompt_id
+        return None
+
     async def _delete_reply(self, event: Any, chat_id: int, target_id: int, info: MsgInfo) -> None:
         """Delete every message of the reply *target_id* belongs to, if no later turn follows it."""
         assert info.reply_id is not None
@@ -1205,23 +1220,66 @@ class ChatGPTTelegramBot:
         try:
             shown = list(info.part_ids or [target_id])
             logger.info(f'Delete pressed: {chat_id=}, {target_id=}, {shown=}')
-            try:
-                await self.delete_messages(chat_id, shown)
-            except Exception:  # noqa: BLE001  # whatever failed is found by the check below
-                logger.exception(f'Could not delete a reply ({chat_id=}, {target_id=})')
-            # as under /linearize, only rows of messages confirmed gone are dropped
-            remaining = await self._still_there(chat_id, shown)
-            drop = [mid for mid in msg_ids if mid not in remaining]
-            # the prompt of an imported turn was shown by the reply's first message, and goes with it
-            if info.reply_id < 0 and -info.reply_id in drop:
-                drop.append(info.reply_id)
-            self.store.delete(chat_id, drop)
+            remaining = await self._remove_reply(chat_id, info.reply_id, shown, msg_ids)
         finally:
             self.deleting_replies.discard(key)
+        await self._answer_deleted(event, remaining)
+
+    async def _delete_streaming_reply(self, event: Any, chat_id: int, target_id: int, prompt_id: int) -> None:
+        """Stop the reply streaming into *target_id*, then delete it as a stored one is."""
+        key = (chat_id, prompt_id)
+        if key in self.deleting_replies:
+            await event.answer('That reply is being deleted', alert=True)
+            return
+        self.deleting_replies.add(key)
+        try:
+            shown = [mid for mid, _ in self.streaming[key].replied_msgs]
+            logger.info(f'Delete pressed while streaming: {chat_id=}, {target_id=}, {shown=}')
+            # an aborted reply is stored like any other, so once it stops it is a turn to delete;
+            # one that failed instead stores nothing, and only its messages go
+            await self._stop_generation(chat_id, prompt_id)
+            msg_ids: list[int] = []
+            info = self.get_msg_info(chat_id, target_id)
+            if info is not None and info.sent_by_bot:
+                shown = list(info.part_ids or [target_id])
+                msg_ids = self.store.turn_messages(chat_id, target_id)
+                # a reply sent to it meanwhile was held back until it was stored
+                if self.store.has_replies(chat_id, msg_ids):
+                    await self._answer_late(event, 'A later turn follows this reply, so it cannot be deleted')
+                    return
+            remaining = await self._remove_reply(chat_id, prompt_id, shown, msg_ids)
+        finally:
+            self.deleting_replies.discard(key)
+        await self._answer_deleted(event, remaining)
+
+    async def _remove_reply(self, chat_id: int, prompt_id: int, shown: list[int], msg_ids: list[int]) -> set[int]:
+        """Delete the messages *shown*, and the rows *msg_ids* of those confirmed gone; what is left."""
+        try:
+            await self.delete_messages(chat_id, shown)
+        except Exception:  # noqa: BLE001  # whatever failed is found by the check below
+            logger.exception(f'Could not delete a reply ({chat_id=}, {shown=})')
+        # as under /linearize, only rows of messages confirmed gone are dropped
+        remaining = await self._still_there(chat_id, shown)
+        drop = [mid for mid in msg_ids if mid not in remaining]
+        # the prompt of an imported turn was shown by the reply's first message, and goes with it
+        if prompt_id < 0 and -prompt_id in drop:
+            drop.append(prompt_id)
+        self.store.delete(chat_id, drop)
+        return remaining
+
+    async def _answer_deleted(self, event: Any, remaining: set[int]) -> None:
         if remaining:
-            await event.answer(f'{len(remaining)} of the messages could not be deleted', alert=True)
+            await self._answer_late(event, f'{len(remaining)} of the messages could not be deleted')
         else:
-            await event.answer()
+            await self._answer_late(event, None)
+
+    @staticmethod
+    async def _answer_late(event: Any, message: str | None) -> None:
+        """Answer a press after work that may have outlasted the query, which Telegram then refuses."""
+        try:
+            await event.answer(message, alert=message is not None)
+        except errors.RPCError as e:
+            logger.warning(f'Could not answer a button press: {e}')
 
     @only_allowed
     async def abort_handler(self, message: Any) -> None:
@@ -1607,6 +1665,7 @@ class ChatGPTTelegramBot:
         finally:
             _ = self.generating.pop(key, None)
             _ = self.generation_done.pop(key, None)
+            _ = self.streaming.pop(key, None)
             done.set()
 
     async def _fetch_image(self, chat_id: int, msg_id: int) -> bytes:
@@ -1705,6 +1764,7 @@ class ChatGPTTelegramBot:
             async with BotReplyMessages(
                 self, chat_id, msg_id, prefix, self.get_renderer(model), adopt, markup
             ) as replymsgs:
+                self.streaming[(chat_id, msg_id)] = replymsgs
                 try:
                     status: str | None = 'Generating...'
                     await replymsgs.update(lead + f'[{status}]')

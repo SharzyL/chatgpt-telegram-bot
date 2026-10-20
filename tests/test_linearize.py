@@ -148,6 +148,7 @@ def _bot(missing_after_delete: set[int] | None = None, delete_raises: bool = Fal
     bot.pending_reply_manager = PendingReplyManager()
     bot.generating = {}
     bot.generation_done = {}
+    bot.streaming = {}
     bot.linearizing = set()
     bot.NAVIGATE_PREVIEW_WIDTH = 36
     bot.LINEARIZE_LIST_LIMIT = 30

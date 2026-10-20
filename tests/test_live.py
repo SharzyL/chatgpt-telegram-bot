@@ -58,6 +58,7 @@ def _bot(live: bool = True, answered: bool = True) -> Any:
     bot.pending_reply_manager = PendingReplyManager()
     bot.generating = {}
     bot.generation_done = {}
+    bot.streaming = {}
     sent: list[tuple[str, int]] = []
     runs: list[dict[str, Any]] = []
     bot.sent = sent  # pyright: ignore[reportAttributeAccessIssue]  # test-only capture

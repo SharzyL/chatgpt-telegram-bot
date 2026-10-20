@@ -36,6 +36,7 @@ def _bot() -> Any:
     bot.pending_reply_manager = PendingReplyManager()
     bot.generating = {}
     bot.generation_done = {}
+    bot.streaming = {}
     bot.default_endpoint = 'openai'
     bot.OPENAI_MAX_RETRY = 3
     bot.TELEGRAM_MIN_INTERVAL = 0.001

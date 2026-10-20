@@ -64,6 +64,7 @@ def _bot(prompt_parts: list[Any] | None = None, part_ids: list[int] | None = Non
     bot.pending_reply_manager = PendingReplyManager()
     bot.generating = {}
     bot.generation_done = {}
+    bot.streaming = {}
     sent: list[Any] = []
     runs: list[tuple[int, list[int] | None]] = []
     editions: list[int] = []
@@ -532,3 +533,70 @@ def test_manipulating_a_live_reply_keeps_its_buttons():
     bot.edit_message = edit_message
     asyncio.run(bot.manipulate_handler(FakeMessage(replied=FakeMessage(sender_id=BOT_ID), target=REPLY_IDS[0]), 'x'))
     assert marks == [LIVE_REPLY_MARKUP]
+
+
+@final
+class FakePress:
+    def __init__(self, message_id: int) -> None:
+        self.chat_id: int = CHAT
+        self.message_id: int = message_id
+        self.data: bytes = b'live:del'
+        self.answers: list[tuple[str | None, bool]] = []
+
+    async def answer(self, message: str | None = None, alert: bool = False) -> None:
+        self.answers.append((message, alert))
+
+
+def _delete_while_streaming(monkeypatch: pytest.MonkeyPatch, adopt: list[int] | None) -> tuple[Any, FakePress]:
+    """Press Delete under a live reply as soon as its first message is out, then let it all finish."""
+    bot = _recording_bot()
+    bot.store.update(CHAT, PROMPT_ID, _prompt(bot)._replace(overrides={'live': None}))
+    bot.deleting_replies = set()
+    deleted: list[int] = []
+    bot.deleted = deleted
+
+    async def delete_messages(_chat_id: int, message_ids: list[int]) -> None:
+        deleted.extend(message_ids)
+
+    async def still_there(_chat_id: int, _message_ids: list[int]) -> set[int]:
+        return set()
+
+    bot.delete_messages = delete_messages
+    bot._still_there = still_there
+
+    async def endless(*_args: Any, **_kwargs: Any) -> Any:
+        while True:
+            yield ResponseDelta(text='more ')
+            await asyncio.sleep(0.001)
+
+    monkeypatch.setattr('chatgpt_telegram_bot.bot.completion', endless)
+
+    async def scenario() -> FakePress:
+        generation = asyncio.ensure_future(
+            ChatGPTTelegramBot._run_completion(bot, CHAT, PROMPT_ID, adopt=adopt, edition=2 if adopt else 1)  # pyright: ignore[reportPrivateUsage]  # exercising the real path
+        )
+        while not bot.calls:
+            await asyncio.sleep(0.001)
+        first = bot.calls[0][1] if adopt else 201
+        press = FakePress(first)
+        await asyncio.wait_for(bot.live_reply_callback(press), timeout=5)
+        await asyncio.wait_for(generation, timeout=5)
+        return press
+
+    return bot, asyncio.run(scenario())
+
+
+def test_delete_while_streaming_stops_the_reply_and_deletes_it(monkeypatch: pytest.MonkeyPatch):
+    bot, press = _delete_while_streaming(monkeypatch, adopt=None)
+    assert bot.deleted == [201]
+    assert bot.get_msg_info(CHAT, 201) is None, 'the aborted reply is stored, then deleted with its message'
+    assert bot.store.answers_to(CHAT, PROMPT_ID) == [REPLY_IDS[0]], 'the earlier answer is untouched'
+    assert bot.generating == {} and bot.streaming == {}
+    assert press.answers == [(None, False)]
+
+
+def test_delete_while_regenerating_deletes_the_turn_being_written_over(monkeypatch: pytest.MonkeyPatch):
+    bot, press = _delete_while_streaming(monkeypatch, adopt=[REPLY_IDS[0]])
+    assert bot.deleted == [REPLY_IDS[0]]
+    assert bot.get_msg_info(CHAT, REPLY_IDS[0]) is None
+    assert press.answers == [(None, False)]
